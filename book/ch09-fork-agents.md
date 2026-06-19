@@ -1,54 +1,54 @@
-# Chapter 9: Fork Agents and the Prompt Cache
+# Глава 9: Agents форка и кэш запросов
 
-## The Ninety-Five Percent Insight
+## Понимание на девяносто пять процентов
 
-When a parent agent spawns five child agents in parallel, the overwhelming majority of each child's API request is identical. The system prompt is the same. The tool definitions are the same. The conversation history is the same. The assistant message that triggered the spawns is the same. The only thing that differs is the final directive: "you handle the database migration," "you write the tests," "you update the docs."
+Когда parent agent параллельно порождает пять дочерних agents, подавляющее большинство запросов API каждого дочернего элемента идентично. Системное prompt такое же. Определения tools те же. История разговора та же. Сообщение помощника, которое вызвало появление, то же самое. Единственное, что отличается, — это последняя директива: «вы занимаетесь миграцией базы данных», «вы пишете тесты», «вы обновляете документацию».
 
-On a typical fork with a warm conversation, the shared prefix might be 80,000 tokens. The per-child directive might be 200 tokens. That is 99.75% overlap. Anthropic's prompt cache gives a 90% discount on cached input tokens. If you can make those 80,000 tokens hit the cache for children 2 through 5, you just cut the input cost of those four requests by 90%. For the parent, this is the difference between spending $4 and spending $0.50 on the same parallel dispatch.
+В типичном форке с теплым разговором общий префикс может составлять 80 000 токенов. Директива для каждого ребенка может составлять 200 токенов. Это перекрытие на 99,75%. Кэш prompts Anthropic дает 90% скидку на кэшированные входные токены. Если вы сможете заставить эти 80 000 токенов попасть в кеш для дочерних элементов со 2 по 5, вы просто сократите входную стоимость этих четырех запросов на 90%. Для родителя это разница между расходами в 4 доллара и 0,50 доллара на одну и ту же параллельную отправку.
 
-The catch is that prompt caching is byte-exact. Not "similar enough." Not "semantically equivalent." The bytes must match, character for character, from the first byte of the system prompt through to the last byte before the per-child content diverges. One extra space, one reordered tool definition, one stale feature flag changing a system prompt fragment -- and the cache misses. The entire prefix is reprocessed at full price.
+Загвоздка в том, что кэширование prompts выполняется с точностью до байта. Не «достаточно похоже». Не «семантически эквивалентен». Байты должны совпадать, символ за символом, от первого байта System Prompt до последнего байта, прежде чем содержимое каждого дочернего элемента будет расходиться. Одно лишнее место, одно переупорядоченное определение tool, один устаревший флаг функции, меняющий фрагмент System Prompt — и кеш промахивается. Вся приставка перерабатывается за полную стоимость.
 
-Fork agents are Claude Code's answer to this constraint. They are not just a convenience for "spawn a child with context" -- they are a prompt cache exploitation mechanism disguised as an orchestration feature. Every design decision in the fork system traces back to one question: how do we guarantee byte-identical prefixes across parallel children?
-
----
-
-## What a Fork Child Inherits
-
-A fork agent inherits four things from its parent, and it inherits them by reference or byte-exact copy, not by recomputation.
-
-**1. The system prompt.** Not regenerated -- threaded. The parent's already-rendered system prompt bytes are passed via `override.systemPrompt`, pulled from `toolUseContext.renderedSystemPrompt`. This is the exact string that was sent in the parent's most recent API call.
-
-**2. The tool definitions.** The fork agent definition declares `tools: ['*']`, but with the `useExactTools` flag set to true, the child receives the parent's assembled tool array directly. No filtering, no reordering, no re-serialization.
-
-**3. The conversation history.** Every message the parent has exchanged with the API -- user turns, assistant turns, tool calls, tool results -- is cloned into the child's context via `forkContextMessages`.
-
-**4. The thinking configuration and model.** The fork definition specifies `model: 'inherit'`, which resolves to the parent's exact model. Same model means same tokenizer, same context window, same cache namespace.
-
-The fork agent definition itself is minimal -- almost a no-op:
-
-The fork agent definition is deliberately minimal -- it inherits everything from the parent. It specifies all tools (`'*'`), inherits the parent's model, uses bubble mode for permissions (so prompts surface in the parent's terminal), and provides a no-op system prompt function that is never actually called -- the real prompt arrives via the override channel, already rendered and byte-stable.
+Agents-форки являются ответом Claude Code на это ограничение. Они не просто удобны для «порождения дочернего элемента с контекстом» — это механизм быстрого использования кэша, замаскированный под функцию оркестрации. Каждое проектное решение в системе разветвлений связано с одним вопросом: как мы можем гарантировать байтовую идентичность префиксов в параллельных дочерних элементах?
 
 ---
 
-## The Byte-Identical Prefix Trick
+## Что наследует ребенок-вилка
 
-The API request to Claude has a specific structure: system prompt, then tools, then messages. For the prompt cache to hit, every byte from the start of the request through to some prefix boundary must be identical across requests.
+Agent форка наследует четыре вещи от своего родителя, и он наследует их по ссылке или с точностью до байта, а не путем повторного вычисления.
 
-Fork agents achieve this by ensuring three layers are frozen:
+**1. Системное prompt.** Не регенерировано -- с резьбой. Уже обработанные байты System Prompt родительского объекта передаются через `override.systemPrompt`, полученный из `toolUseContext.renderedSystemPrompt`. Это точная строка, которая была отправлена ​​в последнем вызове родительского объекта API.
 
-**Layer 1: System prompt via threading, not recomputation.**
+**2. Определения tools.** В определении agent вилки объявляется `tools: ['*']`, но если для флага `useExactTools` установлено значение true, дочерний элемент напрямую получает собранный массив tools родителя. Никакой фильтрации, никакого переупорядочения, никакой повторной сериализации.
 
-When the parent agent's system prompt was rendered for its last API call, the result was captured in `toolUseContext.renderedSystemPrompt`. This is the string after all dynamic interpolation -- GrowthBook feature flags, environment details, MCP server descriptions, skill content, CLAUDE.md files. The fork child receives this exact string.
+**3. История разговоров.** Каждое сообщение, которым родитель обменялся с API — повороты пользователя, повороты помощника, tool calls, результаты работы tools — клонируется в контекст ребенка через `forkContextMessages`.
 
-Why not just call `getSystemPrompt()` again? Because system prompt generation is not pure. GrowthBook flags transition from cold to warm state as the SDK fetches remote config. A flag that returned `false` during the parent's first turn might return `true` by the time the fork child spins up. If the system prompt includes a conditional block gated by that flag, the re-rendered prompt diverges by even a single character. Cache busted. Full-price reprocessing of 80,000 tokens, times five children.
+**4. Конфигурация и модель мышления.** В определении вилки указывается `model: 'inherit'`, что соответствует точной модели родительского элемента. Та же модель означает тот же токенизатор, то же контекстное окно, то же пространство имен кэша.
 
-Threading the rendered bytes eliminates this entire class of divergence.
+Само определение форк-agent минимально — почти не требуется:
 
-**Layer 2: Tool definitions via exact passthrough.**
+Определение agent форка намеренно минимально — оно наследует все от родителя. Он определяет все tools (`'*'`), наследует родительскую модель, использует пузырьковый режим для разрешений (поэтому prompt отображаются в родительском терминале) и предоставляет функцию бездействующей System Prompt, которая на самом деле никогда не вызывается - настоящее prompt поступает через канал переопределения, уже визуализированное и стабильное по байтам.
 
-Normal sub-agents go through `resolveAgentTools()`, which filters the tool pool based on the agent definition's `tools` and `disallowedTools` arrays, applies permission mode differences, and potentially reorders tools. The resulting serialized tool array would differ from the parent's -- different subset, different order, different permission annotations.
+---
 
-Fork agents skip this entirely:
+## Трюк с байтовым префиксом
+
+Запрос API к Клоду имеет определенную структуру: System Prompt, затем tools, затем сообщения. Чтобы Prompt Cache работал, каждый байт от начала запроса до границы префикса должен быть идентичен во всех запросах.
+
+Agents вилки достигают этого, обеспечивая замораживание трех слоев:
+
+**Уровень 1: System Prompt посредством потоковой обработки, а не повторных вычислений.**
+
+Когда System Prompt parent agent отображалось для его последнего вызова API, результат фиксировался в `toolUseContext.renderedSystemPrompt`. Это строка после всей динамической интерполяции — флаги функций GrowthBook, сведения о среде, описания серверов MCP, содержимое skills, файлы CLAUDE.md. Дочерний элемент вилки получает именно эту строку.
+
+Почему бы просто не позвонить еще раз на `getSystemPrompt()`? Потому что генерация системных prompts не является чистой. GrowthBook сигнализирует о переходе из холодного State в теплое, когда SDK получает удаленную конфигурацию. Флаг, который вернул `false` во время первого хода родительского элемента, может вернуть `true` к моменту раскручивания дочернего элемента. Если System Prompt включает условный блок, ограниченный этим флагом, повторно отображаемое prompt отличается хотя бы на один символ. Кэш взломан. Полная обработка 80 000 токенов, умноженная на пять детей.
+
+Обработка обработанных байтов устраняет весь этот класс расхождений.
+
+**Уровень 2: определения tool посредством точного прохождения.**
+
+Обычные sub-agents проходят через `resolveAgentTools()`, который фильтрует пул tools на основе массивов `tools` и `disallowedTools` определения agent, применяет различия в режимах разрешений и, возможно, меняет порядок tools. Результирующий сериализованный массив tools будет отличаться от родительского — другое подмножество, другой порядок, другие аннотации разрешений.
+
+Agents форка полностью пропускают это:
 
 ```typescript
 const resolvedTools = useExactTools
@@ -56,18 +56,18 @@ const resolvedTools = useExactTools
   : resolveAgentTools(agentDefinition, availableTools, isAsync).resolvedTools
 ```
 
-The `useExactTools` flag is set to true only on the fork path. The child gets the parent's tool pool as-is. Same tools, same order, same serialization. This includes keeping the Agent tool itself in the child's pool, even though the child is forbidden from using it -- removing it would change the tool array and bust the cache.
+Флаг `useExactTools` имеет значение true только на пути ветвления. Дочерний элемент получает родительский набор tools «как есть». Те же tools, тот же порядок, та же сериализация. Это включает в себя сохранение самого tool «Agent» в дочернем пуле, даже если дочернему элементу запрещено его использовать — его удаление приведет к изменению массива tools и разрушению кеша.
 
-**Layer 3: Message array construction.**
+**Уровень 3: построение массива сообщений.**
 
-This is where `buildForkedMessages()` does its careful work. The function constructs the final two messages that sit between the shared history and the per-child directive:
+Здесь `buildForkedMessages()` делает свою тщательную работу. Функция создает два последних сообщения, которые находятся между общей историей и директивой для каждого ребенка:
 
-The `buildForkedMessages()` function constructs the final two messages that sit between the shared history and the per-child directive. The algorithm:
+Функция `buildForkedMessages()` создает последние два сообщения, которые находятся между общей историей и директивой для каждого ребенка. Алгоритм:
 
-1. Clone the parent's assistant message (preserving all `tool_use` blocks with their original IDs).
-2. For each `tool_use` block, create a `tool_result` with a constant placeholder string (identical across all children).
-3. Build a single user message containing all the placeholder results followed by the per-child directive wrapped in the boilerplate tag.
-4. Return `[clonedAssistantMessage, userMessageWithPlaceholdersAndDirective]`.
+1. Клонировать сообщение помощника родителя (сохранив все блоки `tool_use` с их исходными идентификаторами).
+2. Для каждого блока `tool_use` создайте `tool_result` с постоянной строкой-заполнителем (идентичной для всех дочерних элементов).
+3. Создайте одно пользовательское сообщение, содержащее все результаты-заполнители, за которыми следует директива для каждого ребенка, заключенная в шаблонный тег.
+4. Верните `[clonedAssistantMessage, userMessageWithPlaceholdersAndDirective]`.
 
 ```typescript
 // Pseudocode — illustrates the message construction
@@ -81,42 +81,42 @@ function buildChildMessages(directive, parentAssistant) {
 }
 ```
 
-The resulting message array for each child looks like:
+Результирующий массив сообщений для каждого дочернего элемента выглядит так:
 
 ```
 [...shared_history, assistant(all_tool_uses), user(placeholder_results..., directive)]
 ```
 
-Every element before the directive is identical across children. The `FORK_PLACEHOLDER_RESULT` -- a constant string `'Fork started -- processing in background'` -- ensures even the tool result blocks are byte-identical. The `tool_use_id` values are identical because they reference the same assistant message. Only the final text block, containing the per-child directive, varies.
+Каждый элемент перед директивой идентичен для всех дочерних элементов. `FORK_PLACEHOLDER_RESULT` — постоянная строка `'Fork started -- processing in background'` — обеспечивает байтовую идентичность даже блоков результатов tool. Значения `tool_use_id` идентичны, поскольку они ссылаются на одно и то же сообщение помощника. Изменяется только последний текстовый блок, содержащий директиву для каждого ребенка.
 
-The cache boundary falls right before that final text block. Everything above it -- potentially tens of thousands of tokens of system prompt, tool definitions, conversation history, and placeholder results -- hits the cache at a 90% discount for every child after the first.
-
----
-
-## The Fork Boilerplate Tag
-
-Each child's directive is wrapped in a boilerplate XML tag that serves two purposes: it instructs the child on how to behave, and it acts as a marker for recursive fork detection.
-
-The boilerplate contains approximately 10 rules. The key ones:
-
-- **Override the parent's forking instruction.** The parent's system prompt says "default to forking" -- the boilerplate explicitly tells the child: "that instruction is for the parent. You ARE the fork. Do NOT spawn sub-agents."
-- **Execute silently, report once.** No conversational text between tool calls. Use tools directly, then produce a structured summary.
-- **Stay within scope.** The child must not expand beyond its directive.
-- **Structured output format.** The response must follow a Scope/Result/Key files/Files changed/Issues template that makes results easy for the parent to parse when multiple children report back simultaneously.
-
-Rule 1 is particularly interesting. The parent's system prompt -- which the fork child inherits verbatim for cache reasons -- contains instructions like "default to forking when you have parallel work." If the child followed that instruction, it would try to fork its own children, creating an infinite recursion of agents. The boilerplate explicitly overrides: "that instruction is for the parent. You ARE the fork."
-
-The structured output format (Scope/Result/Key files/Files changed/Issues) is not decorative. It constrains the child's output to factual reporting, which makes the results easier for the parent to parse and aggregate when five children report back simultaneously.
+Граница кэша проходит прямо перед последним текстовым блоком. Все, что выше этого — потенциально десятки тысяч токенов системных prompts, определений tools, истории разговоров и результатов-заполнителей — попадает в кеш со скидкой 90% для каждого дочернего элемента после первого.
 
 ---
 
-## Recursive Fork Prevention
+## Шаблонный тег вилки
 
-The fork child keeps the Agent tool in its tool pool. It has to -- removing it would change the serialized tool array and bust the prompt cache. But if the child actually invokes the Agent tool without `subagent_type`, the fork path would trigger again, creating a grandchild fork. This grandchild would inherit an even larger context (parent + child conversation), spawn its own forks, and so on.
+Директива каждого дочернего элемента заключена в шаблонный тег XML, который служит двум целям: он инструктирует дочерний элемент о том, как себя вести, и действует как маркер для обнаружения рекурсивного разветвления.
 
-Two guards prevent this:
+Шаблон содержит около 10 правил. Ключевые из них:
 
-**Primary guard: querySource check.** When a fork child is spawned, its `context.options.querySource` is set to `'agent:builtin:fork'`. The `call()` method checks this before allowing the fork path:
+- **Переопределить инструкцию родительского разветвления.** В системном prompt родителя указано «по умолчанию разветвление» — шаблон явно сообщает дочернему элементу: «Эта инструкция предназначена для родителя. Вы ЯВЛЯЕТЕСЬ ответвлением. НЕ порождайте sub-agents».
+- **Выполнять бесшумно, сообщить один раз.** Никакого диалогового текста между вызовами tools. Используйте tools напрямую, а затем подготовьте структурированное резюме.
+- **Оставайтесь в рамках.** Ребенок не должен выходить за рамки своих указаний.
+- **Структурированный формат вывода.** Ответ должен следовать шаблону «Область/Результат/Ключевые файлы/Измененные файлы/Проблемы», который позволяет родителю легко анализировать результаты, когда несколько дочерних элементов отчитываются одновременно.
+
+Правило 1 особенно интересно. Системное prompt родителя, которое дочерний элемент наследует дословно по причинам кэширования, содержит инструкции типа «по умолчанию выполняется разветвление, когда у вас параллельная работа». Если бы дочерний элемент следовал этой инструкции, он попытался бы создать форк своих собственных дочерних элементов, создавая бесконечную рекурсию agents. Шаблон явно переопределяет: «Эта инструкция предназначена для родителя. Вы — ветвь».
+
+Формат структурированного вывода (Объем/Результат/Ключевые файлы/Измененные файлы/Проблемы) не является декоративным. Он ограничивает вывод дочернего элемента фактическими отчетами, что упрощает анализ и агрегирование результатов для родителя, когда пять дочерних элементов отчитываются одновременно.
+
+---
+
+## Предотвращение рекурсивных вилок
+
+Дочерний элемент форка сохраняет tool «Agent» в своем пуле tools. Это необходимо - его удаление приведет к изменению сериализованного массива tools и разрушению Prompt Cache. Но если дочерний элемент на самом деле вызывает tool «Agent» без `subagent_type`, путь вилки сработает снова, создав дочернюю вилку. Этот внук унаследует еще более широкий контекст (разговор родитель-потомок), создаст свои собственные ответвления и так далее.
+
+Два охранника предотвращают это:
+
+**Основная защита: проверка querySource.** При создании дочернего элемента его `context.options.querySource` устанавливается значение `'agent:builtin:fork'`. Метод `call()` проверяет это, прежде чем разрешить путь ветвления:
 
 ```typescript
 // In AgentTool.call():
@@ -128,23 +128,23 @@ if (effectiveType === undefined) {
 }
 ```
 
-This is the fast path. It checks a single string in the options object.
+Это быстрый путь. Он проверяет одну строку в объекте параметров.
 
-**Fallback guard: message scanning.** Fork prevention uses two guards: the `querySource` tag set at spawn time (the fast path -- a single string comparison), and a fallback that scans message history for the boilerplate XML tag. The fallback exists because the `querySource` survives autocompact, but in edge cases where it was not properly threaded, the message-scanning fallback catches the recursion. It is a belt-and-suspenders approach where the cost of the check (scanning messages) is trivial compared to the cost of accidental recursive forking (runaway API spend).
+**Резервная защита: сканирование сообщений.** Для предотвращения вилок используются две меры защиты: тег `querySource`, устанавливаемый во время создания (быстрый путь — сравнение одной строки), и резервный вариант, который сканирует историю сообщений для шаблонного тега XML. Резервный вариант существует, потому что `querySource` выдерживает автокомпактное исполнение, но в крайних случаях, когда он не был должным образом связан с потоками, резервный вариант сканирования сообщений улавливает рекурсию. Это подход «ремни и подтяжки», при котором стоимость проверки (сканирования сообщений) тривиальна по сравнению со стоимостью случайного рекурсивного разветвления (безудержные затраты API).
 
-Why the fallback? Because Claude Code has an autocompact feature that rewrites the message array when context gets too long. Autocompact can rewrite message content but preserves the `querySource` in options. In theory, `querySource` alone is sufficient. In practice, the message-scanning fallback catches edge cases where `querySource` was not properly threaded -- a belt-and-suspenders approach where the cost of the check (scanning messages) is trivial compared to the cost of accidental recursive forking (runaway API spend).
+Почему резервный вариант? Потому что Claude Code имеет функцию автосжатия, которая перезаписывает массив сообщений, когда контекст становится слишком длинным. Autocompact может перезаписывать содержимое сообщения, но сохраняет `querySource` в параметрах. Теоретически достаточно одного `querySource`. На практике резервный вариант сканирования сообщений улавливает крайние случаи, когда `querySource` не был правильно связан с потоками - подход с поясом и подтяжками, при котором стоимость проверки (сканирования сообщений) тривиальна по сравнению с затратами на случайное рекурсивное разветвление (безудержные затраты API).
 
 ---
 
-## The Sync-to-Async Transition
+## Переход от синхронизации к асинхронности
 
-A fork child starts running in the foreground: its messages stream to the parent's terminal, and the parent blocks waiting for completion. But what if the child is taking too long? Claude Code allows mid-execution backgrounding -- the user (or an auto-timeout) can push a running foreground agent into the background without losing any work.
+Дочерний элемент вилки начинает работать на переднем плане: его сообщения передаются на родительский терминал, а родительские блоки ожидают завершения. Но что, если ребенок слишком долго ходит? Claude Code позволяет работать в фоновом режиме в середине выполнения — пользователь (или автоматический тайм-аут) может перевести работающий agent переднего плана в фоновый режим без потери какой-либо работы.
 
-The mechanism is surprisingly clean:
+Механизм на удивление чист:
 
-1. When a foreground agent is registered via `registerAgentForeground()`, a background signal promise is created.
+1. Когда agent переднего плана регистрируется через `registerAgentForeground()`, создается Promise фонового сигнала.
 
-2. The parent's sync loop races between the agent's message stream and the background signal:
+2. Цикл синхронизации родительского элемента переключается между потоком сообщений agent и фоновым сигналом:
 
 ```
 while (true) {
@@ -157,95 +157,95 @@ while (true) {
 }
 ```
 
-3. When the background signal fires, the foreground iterator is gracefully terminated via `iterator.return()`. This triggers the generator's `finally` block, which handles cleanup.
+3. Когда срабатывает фоновый сигнал, итератор переднего плана корректно завершается с помощью `iterator.return()`. Это запускает блок генератора `finally`, который выполняет очистку.
 
-4. A new `runAgent()` instance is spawned with `isAsync: true`, using the same agent ID and the message history accumulated so far. The agent continues from where it left off, now running in the background.
+4. Новый экземпляр `runAgent()` создается с помощью `isAsync: true`, используя тот же идентификатор agent и накопленную на данный момент историю сообщений. Agent продолжает работу с того места, на котором остановился, теперь работает в фоновом режиме.
 
-5. The original synchronous `call()` returns `{ status: 'async_launched' }`, and the parent continues its conversation.
+5. Исходный синхронный `call()` возвращает `{ status: 'async_launched' }`, и родительский элемент продолжает диалог.
 
-No work is lost because the message history is the agent's state. The sidechain transcript on disk has every message the agent has produced. The new async instance replays from this transcript and picks up where the sync instance stopped.
-
----
-
-## Auto-Backgrounding
-
-When the `CLAUDE_AUTO_BACKGROUND_TASKS` environment variable or the `tengu_auto_background_agents` GrowthBook flag is enabled, foreground agents are automatically backgrounded after 120 seconds:
-
-When enabled via environment variable or feature flag, foreground agents are automatically backgrounded after 120 seconds. When disabled, the function returns 0 (no auto-backgrounding).
-
-This is a UX decision with cost implications. A foreground agent blocks the parent terminal -- the user cannot type, cannot issue new instructions, cannot spawn other agents. Two minutes is long enough for the agent to complete most quick tasks synchronously (where the streaming output is useful feedback), but short enough that long-running tasks do not hold the terminal hostage.
-
-Under the fork experiment, the auto-backgrounding question is moot: all fork spawns are forced async from the start. The `run_in_background` parameter is hidden from the schema entirely. Every fork child runs in the background, reports back via a `<task-notification>` when done, and the parent never blocks.
+Никакая работа не будет потеряна, поскольку история сообщений — это State agent. Транскрипт боковой цепи на диске содержит все сообщения, созданные agent. Новый экземпляр async воспроизводится из этой записи и возобновляет работу с того места, где экземпляр синхронизации остановился.
 
 ---
 
-## When Fork Is NOT Used
+## Автоматический фоновый режим
 
-Fork is one of several orchestration modes, and it is deliberately excluded in three cases:
+Если включена переменная среды `CLAUDE_AUTO_BACKGROUND_TASKS` или флаг `tengu_auto_background_agents` GrowthBook, agents переднего плана автоматически переходят в фоновый режим через 120 секунд:
 
-**Coordinator mode.** Coordinator mode and fork mode are mutually exclusive. A coordinator has a structured delegation model: it maintains a plan, assigns tasks to workers with explicit prompts, and tracks progress. Fork's "inherit everything" approach would undermine this. A forked coordinator would inherit the parent coordinator's system prompt (which says "you are the coordinator, delegate work"), and the child would try to orchestrate instead of execute. The `isForkSubagentEnabled()` function checks `isCoordinatorMode()` first and returns false if active.
+При включении через переменную среды или флаг функции agents переднего плана автоматически переводятся в фоновый режим через 120 секунд. Если отключено, функция возвращает 0 (автоматическое фоновое воспроизведение отсутствует).
 
-**Non-interactive sessions.** SDK and API consumers (`--print` mode, Claude Agent SDK) operate without a terminal. Fork's `permissionMode: 'bubble'` surfaces permission prompts to the parent terminal -- which does not exist in non-interactive mode. Rather than building a separate permission flow, the fork path is simply disabled. SDK consumers use explicit `subagent_type` selection instead.
+Это UX-решение, имеющее финансовые последствия. Agent переднего плана блокирует родительский терминал — пользователь не может печатать, не может давать новые инструкции, не может создавать других agents. Двух минут достаточно для того, чтобы agent мог выполнить большинство быстрых Task синхронно (когда потоковые выходные данные представляют собой полезную обратную связь), но достаточно мало, чтобы длительные Task не держали терминал в заложниках.
 
-**Explicit subagent_type.** When the model specifies a `subagent_type` (e.g., `"Explore"`, `"Plan"`, `"general-purpose"`), the fork path is not triggered. Fork only fires when `subagent_type` is omitted. This lets the model choose between "I want a specialized agent with its own system prompt and tool set" (explicit type) and "I want a context-inheriting clone of myself to handle this in parallel" (omitted type).
-
----
-
-## The Economics
-
-Consider a concrete scenario. A developer asks Claude Code to refactor a module. The parent agent analyzes the codebase, forms a plan, and dispatches five fork children in parallel: one to update the database schema, one to rewrite the service layer, one to update the router, one to fix the tests, and one to update the types.
-
-At this point in the conversation, the shared context is substantial:
-- System prompt: ~4,000 tokens
-- Tool definitions (40+ tools): ~12,000 tokens
-- Conversation history (analysis + planning): ~30,000 tokens
-- Assistant message with five tool_use blocks: ~2,000 tokens
-- Placeholder tool results: ~500 tokens
-
-Total shared prefix: ~48,500 tokens. Per-child directive: ~200 tokens.
-
-Without fork (five independent agents, each with fresh context and their own system prompt):
-- Each child processes its own system prompt + tools + task prompt
-- No cache sharing (different system prompts, different tool sets)
-- Cost: 5 x full input processing
-
-With fork (byte-identical prefixes):
-- Child 1: 48,700 tokens at full price (cache miss on first request)
-- Children 2-5: 48,500 tokens at 10% price (cache hit) + 200 tokens at full price each
-- Effective cost for children 2-5: ~4,850 + 200 = ~5,050 tokens equivalent each
-
-The savings scale with context size and child count. For a warm session with 100K tokens of history spawning 8 parallel forks, the cache savings can exceed 90% of what the input tokens would have cost without sharing.
-
-This is why every design decision in the fork system -- the threading instead of recomputation, the exact tool passthrough, the placeholder results, even keeping the Agent tool in the child's pool despite it being forbidden -- optimizes for one thing: byte-identical prefixes. Each decision trades a small amount of elegance or safety for a measurable reduction in API cost.
+В рамках эксперимента с форком вопрос об автоматическом фоновом режиме является спорным: все порождения форков с самого начала принудительно асинхронны. Параметр `run_in_background` полностью скрыт из схемы. Каждый дочерний элемент форка работает в фоновом режиме, сообщает об окончании через `<task-notification>`, а родительский элемент никогда не блокируется.
 
 ---
 
-## Design Tensions
+## Когда вилка НЕ ​​используется
 
-The fork system makes explicit trade-offs that are worth understanding:
+Форк — один из нескольких режимов оркестровки, который намеренно исключен в трёх случаях:
 
-**Isolation vs. cache efficiency.** Fork children inherit everything, including conversation history that may be irrelevant to their task. A child rewriting tests does not need the 15 messages where the parent discussed database schema design. But including those messages is what makes the prefix identical. Stripping irrelevant history would save context window space at the cost of busting the cache. The design bet is that cache savings outweigh the context overhead.
+**Coordinator Mode.** Coordinator Mode и режим разветвления являются взаимоисключающими. У координатора есть структурированная модель делегирования: он поддерживает план, назначает Task работникам с явными prompts и отслеживает прогресс. Подход Форка «наследовать все» подорвет это. Разветвленный координатор унаследует системную prompt родительского координатора (в которой говорится: «Вы координатор, делегируйте работу»), и дочерний элемент будет пытаться организовывать, а не выполнять. Функция `isForkSubagentEnabled()` сначала проверяет `isCoordinatorMode()` и возвращает false, если она активна.
 
-**Safety vs. cache efficiency.** The Agent tool stays in the fork child's tool pool even though the child must not use it. Removing it would be safer (the child cannot even attempt to fork), but would change the tool array serialization. The boilerplate tag and recursive fork guards are the compensating controls -- runtime prevention instead of static removal.
+**Неинтерактивные сеансы.** Потребители SDK и API (режим `--print`, Claude Agent SDK) работают без терминала. `permissionMode: 'bubble'` Fork отображает запросы разрешений на родительский терминал, которого нет в неинтерактивном режиме. Вместо создания отдельного потока разрешений путь ветвления просто отключается. Вместо этого потребители SDK используют явный выбор `subagent_type`.
 
-**Simplicity vs. cache efficiency.** The placeholder tool results are a lie. The child sees `'Fork started -- processing in background'` for every tool_use block in the parent's assistant message, regardless of what those tool calls actually did. This is fine because the child's directive tells it what to do -- it does not need accurate tool results from the parent's dispatching turn. But it means the child's conversation history is technically incoherent. The placeholder is chosen for brevity and uniformity, not accuracy.
-
-Each of these trade-offs reflects the same priority: when you are paying per-token for API calls at scale, byte-identical prefixes are worth contorting the architecture around.
+**Явный subagent_type.** Если в модели указан `subagent_type` (e.g., `"Explore"`, `"Plan"`, `"general-purpose"`), путь ветвления не запускается. Форк срабатывает только тогда, когда `subagent_type` опущен. Это позволяет модели выбирать между «Мне нужен специализированный agent с собственной системной prompt и набором tools» (явный тип) и «Я хочу, чтобы мой клон, наследующий контекст, обрабатывал это параллельно» (опущенный тип).
 
 ---
 
-## Apply This: Designing for Prompt Cache Efficiency
+## Экономика
 
-The fork agent pattern generalizes beyond Claude Code. Any system that dispatches multiple parallel LLM calls from the same context can benefit from cache-aware request construction. The principles:
+Рассмотрим конкретный сценарий. Разработчик просит Claude Code провести рефакторинг модуля. Родительский agent анализирует кодовую базу, формирует план и параллельно отправляет пять дочерних вилок: один для обновления схемы базы данных, один для переписывания уровня сервиса, один для обновления маршрутизатора, один для исправления тестов и один для обновления типов.
 
-**1. Thread rendered prompts, do not recompute.** If your system prompt includes any dynamic content -- feature flags, timestamps, user preferences, A/B test variants -- capture the rendered result and pass it to children by value. Recomputing risks divergence.
+На этом этапе разговора общий контекст существенен:
+- Системное prompt: ~4000 токенов.
+- Определения tools (более 40 tools): ~ 12 000 жетонов.
+- История разговоров (анализ + планирование): ~30 000 токенов
+- Сообщение помощника с пятью блокамиtool_use: ~2000 токенов.
+- Tool results-заполнителя: ~ 500 токенов.
 
-**2. Freeze the tool array.** If your children need different tool sets, you are giving up cache sharing on the tools block. Consider keeping the full tool set and using runtime guards (like the fork boilerplate's "do not use Agent") instead of compile-time removal.
+Общий общий префикс: ~48 500 токенов. Директива для каждого ребенка: ~200 токенов.
 
-**3. Maximize the shared prefix, minimize the per-child suffix.** Structure your message array so that everything shared comes first and per-child content is appended at the end. Interleaving shared and per-child content fragments the cache boundary.
+Без форка (пять независимых agents, каждый со свежим контекстом и собственной системной prompt):
+- Каждый ребенок обрабатывает свою системную prompt + tools + prompt Task.
+- Нет совместного использования кеша (разные системные prompt, разные наборы tools)
+- Стоимость: 5 x полная обработка ввода
 
-**4. Use constant placeholders for variable content.** When the message structure requires responses to previous tool calls, use identical placeholder strings across all children rather than actual (divergent) results.
+С форком (идентичные по байтам префиксы):
+- Ребенок 1: 48 700 жетонов за полную стоимость (промах в кэше по первому запросу)
+- Дети 2–5 лет: 48 500 жетонов по цене 10% (попадание в кэш) + 200 жетонов по полной цене каждый.
+- Эффективная стоимость для детей 2–5 лет: ~4850 + 200 = ~5050 жетонов, эквивалентных каждому.
 
-**5. Measure the break-even.** Cache sharing has overhead: larger context windows per child (they carry irrelevant history), runtime guards instead of static safety, architectural complexity. Calculate whether your parallelism pattern (how many children, how large the shared prefix) actually saves money after accounting for the extra context tokens.
+Шкала экономии с размером контекста и количеством детей. Для теплого сеанса со 100 тысячами токенов истории, порождающих 8 параллельных вилок, экономия кеша может превысить 90% от стоимости входных токенов без совместного использования.
 
-The fork agent system is, at its core, a prompt cache exploitation engine. It answers a question that every multi-agent system builder eventually faces: when the cache gives you a 90% discount on repeated prefixes, how far will you restructure your architecture to claim that discount? Claude Code's answer is: very far.
+Вот почему каждое проектное решение в системе разветвлений — многопоточность вместо повторных вычислений, точное прохождение tool, результаты-заполнители, даже сохранение tool «Agent» в дочернем пуле, несмотря на то, что он запрещен — оптимизируется для одного: байт-идентичных префиксов. Каждое решение требует небольшого количества элегантности или безопасности для измеримого снижения стоимости.
+
+---
+
+## Конструктивные противоречия
+
+Система вилок предполагает явные компромиссы, которые стоит понять:
+
+**Изоляция и эффективность кэша.** Дочерние элементы форка наследуют все, включая историю разговоров, которая может не иметь отношения к их задаче. Дочернему тесту переписывания не нужны 15 сообщений, в которых родитель обсуждает дизайн схемы базы данных. Но именно включение этих сообщений делает префикс идентичным. Удаление ненужной истории позволит сэкономить пространство контекстного окна за счет разрушения кеша. При проектировании делается ставка на то, что экономия кэша перевешивает затраты на контекст.
+
+**Безопасность и эффективность кэша.** Tool «Agent» остается в пуле tools дочернего форка, даже если дочерний элемент не должен его использовать. Удаление его было бы безопаснее (дочерний элемент не сможет даже попытаться выполнить форк), но это изменило бы сериализацию массива tools. Шаблонный тег и рекурсивная защита вилок являются компенсирующими элементами управления — предотвращением выполнения во время выполнения вместо удаления статики.
+
+**Простота и эффективность кэша.** Tool results-заполнителя являются ложью. Дочерний элемент видит `'Fork started -- processing in background'` для каждого блокаtool_use в сообщении помощника родителя, независимо от того, что на самом деле сделали эти tool calls. Это нормально, потому что директива дочернего процесса говорит ему, что делать — ему не нужны точные tool results от диспетчерской работы родителя. Но это означает, что история разговоров ребенка технически бессвязна. Заполнитель выбран из соображений краткости и единообразия, а не точности.
+
+Каждый из этих компромиссов отражает один и тот же приоритет: когда вы платите за токен за вызовы API в большом масштабе, байт-идентичные префиксы стоят того, чтобы исказить архитектуру.
+
+---
+
+## Примените это: проектирование для быстрого повышения эффективности кэша
+
+Шаблон форк-agent выходит за рамки Claude Code. Любая система, которая отправляет несколько параллельных вызовов LLM из одного и того же контекста, может извлечь выгоду из построения запросов с учетом кэша. Принципы:
+
+**1. prompt, отображаемые в потоке, не пересчитывайте.** Если ваша System Prompt включает в себя какой-либо динамический контент — флаги функций, временные метки, пользовательские настройки, варианты A/B-тестов — запишите визуализированный результат и передайте его дочерним элементам по значению. Пересчет рисков дивергенции.
+
+**2. Заморозьте массив tools.** Если вашим детям нужны разные наборы tools, вы отказываетесь от совместного использования кеша в блоке tools. Рассмотрите возможность сохранения полного набора tools и использования средств защиты во время выполнения (например, стандартного шаблона вилки «не использовать agent») вместо удаления во время компиляции.
+
+**3. Увеличьте общий префикс и минимизируйте суффикс для каждого дочернего элемента.** Структурируйте массив сообщений так, чтобы все общие сообщения располагались первыми, а содержимое для каждого дочернего элемента добавлялось в конце. Чередование общего и дочернего контента фрагментирует границу кэша.
+
+**4. Используйте постоянные заполнители для содержимого переменных.** Если структура сообщения требует ответов на предыдущие tool calls, используйте одинаковые строки заполнителей для всех дочерних элементов, а не фактические (расходящиеся) результаты.
+
+**5. Измерьте безубыточность.** Совместное использование кэша сопряжено с накладными расходами: большие контекстные окна для каждого дочернего элемента (они несут нерелевантную историю), средства защиты во время выполнения вместо статической безопасности, сложность архитектуры. Подсчитайте, действительно ли ваш шаблон параллелизма (сколько дочерних элементов, размер общего префикса) экономит деньги после учета дополнительных токенов контекста.
+
+По своей сути система форк-agents представляет собой механизм оперативного использования кэша. Это отвечает на вопрос, с которым в конечном итоге сталкивается каждый bundler multi-agent систем: когда кэш дает вам 90% скидку на повторяющиеся префиксы, насколько сильно вы реструктурируете свою архитектуру, чтобы претендовать на эту скидку? Ответ Claude Code: очень далеко.

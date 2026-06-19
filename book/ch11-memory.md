@@ -1,42 +1,42 @@
-# Chapter 11: Memory -- Learning Across Conversations
+# Глава 11: Memory. Обучение через разговоры
 
-## The Stateless Problem
+## Проблема безгражданства
 
-Every chapter so far has described machinery that exists within a single session. The agent loop runs, tools execute, sub-agents coordinate, and when the process exits, all of it vanishes. The next conversation starts with the same system prompt, the same tool definitions, the same model -- and zero knowledge of what happened before.
+До сих пор в каждой главе описывался механизм, существующий в рамках одного сеанса. Цикл agent запускается, tools выполняются, sub-agents координируют свои действия, а когда процесс завершается, все это исчезает. Следующий разговор начинается с той же System Prompt, тех же определений tools, той же модели — и с нулевым знанием того, что произошло раньше.
 
-This is the fundamental limitation of a stateless architecture. A developer corrects the model's testing approach on Monday, and on Tuesday the model makes the same mistake. A user explains their role, their project's constraints, their preferences for code style, and every new session requires them to explain it again. The model is not forgetful -- it never knew. Each conversation is an independent universe.
+Это фундаментальное ограничение архитектуры без сохранения State. В понедельник разработчик исправляет подход к тестированию модели, а во вторник модель допускает ту же ошибку. Пользователь объясняет свою роль, ограничения своего проекта, свои предпочтения в отношении стиля кода, и каждый новый сеанс требует от него объяснять это снова. Модель не забывчива — она никогда не знала. Каждый разговор — это независимая вселенная.
 
-The problem is not theoretical. It manifests in concrete ways that erode trust. A user says "remember, we use real database instances in tests, not mocks" -- and next week the model generates mocked tests. A user explains they are a senior engineer who does not need beginner explanations -- and the next session opens with a tutorial-level walkthrough. Without memory, every session starts at zero. The agent is perpetually a new hire on their first day.
+Проблема не теоретическая. Это проявляется конкретными способами, которые подрывают доверие. Пользователь говорит: «Помните, в тестах мы используем реальные экземпляры базы данных, а не макеты» — и на следующей неделе модель генерирует макеты тестов. Пользователь объясняет, что он старший инженер, которому не нужны объяснения для новичков, и следующий сеанс начинается с пошагового руководства на уровне учебного пособия. Без memory каждый сеанс начинается с нуля. Agent постоянно нанимается в первый же день.
 
-The standard solution in the industry is Retrieval-Augmented Generation (RAG): embed documents into vectors, store them in a vector database, and retrieve relevant chunks at query time. This works well for knowledge bases -- documentation, FAQs, reference material. But it is architecturally mismatched for what an agent actually needs to remember across sessions. An agent's memory is not a knowledge base. It is a collection of observations: who the user is, what they have corrected, what the project's current constraints are, where to find things. These observations are small, change frequently, and must be human-editable. A vector database solves the wrong problem.
+Стандартным решением в отрасли является расширенная генерация с поиском (RAG): встраивание документов в векторы, сохранение их в базе данных векторов и извлечение соответствующих фрагментов во время запроса. Это хорошо работает для баз знаний — документации, часто задаваемых вопросов, справочных материалов. Но его архитектура не соответствует тому, что на самом деле нужно запоминать agent во время сеансов. Memory agent не является базой знаний. Это набор наблюдений: кто пользователь, что он исправил, каковы текущие ограничения проекта, где что найти. Эти наблюдения невелики, часто меняются и должны быть доступны для редактирования человеком. База данных векторов решает не ту проблему.
 
-Claude Code's memory system is a different bet entirely: files on disk, Markdown format, LLM-powered recall, no infrastructure. The bet is that simplicity in storage, combined with intelligence in retrieval, produces a better system than sophistication in both.
+Система memory Claude Code — это совершенно другая ставка: файлы на диске, формат Markdown, вызов на основе LLM, отсутствие инфраструктуры. Ставка заключается в том, что простота хранения в сочетании с интеллектом при поиске создает лучшую систему, чем изощренность в обоих случаях.
 
-The design philosophy has consequences that shape the entire system:
+Философия проектирования имеет последствия, которые формируют всю систему:
 
-- **Human-readable.** A user who wants to see what Claude Code remembers can open `~/.claude/projects/<slug>/memory/MEMORY.md` in any text editor. No special tools, no decryption, no export command.
-- **Human-editable.** A stale memory can be corrected with vim. A wrong memory can be deleted with `rm`. The user has full agency over the agent's knowledge.
-- **Version-controllable.** Team memories can be committed to git. Memory changes diff cleanly because they are Markdown.
-- **Zero infrastructure.** The memory system works offline, works without a server, works on any OS that has a filesystem. There is no migration path because there is no schema.
-- **Debuggable.** When memory behaves unexpectedly, the diagnosis path is `ls` and `cat`, not query logs and database inspection.
+- **Удобно для чтения.** Пользователь, желающий увидеть, что помнит Claude Code, может открыть `~/.claude/projects/<slug>/memory/MEMORY.md` в любом текстовом редакторе. Никаких специальных tools, никакой расшифровки, никакой команды экспорта.
+- **Доступно для редактирования человеком.** Устаревшую memory можно исправить с помощью vim. Неправильную memory можно удалить с помощью `rm`. Пользователь имеет полную свободу действий в отношении знаний agent.
+- **Управление версиями.** Командные воспоминания можно сохранить в git. Изменения memory четко различаются, потому что это Markdown.
+- **Нулевая инфраструктура.** Система memory работает в автономном режиме, работает без сервера, работает на любой ОС, имеющей файловую систему. Пути миграции нет, поскольку нет схемы.
+- **Отладка.** Если memory ведет себя неожиданно, путь диагностики — `ls` и `cat`, а не журналы запросов и проверка базы данных.
 
-The model both reads and writes memories using `FileWriteTool` and `FileEditTool` -- the same tools it uses to edit source code (introduced in Chapter 6). No special memory API exists. The system prompt teaches the model a two-step write protocol (create file, update index), and the model executes it with its existing capabilities under new instructions. This is tool reuse as architectural principle -- the memory system is not a subsystem bolted onto the agent, it is an emergent behavior of the agent using its existing capabilities.
+Модель читает и записывает воспоминания, используя `FileWriteTool` и `FileEditTool` — те же tools, которые она использует для редактирования исходного кода (представленные в главе 6). Специальной memory API не существует. Системная prompt обучает модель двухэтапному протоколу записи (создание файла, обновление индекса), и модель выполняет его с существующими возможностями под новыми инструкциями. Это повторное использование tools как принцип архитектуры: система memory — это не подсистема, прикрепленная к agent, это возникающее поведение agent, использующее его существующие возможности.
 
-There is a deeper reason the file-based choice works here. Memory, for an AI agent, is fundamentally different from memory in a traditional application. A traditional application's database holds authoritative state -- the source of truth for the system's data. An agent's memory holds *observations* -- things that were true at a point in time and may or may not still be true. Files communicate this epistemological status naturally. They have modification times that reveal when the observation was recorded. They can be read, edited, and deleted by humans who know the observation is wrong. A database suggests permanence and authority; a Markdown file suggests a note that someone wrote down and might need to update. The storage medium communicates the nature of the data -- these are working notes, not gospel.
+Существует более глубокая причина, по которой здесь работает выбор на основе файлов. Memory для agent ИИ фундаментально отличается от memory в традиционном приложении. База данных традиционного приложения имеет авторитетное State — источник достоверности данных системы. Memory agent хранит *наблюдения* — вещи, которые были правдой в определенный момент времени и могут быть или не быть правдой. Файлы естественным образом передают этот эпистемологический статус. У них есть время модификации, которое показывает, когда было записано наблюдение. Их могут читать, редактировать и удалять люди, знающие, что наблюдение ошибочно. База данных предполагает постоянство и авторитет; файл Markdown предлагает заметку, которую кто-то записал и, возможно, потребуется обновить. Носитель данных передает характер данных — это рабочие заметки, а не Евангелие.
 
-### Per-Project Scoping
+### Определение объема проекта
 
-Memory is scoped to the git repository root, not the working directory. If a user opens a terminal in `src/components/` and another in `tests/`, both sessions share the same memory directory. The resolution logic finds the canonical git root first, falling back to the project root:
+Memory ограничена корнем репозитория git, а не рабочим каталогом. Если пользователь открывает терминал в `src/components/`, а другой в `tests/`, оба сеанса используют один и тот же каталог memory. Логика разрешения сначала находит канонический корень git, возвращаясь к корню проекта:
 
-The base path resolution finds the canonical git root first, falling back to the project root. This ensures all git worktrees of the same repository share a single memory directory.
+Разрешение базового пути сначала находит канонический корень git, а затем возвращается к корню проекта. Это гарантирует, что все рабочие деревья git одного и того же репозитория используют один каталог memory.
 
-The `findCanonicalGitRoot` call ensures that all git worktrees of the same repository share a single memory directory. The git root is sanitized (slashes become dashes, via `sanitizePath()`) to produce a flat directory name:
+Вызов `findCanonicalGitRoot` гарантирует, что все рабочие деревья git одного и того же репозитория используют один каталог memory. Корень git очищается (косая черта становится тире посредством `sanitizePath()`) для получения плоского имени каталога:
 
 ```
 ~/.claude/projects/-Users-alex-code-myapp/memory/
 ```
 
-A fully populated memory directory reveals the system's structure:
+Полностью заполненный каталог memory раскрывает структуру системы:
 
 ```mermaid
 graph LR
@@ -62,37 +62,37 @@ graph LR
     MEMORY -->|"on-demand"| RR
 ```
 
-The naming convention is semantic: `<type>_<topic>.md`. The type prefix is not enforced by code but is part of the prompt's instructions, making it easy to visually scan the directory and understand the memory landscape.
+Соглашение об именах является семантическим: `<type>_<topic>.md`. Префикс типа не указывается в коде, но является частью инструкций prompt, что позволяет легко визуально сканировать каталог и понимать структуру memory.
 
 ---
 
-## The Four-Type Taxonomy
+## Таксономия четырех типов
 
-Not everything is worth remembering. The memory system constrains all memories to exactly four types:
+Не все стоит помнить. Система memory ограничивает все воспоминания ровно четырьмя типами:
 
-The four types are: **user**, **feedback**, **project**, and **reference**.
+Четыре типа: **пользователь**, **обратная связь**, **проект** и **ссылка**.
 
-The taxonomy is designed around a single criterion: **is this knowledge derivable from the current project state?** Code patterns, architecture, file structure, git history -- all of these can be re-derived by reading the codebase. They are excluded. The four types capture what cannot be re-derived.
+Таксономия построена на основе одного критерия: **можно ли получить эти знания из текущего State проекта?** Шаблоны кода, архитектура, файловая структура, история git — все это можно получить повторно, прочитав кодовую базу. Они исключены. Четыре типа отражают то, что не может быть получено повторно.
 
-**User memories** record information about the person: their role, goals, responsibilities, expertise level. A senior Go engineer who is new to React gets different explanations than a first-time programmer.
+**Воспоминания пользователей** записывают информацию о человеке: его роль, цели, обязанности, уровень знаний. Старший инженер Go, впервые работающий с React, получает другие объяснения, чем начинающий программист.
 
-**Feedback memories** capture guidance about how to approach work -- both corrections and confirmations. The system explicitly instructs the model to record both: "if you only save corrections, you will drift away from approaches the user has already validated." Each feedback memory has a specific structure: the rule itself, then a `**Why:**` line with the reason (often a past incident), then a `**How to apply:**` line with the trigger conditions.
+**Воспоминания обратной связи** содержат рекомендации о том, как подходить к работе: как исправления, так и подтверждения. Система явно инструктирует модель записывать и то, и другое: «если вы сохраняете только поправки, вы отклоняетесь от подходов, которые пользователь уже проверил». Каждая memory обратной связи имеет определенную структуру: само правило, затем строка `**Why:**` с причиной (часто прошлый инцидент), затем строка `**How to apply:**` с условиями срабатывания.
 
-**Project memories** record ongoing work context -- who is doing what, why, by when. The prompt emphasizes converting relative dates to absolute: "Thursday" becomes "2026-03-05" so the memory remains interpretable weeks later.
+**Воспоминания о проектах** фиксируют текущий контекст работы: кто, что делает, почему и когда. В prompt особое внимание уделяется преобразованию относительных дат в абсолютные: «Четверг» становится «2026-03-05», поэтому memory остается интерпретируемой несколько недель спустя.
 
-**Reference memories** are bookmarks -- pointers to where information lives in external systems. A Linear project URL, a Grafana dashboard, a Slack channel. These tell the model where to look, not what to find.
+**Справочные воспоминания** — это закладки, указывающие, где находится информация во внешних системах. URL-адрес проекта Linear, панель управления Grafana, канал Slack. Они сообщают модели, где искать, а не что найти.
 
-### The Taxonomy as Filter
+### Таксономия как фильтр
 
-The four types are not just categories -- they are a filter. By defining exactly what counts as a memory, the system implicitly defines what does not. Without the taxonomy, an eager model would save everything: code patterns, architecture diagrams, error messages. All derivable from the codebase. Saving it creates a parallel, potentially stale copy of information that is better sourced from its origin.
+Четыре типа — это не просто категории, это фильтр. Точно определяя, что считать memoryю, система неявно определяет, что нет. Без таксономии энергичная модель сохраняла бы все: шаблоны кода, архитектурные диаграммы, сообщения об ошибках. Все извлекается из кодовой базы. При его сохранении создается параллельная, потенциально устаревшая копия информации, которую лучше получить из ее источника.
 
-The taxonomy also prevents a subtler failure: memory as crutch. If the model saves architectural decisions as memories, it stops reading the codebase to understand architecture. By excluding derivable information, the system forces the model to stay grounded in the current state of the code.
+Таксономия также предотвращает более тонкую ошибку: memory как опора. Если модель сохраняет архитектурные решения в memory, она перестает читать кодовую базу, чтобы понять архитектуру. Исключая извлекаемую информацию, система заставляет модель оставаться привязанной к текущему State кода.
 
-The exclusion list is explicit: code patterns, git history, debugging solutions, anything in CLAUDE.md, ephemeral task details. These exclusions apply even when the user explicitly asks to save. If a user says "remember this PR list," the model is instructed to push back -- "what was *surprising* or *non-obvious* about it?" That surprising part is worth keeping. The raw list is not. This instruction was validated through evals, going from 0/2 to 3/3 when the exclusion-override instruction was added.
+Список исключений является явным: шаблоны кода, история git, решения для отладки, все, что содержится в CLAUDE.md, сведения об эфемерных Task. Эти исключения применяются, даже если пользователь явно просит сохранить. Если пользователь говорит: «Запомни этот PR-список», модели предлагается возразить: «Что в этом было *удивительного* или *неочевидного*?» Эту удивительную часть стоит сохранить. Необработанный список — нет. Эта инструкция была проверена посредством оценок, начиная с 0/2 до 3/3, когда была добавлена ​​инструкция переопределения исключения.
 
-### Frontmatter as Contract
+### Frontmatter как контракт
 
-Every memory file uses YAML frontmatter with three required fields:
+Каждый файл memory использует frontmatter YAML с тремя обязательными полями:
 
 ```markdown
 ---
@@ -102,17 +102,17 @@ type: {{user, feedback, project, reference}}
 ---
 ```
 
-The `description` is the most load-bearing field. It is what the relevance selector (a Sonnet side-query, discussed below) uses to decide whether to surface this memory. A vague description like "testing stuff" will either match too broadly or fail to match at all. A specific description like "Integration tests must hit real DB, not mocks -- burned by mock divergence Q4" matches exactly the conversations where it matters. The description is the memory's search index -- consumed not by a search engine but by a language model that can understand nuance, context, and intent.
+`description` является наиболее несущим полем. Это то, что селектор релевантности (побочный запрос Sonnet, обсуждаемый ниже) использует, чтобы решить, следует ли отображать эту memory. Расплывчатое описание, такое как «тестирование», либо будет соответствовать слишком широко, либо вообще не будет соответствовать. Конкретное описание, такое как «Интеграционные тесты должны касаться реальной БД, а не макетов — сожжено ложным расхождением Q4», соответствует именно тем разговорам, где это имеет значение. Описание — это индекс поиска в memory, используемый не поисковой системой, а языковой моделью, которая может понимать нюансы, контекст и намерения.
 
-The frontmatter is also the only part of the file that the scanning system reads during recall. `scanMemoryFiles()` reads each file only to its first 30 lines to extract the header. The body is private until the file is explicitly selected and loaded.
+Вступительная часть также является единственной частью файла, которую считывает система сканирования во время вызова. `scanMemoryFiles()` считывает каждый файл только до первых 30 строк для извлечения заголовка. Тело является закрытым до тех пор, пока файл не будет явно выбран и загружен.
 
 ---
 
-## The Write Path
+## Путь записи
 
-Writing a memory is a two-step process executed with standard file tools.
+Запись memory — это двухэтапный процесс, выполняемый стандартными файловыми tools.
 
-**Step 1: Write the memory file.** The model creates a `.md` file in the memory directory with YAML frontmatter:
+**Шаг 1. Запишите файл memory.** Модель создает файл `.md` в каталоге memory с заголовком YAML:
 
 ```markdown
 ---
@@ -130,25 +130,25 @@ queries hit edge cases the mocks didn't cover.
 operations should use the real PGlite instance from test-utils.
 ```
 
-**Step 2: Update the index.** The model adds a one-line pointer to `MEMORY.md`:
+**Шаг 2. Обновите индекс.** Модель добавляет однострочный указатель на `MEMORY.md`:
 
 ```markdown
 - [Testing Policy](feedback_testing.md) -- integration tests must hit real DB
 ```
 
-Each entry must stay under approximately 150 characters. The index is a table of contents, not a knowledge base.
+Каждая запись должна содержать не более 150 символов. Индекс представляет собой оглавление, а не базу знаний.
 
-When the model learns new information that modifies an existing memory, it uses `FileEditTool` to update the existing file rather than creating a duplicate. The system does not version memories internally -- the file is on the local filesystem, and the user has `git` if they want versioning. Before the prompt is built, `ensureMemoryDirExists()` creates the memory directory, and the prompt tells the model the directory already exists, avoiding wasted turns on `ls` and `mkdir -p`.
+Когда модель изучает новую информацию, которая изменяет существующую memory, она использует `FileEditTool` для обновления существующего файла, а не для создания дубликата. Система не создает версии memory внутри себя — файл находится в локальной файловой системе, и у пользователя есть `git`, если он хочет управлять версиями. Прежде чем будет построено prompt, `ensureMemoryDirExists()` создает каталог memory, и prompt сообщает модели, что каталог уже существует, избегая напрасных включений `ls` и `mkdir -p`.
 
 ---
 
-## The Recall Path
+## Путь возврата
 
-Writing memories is necessary but not sufficient. The harder problem is retrieval: given a user's query, which of the potentially hundreds of memory files should be loaded into the model's context? Loading all of them would exhaust the token budget. Loading none would defeat the purpose. Loading the wrong ones would waste tokens on irrelevant information while missing the knowledge that would have changed the model's behavior.
+Записывать воспоминания необходимо, но недостаточно. Более сложная проблема — поиск: учитывая запрос пользователя, какой из потенциально сотен файлов memory следует загрузить в контекст модели? Загрузка их всех исчерпает бюджет токена. Ничего не загружая, это противоречит цели. Загрузка неправильных значений приведет к потере токенов ненужной информации и потере знаний, которые могли бы изменить поведение модели.
 
-The recall system operates in two tiers. The `MEMORY.md` index is always loaded into context at session start, providing orientation. Individual memory files are surfaced on-demand through an LLM-powered relevance query that selects up to five memories per turn.
+Система отзыва работает на двух уровнях. Индекс `MEMORY.md` всегда загружается в контекст при запуске сеанса, обеспечивая ориентацию. Отдельные файлы memory отображаются по требованию с помощью релевантного запроса на основе LLM, который выбирает до пяти воспоминаний за ход.
 
-### The Full Recall Pipeline
+### Конвейер полного отзыва
 
 ```mermaid
 flowchart TD
@@ -166,79 +166,79 @@ flowchart TD
     style F fill:#fff3e0
 ```
 
-The async prefetch in step 2 is the key performance decision. By the time the main model reaches a point where recalled context would be useful, the side-query has usually already completed. The user experiences no additional latency.
+Асинхронная предварительная выборка на шаге 2 является ключевым решением по повышению производительности. К тому времени, когда основная модель достигает точки, когда вызванный контекст может оказаться полезным, побочный запрос обычно уже завершается. Пользователь не испытывает дополнительных задержек.
 
-### The Sonnet Side-Query
+### Дополнительный запрос Sonnet
 
-The manifest is sent to a Sonnet model as a side-query. The system prompt for this selector is precise:
+Манифест отправляется модели Sonnet в качестве побочного запроса. Системная prompt для этого селектора точна:
 
-The system prompt for the selector instructs it to be conservative: include only memories that will be useful for the current query, skip memories if uncertain, and avoid selecting API/usage documentation for tools already in active use (since the model already has those tools loaded) -- but still surface warnings, gotchas, or known issues about those tools.
+Системное prompt для селектора предписывает ему быть консервативным: включать только те воспоминания, которые будут полезны для текущего запроса, пропускать воспоминания, если они не уверены, и избегать выбора API/документации по использованию для tools, которые уже активно используются (поскольку в модели уже загружены эти tools), но все же отображать предупреждения, ошибки или известные проблемы, связанные с этими tools.
 
-The response uses structured output -- `{ selected_memories: string[] }` -- and filenames are validated against the known set.
+В ответе используется структурированный вывод — `{ selected_memories: string[] }`, а имена файлов проверяются на соответствие известному набору.
 
-This approach trades latency for precision, and the tradeoff analysis is instructive. **Keyword matching** would be fast but has no understanding of context -- it cannot express "do not select memories for tools already in active use." **Embedding similarity** handles semantic matching but introduces infrastructure (embedding model, vector store, update pipeline) and struggles with negation -- the embedding of "do NOT use database mocks" is very close to "use database mocks." **The Sonnet side-query** understands semantic relevance, reasons about context, handles negation, and requires zero infrastructure. The latency cost is bounded (hundreds of milliseconds) and hidden behind the main model's initial processing.
+Этот подход меняет задержку на точность, и анализ компромиссов поучителен. **Сопоставление ключевых слов** будет быстрым, но не учитывает контекст: оно не может выражать фразу «не выбирать воспоминания для tools, которые уже активно используются». **Внедрение сходства** обрабатывает семантическое соответствие, но вводит инфраструктуру (модель внедрения, векторное хранилище, конвейер обновлений) и имеет проблемы с отрицанием — внедрение фразы «НЕ использовать макеты базы данных» очень близко к «использовать макеты базы данных». **Побочный запрос Sonnet** понимает семантическую релевантность, рассуждения о контексте, обрабатывает отрицание и не требует никакой инфраструктуры. Стоимость задержки ограничена (сотни миллисекунд) и скрыта за начальной обработкой основной модели.
 
-The telemetry system tracks selection rates even when no memories are selected. A selection rate of 0/150 means something different from 0/3 -- the first indicates a precision problem, the second a coverage problem.
-
----
-
-## Staleness
-
-The staleness system addresses a failure mode that emerged from real usage. Users reported that old memories -- containing file:line citations to code that had since changed -- were being asserted as fact by the model. The citation made the stale claim sound *more* authoritative, not less.
-
-The solution is not expiration. Old memories are not deleted -- they may contain institutional knowledge valid for years. Instead, the system attaches age warnings:
-
-The staleness function computes the memory's age in days. Memories from today or yesterday get no warning (the function returns an empty string). Everything older gets a caveat injected alongside the memory content: a message stating the age in days and warning that code behavior claims or file:line citations may be outdated, advising verification against current code.
-
-Memories from today or yesterday get no warning. Everything older gets a staleness caveat injected alongside the memory content. The human-readable format -- "today," "yesterday," "47 days ago" -- exists because models are poor at date arithmetic. A raw ISO timestamp does not trigger staleness reasoning the way "47 days ago" does. This is an empirical observation about model behavior, validated through evals: the action-cue framing "Before recommending from memory" scored 3/3 versus 0/3 for the more abstract "Trusting what you recall," with identical body text.
-
-There is a philosophical tension worth naming. The staleness system treats memories as hypotheses, not facts. But the model's natural tendency is to present information confidently. The staleness warning is fighting the model's own voice -- using its instruction-following capability to override its confidence-generation tendency.
+Система телеметрии отслеживает скорость выбора, даже если ни одна memory не выбрана. Скорость выбора 0/150 означает нечто иное, чем 0/3: первое указывает на проблему точности, второе - на проблему покрытия.
 
 ---
 
-## MEMORY.md as the Always-Loaded Index
+## Устаревание
 
-Every conversation begins with `MEMORY.md` in context. It is not a memory -- it is an index, a table of contents for the actual memory files.
+Система устаревания устраняет режим сбоя, возникший в результате реального использования. Пользователи сообщали, что старые воспоминания, содержащие ссылки на файл:строки кода, который с тех пор изменился, подтверждались моделью как факт. Благодаря этой цитате устаревшее утверждение звучало *более* авторитетно, а не менее.
 
-The index has two hard caps:
+Решение не в истечении срока действия. Старые воспоминания не удаляются — они могут содержать институциональные знания, действительные годами. Вместо этого система прикрепляет возрастные предупреждения:
 
-The index has two hard caps: 200 lines and 25,000 bytes.
+Функция устаревания вычисляет возраст memory в днях. Воспоминания сегодняшнего или вчерашнего дня не получают предупреждения (функция возвращает пустую строку). Все более старое получает предупреждение вместе с содержимым memory: сообщение, указывающее возраст в днях и предупреждающее, что утверждения о поведении кода или ссылки на файлы: строки могут быть устаревшими, предлагая проверку на соответствие текущему коду.
 
-The 200-line cap catches normal growth. The 25KB byte cap catches an observed failure mode: users packing long lines that stay under 200 lines but consume enormous token budgets. At the 97th percentile, a MEMORY.md with only 197 lines weighed 197KB. When either cap fires, actionable guidance tells the user what to fix: "Keep index entries to one line under ~200 chars; move detail into topic files."
+Воспоминания о сегодняшнем или вчерашнем дне не вызывают никаких предупреждений. Все более старое получает предупреждение об устаревании вместе с содержимым memory. Удобочитаемый формат — «сегодня», «вчера», «47 дней назад» — существует потому, что модели плохо справляются с арифметикой дат. Необработанная временная метка ISO не вызывает устаревания, как это происходит «47 дней назад». Это эмпирическое наблюдение о поведении модели, подтвержденное посредством оценок: рамка-prompt к действию «Прежде чем рекомендовать по memory» получила оценку 3/3 по сравнению с 0/3 для более абстрактной «Доверять тому, что вы помните» с идентичным основным текстом.
 
-This two-tier architecture -- lightweight always-on index plus heavy on-demand content -- is the design that allows memory to scale. A project with 150 memories has a 150-line index consuming perhaps 3,000 tokens, not 150 full files consuming 100,000.
-
----
-
-The transition from individual memory to shared knowledge is natural. A testing policy, a deployment convention, a known gotcha in the build system -- these need to be shared across a team.
-
-## Team Memory
-
-Team memory is a subdirectory of the auto-memory directory at `<autoMemPath>/team/`, gated behind a feature flag and requiring auto-memory to be enabled. The architectural nesting is deliberate: disabling auto-memory transitively disables team memory.
-
-### Defense in Depth
-
-Team memory introduces an attack surface that individual memory does not have. Team-synced files come from other users, and a malicious teammate could attempt path traversal. The security model uses three layers of defense.
-
-**Layer 1: Input sanitization.** The `sanitizePathKey()` function validates against null bytes, URL-encoded traversals (`%2e%2e%2f`), Unicode normalization attacks (fullwidth characters that normalize to `../`), backslashes, and absolute paths.
-
-**Layer 2: String-level path validation.** After sanitization, `path.resolve()` normalizes remaining `..` segments, and the resolved path is checked against the team directory prefix (including a trailing separator to prevent `team-evil/` from matching `team/`).
-
-**Layer 3: Symlink resolution.** `realpathDeepestExisting()` resolves symlinks on the deepest existing ancestor, catching attacks that string-level validation cannot detect. If `team/evil` is a symlink pointing to `/etc/`, string validation sees a valid prefix, but `realpath` reveals the true target.
-
-All validation failures produce a `PathTraversalError`. No partial successes, no fallbacks. Fail closed.
-
-### Scope Guidance
-
-The prompt teaches the model about private vs. shared memory. User memories are always private. Reference memories are usually team. Feedback memories default to private unless they represent project-wide conventions. The cross-checking instruction -- "Before saving a private feedback memory, check that it does not contradict a team feedback memory" -- prevents conflicting guidance from surfacing unpredictably depending on which memory is recalled first.
+Существует философское напряжение, о котором стоит упомянуть. Система устаревания рассматривает воспоминания как гипотезы, а не факты. Но естественная тенденция модели — уверенно представлять информацию. Предупреждение об устаревании борется с собственным голосом модели, используя ее способность следовать инструкциям, чтобы преодолеть тенденцию создания доверия.
 
 ---
 
-## KAIROS Mode: Append-Only Daily Logs
+## MEMORY.md как всегда загружаемый индекс
 
-Standard memory assumes discrete sessions. KAIROS mode (Claude Code's assistant mode) breaks this assumption -- sessions are long-lived, potentially running for days. The two-step write pattern does not scale to continuous operation.
+Каждый разговор начинается с `MEMORY.md` в контексте. Это не memory — это индекс, таблица содержания реальных файлов memory.
 
-The solution is architectural separation between capture and consolidation:
+Индекс имеет два жестких ограничения:
+
+Индекс имеет два жестких ограничения: 200 строк и 25 000 байт.
+
+Ограничение в 200 строк ловит нормальный рост. Ограничение в 25 КБ фиксирует наблюдаемый режим сбоя: пользователи упаковывают длинные строки, длина которых не превышает 200 строк, но потребляют огромные бюджеты токенов. На 97-м процентиле MEMORY.md всего со 197 строками весил 197 КБ. Когда срабатывает любой из этих ограничений, пользователю подсказывает практическое руководство, что нужно исправить: «Сохраняйте записи указателя в одну строку длиной менее 200 символов; перемещайте детали в файлы тем».
+
+Эта двухуровневая архитектура — легкий постоянный индекс и большой объем контента по запросу — позволяет масштабировать memory. Проект со 150 memoryю имеет 150-строчный индекс, потребляющий, возможно, 3000 токенов, а не 150 полных файлов, потребляющих 100 000.
+
+---
+
+Переход от индивидуальной memory к общим знаниям естественен. Политика тестирования, соглашение о развертывании, известные ошибки в системе сборки — все это должно быть доступно всей команде.
+
+## Командная memory
+
+Memory команды — это подкаталог каталога автоматической memory по адресу `<autoMemPath>/team/`, закрытый флагом функции и требующий включения автоматической memory. Архитектурная вложенность является преднамеренной: отключение автоматической memory транзитивно отключает групповую memory.
+
+### Глубокая защита
+
+Командная memory создает поверхность атаки, которой нет у индивидуальной memory. Файлы, синхронизированные командой, поступают от других пользователей, и злонамеренный товарищ по команде может попытаться обойти путь. Модель безопасности использует три уровня защиты.
+
+**Уровень 1: очистка ввода.** Функция `sanitizePathKey()` проверяет наличие нулевых байтов, обходов в URL-коде (`%2e%2e%2f`), атак нормализации Юникода (символы полной ширины, которые нормализуются до `../`), обратной косой черты и абсолютных путей.
+
+**Уровень 2: проверка пути на уровне строки.** После очистки `path.resolve()` нормализует оставшиеся сегменты `..`, а разрешенный путь сверяется с префиксом каталога группы (включая завершающий разделитель, чтобы предотвратить совпадение `team-evil/` с `team/`).
+
+**Уровень 3: разрешение символических ссылок.** `realpathDeepestExisting()` разрешает символические ссылки на самом глубоком из существующих предков, перехватывая атаки, которые не может обнаружить проверка на уровне строки. Если `team/evil` является символической ссылкой, указывающей на `/etc/`, проверка строки видит действительный префикс, но `realpath` показывает истинную цель.
+
+Все ошибки проверки приводят к ошибке `PathTraversalError`. Ни частичных успехов, ни отступлений. Фэйл закрылся.
+
+### Руководство по области применения
+
+prompt рассказывает модели о частной и общей memory. Пользовательские воспоминания всегда конфиденциальны. Справочные воспоминания обычно являются командными. Memory обратной связи по умолчанию является частной, если она не соответствует соглашениям всего проекта. Инструкция перекрестной проверки — «Прежде чем сохранять частную memory обратной связи, убедитесь, что она не противоречит memory обратной связи команды» — предотвращает непредсказуемое всплывание противоречивых указаний в зависимости от того, какая memory вызывается первой.
+
+---
+
+## KAIROS Режим: ежедневные журналы только для добавления
+
+Стандартная memory предполагает дискретные сеансы. Режим KAIROS (режим помощника Claude Code) нарушает это предположение — сеансы долговечны и могут длиться несколько дней. Двухэтапный шаблон записи не масштабируется для непрерывной работы.
+
+Решением является архитектурное разделение захвата и консолидации:
 
 ```mermaid
 graph LR
@@ -257,64 +257,64 @@ graph LR
     style B3 fill:#fff9c4
 ```
 
-In KAIROS mode, the model appends to date-named log files (`<autoMemPath>/logs/YYYY/MM/YYYY-MM-DD.md`). Each entry is a short timestamped bullet. The model is instructed: "Do not rewrite or reorganize the log" -- restructuring during capture loses the chronological signal that consolidation needs.
+В режиме KAIROS модель добавляется в файлы журнала с именем по дате (`<autoMemPath>/logs/YYYY/MM/YYYY-MM-DD.md`). Каждая запись представляет собой короткую метку с меткой времени. Модель указана: «Не перезаписывайте и не реорганизовывайте журнал» — при реструктуризации во время захвата теряется хронологический сигнал, необходимый для консолидации.
 
-The path in the prompt is described as a *pattern* rather than today's literal date. This is a caching optimization: the memory prompt is cached and not invalidated when the date changes at midnight. The model derives the current date from a separate `date_change` attachment.
+Путь в prompt описывается как *шаблон*, а не как сегодняшняя буквальная дата. Это оптимизация кэширования: prompt memory кэшируется и не становится недействительным при изменении даты в полночь. Модель получает текущую дату из отдельного вложения `date_change`.
 
-### The /dream Consolidation
+### Объединение /dream
 
-Consolidation runs in four phases: **Orient** (list directory, read index, skim existing files), **Gather** (search logs, check for drifted memories), **Consolidate** (write or update files, merge rather than duplicate), **Prune** (update index under 200 lines, remove stale pointers). The emphasis on merging into existing files rather than creating new ones is important -- without it, the memory directory would grow linearly with usage.
+Консолидация выполняется в четыре этапа: **Ориентирование** (список каталогов, чтение индекса, просмотр существующих файлов), **Сбор** (поиск в журналах, проверка на наличие смещенных воспоминаний), **Консолидация** (запись или обновление файлов, объединение, а не дублирование), **Сокращение** (обновление индекса длиной менее 200 строк, удаление устаревших указателей). Акцент на слиянии с существующими файлами, а не на создании новых важен — без него каталог memory будет расти линейно по мере использования.
 
-### The Consolidation Lock
+### Блокировка консолидации
 
-The lock file `.consolidate-lock` serves dual purpose: its content is the holder's PID (mutual exclusion), its mtime *is* `lastConsolidatedAt` (scheduling state). The auto-dream fires when three gates pass, evaluated cheapest-first: hours since last consolidation exceeds 24, sessions modified since then exceeds 5, and no other process holds the lock. Crash recovery detects dead PIDs via `process.kill(pid, 0)`, with a one-hour staleness timeout as defense against PID reuse.
-
----
-
-## Background Extraction
-
-The main agent has full instructions for writing memories proactively. But agents are imperfect -- and the imperfection is predictable. When a user says "remember to always use integration tests" and then immediately asks "now fix the login bug," the model's attention shifts entirely to the bug. The memory-saving instruction was processed but may not execute.
-
-At the end of each complete query loop, a forked agent -- sharing the parent's prompt cache -- analyzes recent messages and writes any memories the main agent missed. When the main agent has already written memories in the current turn range, the extraction agent skips that range. The extraction agent has a constrained tool budget: read-only tools plus write access only to memory directory paths. Its prompt instructs a two-turn strategy: turn 1 reads in parallel, turn 2 writes in parallel.
-
-The interaction is cooperative, not competitive. The main agent's prompt always contains the full save instructions. When the main agent saves, the background agent defers. When it does not, the background agent catches the gap. This pattern -- a primary path with a background safety net -- makes memory capture more reliable without burdening the primary interaction. Neither alone would be sufficient.
+Файл блокировки `.consolidate-lock` служит двойной цели: его содержимым является PID владельца (взаимное исключение), а его mtime *is* `lastConsolidatedAt` (State планирования). Автоматический сон срабатывает, когда проходят три врата, оцениваемые в первую очередь с наименьшими затратами: количество часов с момента последней консолидации превышает 24, количество измененных с тех пор сеансов превышает 5, и никакой другой процесс не удерживает блокировку. Восстановление после сбоя обнаруживает неработающие PID через `process.kill(pid, 0)` с одночасовым тайм-аутом устаревания в качестве защиты от повторного использования PID.
 
 ---
 
-## Path Resolution and Security
+## Извлечение фона
 
-The auto-memory path is resolved through a priority chain:
+У главного agent есть полные инструкции по активному написанию воспоминаний. Но agents несовершенны, и это несовершенство предсказуемо. Когда пользователь говорит: «Не забывайте всегда использовать интеграционные тесты», а затем тут же спрашивает: «А теперь исправьте ошибку входа в систему», внимание модели полностью переключается на ошибку. Инструкция по экономии memory была обработана, но не может быть выполнена.
 
-1. **`CLAUDE_COWORK_MEMORY_PATH_OVERRIDE`** -- Full-path override for Cowork.
-2. **`autoMemoryDirectory` in settings.json** -- Only trusted settings sources. Project settings are intentionally excluded.
-3. **Default computed path** -- `~/.claude/projects/<sanitized-git-root>/memory/`.
+В конце каждого полного Query Loop fork agent, использующий родительский Prompt Cache, анализирует последние сообщения и записывает любые воспоминания, которые пропустил главный agent. Когда главный agent уже записал воспоминания в текущем диапазоне хода, agent извлечения пропускает этот диапазон. Agent извлечения имеет ограниченный бюджет tools: tools только для чтения плюс доступ на запись только к путям каталогов в memory. Его prompt указывает на двухходовую стратегию: первый этап читает параллельно, второй этап записывает параллельно.
 
-The exclusion of project settings is a security decision. A malicious repository could commit `.claude/settings.json` with `autoMemoryDirectory: "~/.ssh"`, and the permission carve-out for memory files would grant the model automatic write access to SSH keys. By limiting the override to policy, flag, local, and user settings -- none committable to a repository -- this attack vector is closed.
-
-The `isAutoMemPath()` function normalizes paths before prefix-checking to prevent traversal, and the trailing separator convention ensures prefix matching requires a directory boundary.
-
-### The Enable/Disable Chain
-
-Whether auto-memory is active is determined by `isAutoMemoryEnabled()`, implementing its own priority chain: environment variable, bare mode, CCR without persistent storage, settings, default enabled. When disabled, both the prompt section is dropped (so the model receives no memory instructions) and the background processes stop (extract-memories, auto-dream, team sync). Both gates must align -- removing the prompt alone would not stop the extraction agent, which has its own prompt.
+Взаимодействие носит кооперативный, а не конкурентный характер. prompt главного agent всегда содержит полные инструкции по сохранению. Когда основной agent сохраняет данные, фоновый agent откладывает выполнение. Если этого не происходит, фоновый agent улавливает пробел. Этот шаблон — основной путь с фоновой сетью безопасности — делает захват memory более надежным, не обременяя основное взаимодействие. Ни того, ни другого было бы недостаточно.
 
 ---
 
-## Apply This: Designing Agent Memory
+## Разрешение пути и безопасность
 
-The memory system's complexity is in the behavioral layer -- prompt instructions, LLM-powered recall, staleness management, background extraction -- not in storage infrastructure. This distribution of complexity is itself a design principle.
+Путь автозапоминания определяется через цепочку приоритетов:
 
-**Files beat databases for agent memory.** Files are inspectable, editable, and version-controllable. Transparency builds trust. When the alternative is a database users cannot easily read, files win on trust alone.
+1. **`CLAUDE_COWORK_MEMORY_PATH_OVERRIDE`** – переопределение полного пути для Cowork.
+2. **`autoMemoryDirectory` в settings.json** -- Только проверенные источники настроек. Настройки проекта намеренно исключены.
+3. **Вычисляемый путь по умолчанию** — `~/.claude/projects/<sanitized-git-root>/memory/`.
 
-**Constrain what gets saved, not just how.** The derivability test -- can this knowledge be re-derived from the current project state? -- eliminates the majority of potential memories while preserving the ones that actually matter.
+Исключение настроек проекта является решением безопасности. Вредоносный репозиторий может зафиксировать `.claude/settings.json` с помощью `autoMemoryDirectory: "~/.ssh"`, а исключение разрешений для файлов memory предоставит модели автоматический доступ для записи к ключам SSH. Ограничивая переопределение политиками, флагами, локальными и пользовательскими настройками (ни один из которых не может быть передан в репозиторий), этот вектор атаки закрывается.
 
-**Use an LLM for recall, not keywords or embeddings.** An LLM side-query understands context, reasons about what is already available in conversation, handles negation, and requires no index maintenance. The latency cost is real but bounded and hidden behind the main model's processing.
+Функция `isAutoMemPath()` нормализует пути перед проверкой префикса, чтобы предотвратить обход, а соглашение о конечном разделителе гарантирует, что для сопоставления префиксов требуется граница каталога.
 
-**Warn about staleness, do not expire.** Institutional knowledge may remain valid for years. Attaching age warnings lets the model treat old memories as hypotheses rather than facts. The human-readable age format triggers the right reasoning in a way that raw timestamps do not.
+### Цепочка включения/выключения
 
-**Build a safety net for capture.** The main agent will miss memories. A background extraction agent that reviews recent conversation makes the system more reliable without burdening the primary interaction. When the main agent saves, the background agent defers.
+Активна ли автоматическая memory, определяется `isAutoMemoryEnabled()`, реализующим собственную цепочку приоритетов: переменная среды, простой режим, CCR без постоянного хранилища, настройки, включено по умолчанию. Если этот параметр отключен, раздел prompts удаляется (поэтому модель не получает инструкций по использованию memory), а фоновые процессы останавливаются (извлечение воспоминаний, автоматическое сновидение, групповая синхронизация). Оба шлюза должны совместиться — удаление одной prompt не остановит agent извлечения, у которого есть своя собственная prompt.
 
 ---
 
-The agent can now learn across sessions -- accumulating knowledge about its user, their preferences, their project's state, and the corrections they have made. The memory system makes a philosophical commitment: that an agent's relationship with its user should deepen over time, not reset on every interaction. The file-based implementation makes that commitment tangible -- visible on disk, editable by humans, version-controlled alongside code. The agent's memory is not a black box. It is a collection of notes in a folder, written in a language that both the model and the human can read.
+## Примените это: проектирование memory agent
 
-The next chapter examines how Claude Code extends its capabilities beyond the core: the skills system that teaches the model new behaviors, and the hooks system that lets external code constrain and modify those behaviors at over two dozen lifecycle points.
+Сложность системы memory находится на поведенческом уровне (prompt, вызов с помощью LLM, управление устаревшими данными, фоновое извлечение), а не в инфраструктуре хранения данных. Такое распределение сложности само по себе является принципом проектирования.
+
+**Файлы превосходят базы данных по объему memory agent.** Файлы можно проверять, редактировать и контролировать версии. Прозрачность укрепляет доверие. Когда альтернативой является база данных, которую пользователи не могут легко прочитать, файлы выигрывают только за счет доверия.
+
+**Ограничьте то, что будет сохранено, а не только то, как.** Тест на выводимость: можно ли повторно получить эти знания из текущего State проекта? - устраняет большую часть потенциальных воспоминаний, сохраняя при этом те, которые действительно имеют значение.
+
+**Используйте LLM для вызова, а не ключевых слов или встраивания.** Побочный запрос LLM понимает контекст, рассуждения о том, что уже доступно в разговоре, обрабатывает отрицание и не требует обслуживания индекса. Стоимость задержки реальна, но ограничена и скрыта за обработкой основной модели.
+
+**Предупреждайте об устаревании, срок действия не истекает.** Институциональные знания могут оставаться действительными в течение многих лет. Добавление предупреждений о возрасте позволяет модели рассматривать старые воспоминания как гипотезы, а не как факты. Удобочитаемый формат возраста вызывает правильные рассуждения, чего не делают необработанные временные метки.
+
+**Создайте защитную сеть для поимки.** Главный agent будет скучать по воспоминаниям. Agent извлечения фона, который просматривает недавний разговор, делает систему более надежной, не нагружая основное взаимодействие. Когда основной agent сохраняет данные, фоновый agent откладывает выполнение.
+
+---
+
+Теперь agent может учиться в ходе сеансов, накапливая знания о своем пользователе, его предпочтениях, State проекта и внесенных ими исправлениях. Система memory берет на себя философское обязательство: отношения agent с пользователем должны со временем углубляться, а не сбрасываться при каждом взаимодействии. Реализация на основе файлов делает это обязательство осязаемым — видимым на диске, доступным для редактирования людьми, контролируемым версиями наряду с кодом. Memory agent — не черный ящик. Это коллекция заметок в папке, написанная на языке, понятном как модели, так и человеку.
+
+В следующей главе рассматривается, как Claude Code расширяет свои возможности за пределы ядра: система skills, которая обучает модель новому поведению, и система hooks, которая позволяет внешнему коду ограничивать и изменять это поведение на более чем двух десятках точек жизненного цикла.

@@ -1,22 +1,22 @@
-# Chapter 7: Concurrent Tool Execution
+# Глава 7: Параллельное выполнение tools
 
-## The Cost of Waiting
+## Цена ожидания
 
-Chapter 6 traced the lifecycle of a single tool call -- from the raw `tool_use` block in the API response through input validation, permission checks, execution, and result formatting. That pipeline handles one tool. But the model rarely requests just one.
+В главе 6 прослеживается жизненный цикл одного tool call — от необработанного блока `tool_use` в ответе API до проверки входных данных, проверок разрешений, выполнения и форматирования результатов. Этот конвейер обрабатывает один tool. Но модель редко просит только одну.
 
-A typical Claude Code interaction involves three to five tool calls per turn. "Read these two files, grep for this pattern, then edit this function." The model emits all of those in a single response. If each tool takes 200 milliseconds, running them sequentially costs a full second. If the Read and Grep calls are independent -- and they are -- running them in parallel cuts that to 200 milliseconds. Five-to-one improvement, free.
+Типичное взаимодействие Claude Code включает от трех до пяти вызовов tool за ход. «Прочитайте эти два файла, найдите этот шаблон, затем отредактируйте эту функцию». Модель выдает все это в одном ответе. Если каждый tool занимает 200 миллисекунд, их последовательный запуск будет стоить целую секунду. Если вызовы Read и Grep независимы (а они независимы), их параллельный запуск сокращает это время до 200 миллисекунд. Улучшение пять к одному, бесплатно.
 
-But not all tools are independent. An Edit that modifies `config.ts` cannot run concurrently with another Edit that modifies `config.ts`. A Bash command that creates a directory must complete before a Bash command that writes a file into that directory. Concurrency is not a global property of a tool. It is a property of a specific tool invocation with specific inputs.
+Но не все tools независимы. Редактирование, изменяющее `config.ts`, не может выполняться одновременно с другим редактированием, изменяющим `config.ts`. Команда Bash, создающая каталог, должна завершиться до того, как команда Bash записывает файл в этот каталог. Параллелизм не является глобальным свойством tool. Это свойство конкретного tool call с конкретными входными данными.
 
-This is the insight that drives the entire concurrency system: **safety is per-call, not per-tool-type**. `Bash("ls -la")` is safe to parallelize. `Bash("rm -rf build/")` is not. The same tool, different inputs, different concurrency classification. The system must inspect the input before deciding.
+Именно эта идея лежит в основе всей системы параллелизма: **безопасность зависит от каждого вызова, а не от каждого типа tool**. `Bash("ls -la")` безопасно распараллеливать. `Bash("rm -rf build/")` нет. Один и тот же tool, разные входные данные, разная классификация параллелизма. Прежде чем принять решение, система должна проверить входные данные.
 
-Claude Code implements two layers of concurrency optimization. The first is **batch orchestration**: after the model's response is fully received, partition the tool calls into concurrent and serial groups, then execute each group appropriately. The second is **speculative execution**: start running tools *while the model is still streaming its response*, harvesting results before the response is even complete. Together, these two mechanisms eliminate most of the wall-clock time that would otherwise be spent waiting.
+Claude Code реализует два уровня оптимизации параллелизма. Первый — это **batchная оркестровка**: после того, как ответ модели полностью получен, разделите вызовы tool на параллельные и последовательные группы, а затем соответствующим образом выполните каждую группу. Второй — **спекулятивное выполнение**: запустите tools *пока модель все еще передает свой ответ*, собирая результаты еще до того, как ответ будет завершен. Вместе эти два механизма устраняют большую часть времени настенных часов, которое в противном случае было бы потрачено на ожидание.
 
 ---
 
-## The Partition Algorithm
+## Алгоритм разделения
 
-The entry point is `partitionToolCalls()` in `toolOrchestration.ts`. It takes an ordered array of `ToolUseBlock` messages and produces an array of batches, where each batch is either "all concurrent-safe" or "a single serial tool."
+Точка входа — `partitionToolCalls()` в `toolOrchestration.ts`. Он принимает упорядоченный массив сообщений `ToolUseBlock` и создает массив bundleов, где каждый batch либо «все параллельные», либо «один последовательный tool».
 
 ```typescript
 // Pseudocode — illustrates the partition algorithm
@@ -41,14 +41,14 @@ function groupBySafety(calls: ToolCall[], registry: ToolRegistry): Group[] {
 }
 ```
 
-The algorithm walks the array left to right. For each tool call:
+Алгоритм просматривает массив слева направо. Для каждого tool call:
 
-1. **Look up the tool definition** by name.
-2. **Parse the input** with the tool's Zod schema via `safeParse()`. If parsing fails, the tool is conservatively classified as not concurrency-safe.
-3. **Call `isConcurrencySafe(parsedInput)`** on the tool definition. This is where per-input classification happens. The Bash tool parses the command string, checks if every subcommand is read-only (`ls`, `grep`, `cat`, `git status`), and returns `true` only if the entire compound command is a pure read. The Read tool always returns `true`. The Edit tool always returns `false`. The call is wrapped in try-catch -- if `isConcurrencySafe` throws (say, the Bash command string can't be parsed by the shell-quote library), the tool defaults to serial.
-4. **Merge or create a batch.** If the current tool is concurrency-safe AND the most recent batch is also concurrency-safe, append to that batch. Otherwise, start a new batch.
+1. **Найдите определение tool** по названию.
+2. **Проанализируйте входные данные** с помощью схемы Zod tool через `safeParse()`. Если синтаксический анализ завершается неудачей, tool консервативно классифицируется как небезопасный для параллелизма.
+3. **Вызовите `isConcurrencySafe(parsedInput)`** для определения tool. Здесь происходит классификация по входу. Tool Bash анализирует командную строку, проверяет, доступна ли каждая подкоманда только для чтения (`ls`, `grep`, `cat`, `git status`), и возвращает `true`, только если вся составная команда является чистым чтением. Tool «Чтение» всегда возвращает `true`. Tool редактирования всегда возвращает `false`. Вызов заключен в try-catch - если `isConcurrencySafe` выдает ошибку (скажем, командная строка Bash не может быть проанализирована библиотекой кавычек оболочки), tool по умолчанию использует последовательный порт.
+4. **Объедините или создайте batch.** Если текущий tool безопасен для параллелизма И самый последний batch также безопасен для параллелизма, добавьте его к этому batchу. В противном случае запустите новую партию.
 
-The result is a sequence of batches that alternates between concurrent groups and individual serial entries. Walk through a concrete example:
+Результатом является последовательность партий, в которой чередуются одновременные группы и отдельные серийные записи. Рассмотрим конкретный пример:
 
 ```
 Model requests: [Read, Read, Grep, Edit, Read]
@@ -65,17 +65,17 @@ Result: 3 batches
   Batch 3: [Read]              — run concurrently (just one tool)
 ```
 
-The partitioning is greedy and order-preserving. Consecutive safe tools accumulate into a single batch. Any unsafe tool breaks the run and starts a new batch. This means the order in which the model emits tool calls matters -- if it interleaves a Write between two Reads, you get three batches instead of two. In practice, models tend to cluster their reads together, which is the common case the algorithm is optimized for.
+Разделение является жадным и сохраняет порядок. Последовательные безопасные tools накапливаются в одну партию. Любой небезопасный tool прерывает цикл и запускает новую партию. Это означает, что порядок, в котором модель генерирует tool calls, имеет значение — если она чередует запись между двумя операциями чтения, вы получаете три batchа вместо двух. На практике модели имеют тенденцию группировать свои чтения вместе, что является распространенным случаем, для которого оптимизирован алгоритм.
 
 ---
 
-## Batch Execution
+## Пакетное выполнение
 
-The `runTools()` generator iterates through the partitioned batches and dispatches each one to the appropriate executor.
+Генератор `runTools()` перебирает разделенные batches и отправляет каждый из них соответствующему исполнителю.
 
-### Concurrent Batches
+### Параллельные batches
 
-For a concurrent batch, `runToolsConcurrently()` fires all tools in parallel using an `all()` utility that caps active generators at the concurrency limit:
+Для параллельного batchа `runToolsConcurrently()` запускает все tools параллельно с помощью утилиты `all()`, которая ограничивает активные генераторы пределом параллелизма:
 
 ```typescript
 // Pseudocode — illustrates the concurrent dispatch pattern
@@ -91,11 +91,11 @@ async function* dispatchParallel(calls, context) {
 }
 ```
 
-The concurrency limit defaults to 10, configurable via `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY`. Ten is generous -- you rarely see more than five or six tool calls in a single model response. The limit exists as a safety valve for pathological cases, not as a typical constraint.
+По умолчанию предел параллелизма равен 10, его можно настроить с помощью `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY`. Десять — это щедро: вы редко встретите более пяти или шести tool calls в одном ответе модели. Предел существует как предохранительный клапан для патологических случаев, а не как типичное ограничение.
 
-The `all()` utility is a generator-aware variant of `Promise.all` with bounded concurrency. It starts up to N generators simultaneously, yields results from whichever completes first, and starts the next queued generator as each one finishes. The mechanics are similar to a semaphore-guarded task pool, but adapted for async generators that yield intermediate results.
+Утилита `all()` — это вариант `Promise.all` с поддержкой генератора и ограниченным параллелизмом. Он запускает до N генераторов одновременно, выдает результаты в зависимости от того, какой из них завершится первым, и запускает следующий генератор в очереди по завершении каждого из них. Механика аналогична пулу Task, защищенному семафорами, но адаптирована для асинхронных генераторов, дающих промежуточные результаты.
 
-**Context modifier queuing** is the subtle part. Some tools produce *context modifiers* -- functions that transform the `ToolUseContext` for subsequent tools. When tools run concurrently, you cannot apply these modifiers immediately because other tools in the same batch are reading the same context. Instead, modifiers are collected in a map keyed by tool use ID:
+**Очередь модификаторов контекста** — это тонкая часть. Некоторые tools создают *модификаторы контекста* — функции, которые преобразуют `ToolUseContext` для последующих tools. Когда tools работают одновременно, вы не можете применить эти модификаторы немедленно, поскольку другие tools в том же batchе читают тот же контекст. Вместо этого модификаторы собираются на карте с указанием идентификатора использования tool:
 
 ```typescript
 const queuedContextModifiers: Record<
@@ -104,7 +104,7 @@ const queuedContextModifiers: Record<
 > = {}
 ```
 
-After the entire concurrent batch finishes, the modifiers are applied in tool-order (not completion-order), preserving deterministic context evolution:
+После завершения всей параллельной партии модификаторы применяются в порядке tools (а не в порядке завершения), сохраняя детерминированную эволюцию контекста:
 
 ```typescript
 for (const block of blocks) {
@@ -116,11 +116,11 @@ for (const block of blocks) {
 }
 ```
 
-In practice, none of the current concurrency-safe tools produce context modifiers -- the comment in the codebase acknowledges this explicitly. But the infrastructure exists because tools can be added by MCP servers, and a custom read-only MCP tool might legitimately want to modify context (updating a "files seen" set, for instance).
+На практике ни один из нынешних tools, обеспечивающих безопасность параллелизма, не создает модификаторы контекста — комментарий в кодовой базе явно подтверждает это. Но инфраструктура существует, потому что tools могут быть добавлены серверами MCP, а специальный tool MCP, доступный только для чтения, может законно захотеть изменить контекст (например, обновить набор «просмотренных файлов»).
 
-### Serial Batches
+### Серийные партии
 
-Serial execution is straightforward. Each tool runs, its context modifiers are applied immediately, and the next tool sees the updated context:
+Серийное исполнение простое. Каждый tool запускается, его модификаторы контекста применяются немедленно, и следующий tool видит обновленный контекст:
 
 ```typescript
 for (const toolUse of toolUseMessages) {
@@ -133,15 +133,15 @@ for (const toolUse of toolUseMessages) {
 }
 ```
 
-This is the critical difference. Serial tools can change the world for subsequent tools. An Edit modifies a file; the next Read sees the modified version. A Bash command creates a directory; the next Bash command writes into it. Context modifiers are the formalization of this dependency: they let a tool say "the execution environment has changed, here's how."
+Это критическая разница. Последовательные tools могут изменить мир для последующих tools. Edit изменяет файл; следующее чтение увидит измененную версию. Команда Bash создает каталог; в него записывается следующая команда Bash. Модификаторы контекста являются формализацией этой зависимости: они позволяют tool сказать: «Среда выполнения изменилась, вот как».
 
 ---
 
-## The Streaming Tool Executor
+## Исполнитель tool streaming
 
-Batch orchestration eliminates unnecessary serialization *after* the model's response arrives. But there is a bigger opportunity: the model's response takes time to stream. A typical multi-tool response might take 2-3 seconds to fully arrive. The first tool call is parseable after 500 milliseconds. Why wait for the remaining 2 seconds?
+Пакетная оркестровка исключает ненужную сериализацию *после* получения ответа модели. Но есть и большая возможность: для трансляции реакции модели требуется время. Типичный ответ multi-tool может занять 2–3 секунды. Первый tool call можно анализировать через 500 миллисекунд. Зачем ждать оставшиеся 2 секунды?
 
-The `StreamingToolExecutor` class implements speculative execution. As the model streams its response, each `tool_use` block is handed to the executor the moment it is fully parsed. The executor starts running it immediately -- while the model is still generating the next tool call. By the time the response finishes streaming, several tools may have already completed.
+Класс `StreamingToolExecutor` реализует спекулятивное выполнение. Когда модель передает свой ответ, каждый блок `tool_use` передается исполнителю в момент его полного анализа. Исполнитель начинает его выполнять немедленно, пока модель еще генерирует следующий tool call. К моменту завершения streaming ответа несколько tools могут уже завершить свою работу.
 
 ```mermaid
 gantt
@@ -162,13 +162,13 @@ gantt
     Tool 3 drain after stream  :b4, 2500, 2600
 ```
 
-Sequential total: 3.1s. Streaming total: 2.6s -- tools 1 and 2 completed during streaming, saving 16% of wall-clock time.
+Последовательный итог: 3,1 с. Общее время streaming: 2,6 с — tools 1 и 2 выполняются во время streaming, что позволяет сэкономить 16 % времени настенных часов.
 
-The savings compound. When the model requests five read-only tools and the response takes 3 seconds to stream, all five tools can start and finish during that 3 seconds. The post-stream drain phase has nothing left to do. The user sees results almost immediately after the last character of the model's response appears.
+Сберегательный комплекс. Когда модель запрашивает пять tools, доступных только для чтения, а для streaming ответа требуется 3 секунды, все пять tools могут запуститься и завершиться в течение этих 3 секунд. На этапе слива после потока делать нечего. Пользователь видит результаты практически сразу после появления последнего символа ответа модели.
 
-### Tool Lifecycle
+### Жизненный цикл tool
 
-Each tool tracked by the executor progresses through four states:
+Каждый tool, отслеживаемый исполнителем, проходит через четыре State:
 
 ```mermaid
 stateDiagram-v2
@@ -177,70 +177,70 @@ stateDiagram-v2
     completed --> yielded: results emitted in order
 ```
 
-- **queued**: The `tool_use` block has been parsed and registered. Waiting for concurrency conditions to allow execution.
-- **executing**: The tool's `call()` function is running. Results accumulate in a buffer.
-- **completed**: Execution finished. Results are ready to be yielded to the conversation.
-- **yielded**: Results have been emitted. Terminal state.
+- **в очереди**: блок `tool_use` проанализирован и зарегистрирован. Ожидание условий параллелизма, позволяющих выполнение.
+- **выполнение**: функция tool `call()` запущена. Результаты накапливаются в буфере.
+- **completed**: выполнение завершено. Результаты готовы к обсуждению.
+- **yielded**: результаты отправлены. Терминальное State.
 
-### addTool(): Queuing During the Stream
+### addTool(): Очередь во время трансляции
 
 ```typescript
 addTool(block: ToolUseBlock, assistantMessage: AssistantMessage): void
 ```
 
-Called by the streaming response parser each time a complete `tool_use` block arrives. The method:
+Вызывается анализатором потокового ответа каждый раз, когда поступает полный блок `tool_use`. Метод:
 
-1. Looks up the tool definition. If not found, immediately creates a `completed` entry with an error message -- no point in queuing a tool that does not exist.
-2. Parses the input and determines `isConcurrencySafe` using the same logic as `partitionToolCalls()`.
-3. Pushes a `TrackedTool` with status `'queued'`.
-4. Calls `processQueue()` -- which may start the tool immediately.
+1. Ищет определение tool. Если он не найден, немедленно создается запись `completed` с сообщением об ошибке — нет смысла ставить в очередь несуществующий tool.
+2. Анализирует входные данные и определяет `isConcurrencySafe`, используя ту же логику, что и `partitionToolCalls()`.
+3. Отправляет `TrackedTool` со статусом `'queued'`.
+4. Вызывает `processQueue()`, который может немедленно запустить tool.
 
-The call to `processQueue()` is fire-and-forget (`void this.processQueue()`). The executor does not await it. This is intentional: `addTool()` is called from the streaming parser's event handler, and blocking there would stall response parsing. The tool starts executing in the background while the parser continues consuming the stream.
+Вызов `processQueue()` выполняется по принципу «выстрелил и забыл» (`void this.processQueue()`). Исполнитель этого не ждет. Это сделано намеренно: `addTool()` вызывается из обработчика событий потокового анализатора, и его блокировка приведет к остановке анализа ответа. Tool начинает работать в фоновом режиме, в то время как анализатор продолжает использовать поток.
 
-### processQueue(): The Admission Check
+### processQueue(): Проверка поступления
 
-The admission check is a single predicate:
+Проверка допуска представляет собой один предикат:
 
 ```typescript
 // Pseudocode — illustrates the mutual exclusion rule
 canRun = noToolsRunning || (newToolIsSafe && allRunningAreSafe)
 ```
 
-A tool can start executing if and only if:
-- **No tools are currently executing** (the queue is empty), OR
-- **Both the new tool and all currently executing tools are concurrency-safe.**
+Tool может начать работу тогда и только тогда, когда:
+- **Ни один tool в данный момент не выполняется** (очередь пуста), ИЛИ
+- **Как новый tool, так и все выполняемые в данный момент tools безопасны для одновременного выполнения.**
 
-This is a mutual exclusion contract. A non-concurrent tool requires exclusive access -- nothing else can be running. Concurrent tools can share the runway with other concurrent tools, but a single non-concurrent tool in the executing set blocks everyone.
+Это договор о взаимном исключении. Непараллельный tool требует монопольного доступа — больше ничего работать не может. Параллельные tools могут использовать совместно с другими параллельными tools, но один непараллельный tool в исполняющем наборе блокирует всех.
 
-The `processQueue()` method iterates through all tools in order. For each queued tool, it checks `canExecuteTool()`. If the tool can run, it starts. If a non-concurrent tool cannot run yet, the loop *breaks* -- it stops checking subsequent tools entirely, because non-concurrent tools must maintain ordering. If a concurrent tool cannot run (blocked by an executing non-concurrent tool), the loop *continues* -- but in practice this rarely helps, because concurrent tools after a non-concurrent blocker are typically dependent on its results anyway.
+Метод `processQueue()` перебирает все tools по порядку. Для каждого tool в очереди проверяется `canExecuteTool()`. Если tool может работать, он запускается. Если непараллельный tool еще не может быть запущен, цикл *обрывается* — он полностью прекращает проверку последующих tools, поскольку непараллельные tools должны поддерживать порядок. Если параллельный tool не может запуститься (блокируется выполняющимся непараллельным tool), цикл *продолжается* - но на практике это редко помогает, потому что параллельные tools после непараллельного блокировщика обычно в любом случае зависят от его результатов.
 
-### executeTool(): The Core Execution Loop
+### executeTool(): Основной цикл выполнения
 
-This method is where the real complexity lives. It manages abort controllers, error cascades, progress reporting, and context modifiers.
+Именно в этом методе и заключается настоящая сложность. Он управляет контроллерами прерываний, каскадами ошибок, отчетами о ходе выполнения и модификаторами контекста.
 
-**Child abort controllers.** Each tool gets its own `AbortController` that is a child of a shared sibling-level controller.
+**Дочерние контроллеры прерывания.** Каждый tool получает свой собственный `AbortController`, который является дочерним по отношению к общему контроллеру родственного уровня.
 
-The hierarchy is three levels deep: the query-level controller (owned by the REPL, fires on user Ctrl+C) parents the sibling controller (owned by the streaming executor, fires on Bash errors) which parents each tool's individual controller. Aborting the sibling controller kills all running tools. Aborting a tool's individual controller kills only that tool -- but it also bubbles up to the query controller if the abort reason is not a sibling error. This bubble-up prevents the system from silently discarding the executor when, for example, a permission denial should end the entire turn.
+Иерархия состоит из трех уровней: контроллер уровня запроса (принадлежит REPL, срабатывает при нажатии пользователем Ctrl+C) является родительским контроллером-родителем (принадлежит исполнителю streaming, активируется при ошибках Bash), который является родительским для отдельного контроллера каждого tool. Прерывание родственного контроллера уничтожает все работающие tools. Прерывание отдельного контроллера tool приводит к уничтожению только этого tool, но оно также передается контроллеру запросов, если причиной прерывания не является одноуровневая ошибка. Это всплеск не позволяет системе молча отбросить исполнителя, когда, например, отказ в разрешении должен завершить весь ход.
 
-This bubble-up is essential for permission denial. When a user rejects a tool in the permission dialog, the tool's abort controller fires. That signal must reach the query loop so it can end the turn. Without it, the query loop would continue as if nothing happened, sending a stale rejection message to the model.
+Этот пузырь необходим для отказа в разрешении. Когда пользователь отклоняет tool в диалоговом окне разрешений, срабатывает контроллер отмены tool. Этот сигнал должен достичь Query Loop, чтобы завершить ход. Без него Query Loop будет продолжаться, как будто ничего не произошло, отправляя модели устаревшее сообщение об отклонении.
 
-**The sibling error cascade.** When a tool produces an error result, the executor checks whether to cancel sibling tools. The rule: **only Bash errors cascade.** When a shell command errors, the executor records the failure, captures a description of the errored tool, and aborts the sibling controller -- which cancels all other running tools in the batch.
+**Каскад одноуровневых ошибок.** Когда tool выдает результат ошибки, исполнитель проверяет, следует ли отменить одноуровневые tools. Правило: **каскадируются только ошибки Bash.** При ошибке команды оболочки исполнитель записывает сбой, записывает описание tool, в котором возникла ошибка, и прерывает работу родственного контроллера, что отменяет все остальные запущенные tools в bundleе.
 
-The rationale is pragmatic. Bash commands often form implicit dependency chains: `mkdir build && cp src/* build/ && tar -czf dist.tar.gz build/`. If `mkdir` fails, running `cp` and `tar` is pointless. Canceling siblings immediately saves time and avoids confusing error messages.
+Обоснование прагматично. Команды Bash часто образуют неявные цепочки зависимостей: `mkdir build && cp src/* build/ && tar -czf dist.tar.gz build/`. В случае сбоя `mkdir` запуск `cp` и `tar` бессмысленен. Отмена братьев и сестер немедленно экономит время и позволяет избежать запутанных сообщений об ошибках.
 
-Read and Grep errors, by contrast, are independent. If one file read fails because the file was deleted, that has no bearing on a concurrent grep searching a different directory. Canceling the grep would waste work for no reason.
+Ошибки чтения и Grep, напротив, независимы. Если чтение одного файла завершается неудачей из-за того, что файл был удален, это не имеет никакого отношения к параллельному поиску grep в другом каталоге. Отмена grep приведет к потере работы без причины.
 
-The error cascade produces synthetic error messages for sibling tools:
+Каскад ошибок выдает синтетические сообщения об ошибках для родственных tools:
 
 ```
 Cancelled: parallel tool call Bash(mkdir build) errored
 ```
 
-The description includes the first 40 characters of the errored tool's command or file path, giving the model enough context to understand what went wrong.
+Описание включает первые 40 символов команды или пути к файлу ошибочного tool, что дает модели достаточный контекст, чтобы понять, что пошло не так.
 
-**Progress messages** are handled separately from results. While results are buffered and yielded in order, progress messages (status updates like "Reading file..." or "Searching...") go to a `pendingProgress` array and are yielded immediately via `getCompletedResults()`. A resolve callback wakes up the `getRemainingResults()` loop when new progress arrives, preventing the UI from appearing frozen during long-running tools.
+**Сообщения о ходе выполнения** обрабатываются отдельно от результатов. Хотя результаты буферизуются и выдаются по порядку, сообщения о ходе выполнения (обновления статуса, такие как «Чтение файла...» или «Поиск...») передаются в массив `pendingProgress` и немедленно передаются через `getCompletedResults()`. Обратный вызов разрешения пробуждает цикл `getRemainingResults()` при поступлении нового прогресса, предотвращая зависание UI во время длительной работы tools.
 
-**Queue re-processing.** After each tool completes, `processQueue()` is called again:
+**Повторная обработка очереди.** После завершения работы каждого tool `processQueue()` вызывается снова:
 
 ```typescript
 void promise.finally(() => {
@@ -248,27 +248,27 @@ void promise.finally(() => {
 })
 ```
 
-This is how serial tools that were blocked by a concurrent batch get started. When the last concurrent tool finishes, the subsequent non-concurrent tool's `canExecuteTool()` check passes, and it begins executing.
+Именно так запускаются серийные tools, которые были заблокированы параллельным batchом. Когда последний параллельный tool завершает работу, проверка `canExecuteTool()` последующего непараллельного tool проходит, и он начинает выполнение.
 
-### Result Harvesting
+### Сбор результатов
 
-The streaming executor exposes two harvesting methods, designed for two different phases of the response lifecycle.
+Исполнитель streaming предоставляет два метода сбора данных, предназначенных для двух разных этапов жизненного цикла ответа.
 
-**`getCompletedResults()` -- mid-stream harvesting.** This is a synchronous generator called between chunks of the streaming API response. It walks the tools array in order and yields results for any tools that have completed:
+**`getCompletedResults()` — сбор данных в середине потока.** Это синхронный генератор, вызываемый между частями потокового ответа API. Он обходит массив tools по порядку и выдает результаты для всех завершенных tools:
 
-`getCompletedResults()` is a synchronous generator that walks the tools array in submission order. For each tool, it first drains any pending progress messages. If the tool is completed, it yields the results and marks it as yielded. The critical rule: if a non-concurrent tool is still executing, the walk **breaks** -- nothing after it can be yielded, even if subsequent tools have already completed. Results after a serial tool might depend on its context modifications, so they must wait. For concurrent tools, this restriction does not apply; the loop skips executing concurrent tools and continues checking subsequent entries.
+`getCompletedResults()` — синхронный генератор, который обрабатывает массив tools в порядке отправки. Для каждого tool сначала удаляются все ожидающие сообщения о ходе выполнения. Если tool завершен, он выдает результаты и помечает их как завершенные. Критическое правило: если непараллельный tool все еще выполняется, обход **прерывается** — ничего после него не может быть выдано, даже если последующие tools уже завершились. Результаты после использования последовательного tool могут зависеть от изменений его контекста, поэтому им придется подождать. Для параллельных tools это ограничение не применяется; цикл пропускает выполнение параллельных tools и продолжает проверку последующих записей.
 
-This break is the order-preservation mechanism. If a non-concurrent tool is still executing, nothing after it can be yielded -- even if subsequent tools have already completed. Results after a serial tool might depend on its context modifications, so they must wait. For concurrent tools, this restriction does not apply; the loop skips executing concurrent tools and continues checking subsequent entries.
+Этот разрыв является механизмом сохранения порядка. Если непараллельный tool все еще выполняется, после него ничего не может быть получено, даже если последующие tools уже завершились. Результаты после использования последовательного tool могут зависеть от изменений его контекста, поэтому им придется подождать. Для параллельных tools это ограничение не применяется; цикл пропускает выполнение параллельных tools и продолжает проверку последующих записей.
 
-**`getRemainingResults()` -- post-stream drain.** Called after the model's response is fully received. This async generator loops until every tool is yielded:
+**`getRemainingResults()` — слив после потока.** Вызывается после полного получения ответа модели. Этот асинхронный генератор работает до тех пор, пока не будет получен каждый tool:
 
-`getRemainingResults()` is the post-stream drain. It loops until every tool is yielded. On each iteration, it processes the queue (starting any newly-unblocked tools), yields any completed results via `getCompletedResults()`, and then -- if tools are still executing but nothing new has completed -- uses `Promise.race` to idle-wait on whichever finishes first: any executing tool's promise, or a progress-available signal. This avoids busy-polling while still waking up the moment something happens. When no tools have completed and nothing new can start, the executor waits for any executing tool to finish (or for progress to arrive). This avoids busy-polling while still waking up the moment something happens.
+`getRemainingResults()` — слив после потока. Он повторяется до тех пор, пока не будет получен каждый tool. На каждой итерации он обрабатывает очередь (запуская все недавно разблокированные tools), выдает все завершенные результаты через `getCompletedResults()`, а затем — если tools все еще выполняются, но ничего нового не было завершено — использует `Promise.race` для ожидания простоя в зависимости от того, что завершится раньше: Promise любого исполняемого tool или сигнал о доступности прогресса. Это позволяет избежать опроса занятости и при этом просыпаться в тот момент, когда что-то происходит. Когда ни один tool не завершил работу и ничего нового запустить невозможно, исполнитель ожидает завершения работы любого исполняемого tool (или достижения прогресса). Это позволяет избежать опроса занятости и при этом просыпаться в тот момент, когда что-то происходит.
 
-### Order Preservation
+### Сохранение заказа
 
-Results are yielded in the order tools were *received*, not the order they *completed*. This is a deliberate design choice.
+Результаты отображаются в том порядке, в котором tools были *получены*, а не в том порядке, в котором они *завершены*. Это осознанный дизайнерский выбор.
 
-Consider a model response that requests `[Read("a.ts"), Read("b.ts"), Read("c.ts")]`. All three start concurrently. `c.ts` finishes first (it is smaller), then `a.ts`, then `b.ts`. If results were yielded in completion order, the conversation would show:
+Рассмотрим ответ модели, который запрашивает `[Read("a.ts"), Read("b.ts"), Read("c.ts")]`. Все три стартуют одновременно. Первым финиширует `c.ts` (он меньшего размера), затем `a.ts`, затем `b.ts`. Если бы результаты были получены в порядке завершения, диалог показал бы:
 
 ```
 Tool result: c.ts contents
@@ -276,7 +276,7 @@ Tool result: a.ts contents
 Tool result: b.ts contents
 ```
 
-But the model emitted them in a-b-c order. The conversation history must match the model's expectation, or the next turn will be confused about which result corresponds to which request. By yielding in arrival order, the conversation stays coherent:
+Но модель выдавала их в порядке a-b-c. История разговоров должна соответствовать ожиданиям модели, иначе следующий ход будет запутаться в том, какой результат соответствует какому запросу. Если уступить в порядке прибытия, разговор останется связным:
 
 ```
 Tool result: a.ts contents  (completed second, yielded first)
@@ -284,11 +284,11 @@ Tool result: b.ts contents  (completed third, yielded second)
 Tool result: c.ts contents  (completed first, yielded third)
 ```
 
-The cost is minor: if tool 1 is slow and tools 2-5 are fast, the fast results sit in buffers until tool 1 finishes. But the alternative -- conversation incoherence -- is far worse.
+Затраты невелики: если tool 1 медленный, а tools 2–5 быстрые, быстрые результаты сохраняются в буферах до тех пор, пока tool 1 не завершит работу. Но альтернатива – бессвязность разговора – гораздо хуже.
 
-### discard(): The Streaming Fallback Escape Hatch
+### discard(): Резервный аварийный люк streaming
 
-When the API response stream fails mid-way (network error, server disconnect), the system retries with a new API call. But the streaming executor may have already started tools from the failed attempt. Those results are now orphaned -- they correspond to a response that was never fully received.
+Если поток ответов API терпит неудачу на полпути (ошибка сети, отключение сервера), система повторяет попытку с новым вызовом API. Но исполнитель streaming, возможно, уже запустил tools после неудачной попытки. Эти результаты теперь остались без внимания — они соответствуют ответу, который так и не был получен полностью.
 
 ```typescript
 discard(): void {
@@ -296,66 +296,66 @@ discard(): void {
 }
 ```
 
-Setting `discarded = true` causes:
-- `getCompletedResults()` returns immediately with no results.
-- `getRemainingResults()` returns immediately with no results.
-- Any tool that starts executing checks `getAbortReason()`, sees `streaming_fallback`, and gets a synthetic error instead of actually running.
+Установка `discarded = true` приводит к:
+- `getCompletedResults()` немедленно возвращается без результатов.
+- `getRemainingResults()` немедленно возвращается без результатов.
+— Любой tool, который начинает выполнять проверки `getAbortReason()`, видит `streaming_fallback` и вместо фактического запуска получает синтетическую ошибку.
 
-The discarded executor is abandoned. A fresh executor is created for the retry attempt.
+Отброшенный исполнитель заброшен. Для повторной попытки создается новый исполнитель.
 
 ---
 
-## Tool Concurrency Properties
+## Свойства параллелизма tool
 
-Each built-in tool declares its concurrency characteristics through the `isConcurrencySafe()` method. The classification is not arbitrary -- it reflects the tool's actual effect on shared state.
+Каждый встроенный tool объявляет свои характеристики параллелизма с помощью метода `isConcurrencySafe()`. Классификация не является произвольной — она отражает фактическое влияние tool на общее State.
 
-| Tool | Concurrency Safe | Condition | Rationale |
+| Tool | Безопасный параллельный доступ | State | Обоснование |
 |------|-----------------|-----------|-----------|
-| **Read** | Always | -- | Pure read. No side effects. |
-| **Grep** | Always | -- | Pure read. Wraps ripgrep. |
-| **Glob** | Always | -- | Pure read. File listing. |
-| **Fetch** | Always | -- | HTTP GET. No local side effects. |
-| **WebSearch** | Always | -- | API call to search provider. |
-| **Bash** | Sometimes | Read-only commands only | `isReadOnly()` parses the command and classifies subcommands. `ls`, `git status`, `cat`, `grep` are safe. `rm`, `mkdir`, `mv` are not. |
-| **Edit** | Never | -- | Modifies files. Two concurrent edits to the same file corrupt it. |
-| **Write** | Never | -- | Creates or overwrites files. Same corruption risk. |
-| **NotebookEdit** | Never | -- | Modifies `.ipynb` files. |
+| **Читать** | Всегда | -- | Чистое чтение. Никаких побочных эффектов. |
+| **Грэп** | Всегда | -- | Чистое чтение. Обертывает рипгреп. |
+| **Глоб** | Всегда | -- | Чистое чтение. Листинг файлов. |
+| **Выбрать** | Всегда | -- | HTTP ПОЛУЧИТЬ. Никаких местных побочных эффектов. |
+| **Веб-поиск** | Всегда | -- | API Звонок поисковому провайдеру. |
+| **Баш** | Иногда | Только команды только для чтения | `isReadOnly()` анализирует команду и классифицирует подкоманды. `ls`, `git status`, `cat`, `grep` безопасны. `rm`, `mkdir`, `mv` нет. |
+| **Изменить** | Никогда | -- | Изменяет файлы. Два одновременных редактирования одного и того же файла повреждают его. |
+| **Написать** | Никогда | -- | Создает или перезаписывает файлы. Тот же коррупционный риск. |
+| **БлокнотРедактировать** | Никогда | -- | Изменяет файлы `.ipynb`. |
 
-The Bash tool's classification deserves elaboration. It uses `splitCommandWithOperators()` to decompose compound commands (`&&`, `||`, `;`, `|`), then classifies each subcommand against known-safe sets:
+Классификация tools Bash заслуживает уточнения. Он использует `splitCommandWithOperators()` для разложения составных команд (`&&`, `||`, `;`, `|`), а затем классифицирует каждую подкоманду по известным безопасным наборам:
 
-- **Search commands**: `grep`, `rg`, `find`, `fd`, `ag`, `ack`
-- **Read commands**: `cat`, `head`, `tail`, `wc`, `jq`, `less`, `file`, `stat`
-- **List commands**: `ls`, `tree`, `du`, `df`
-- **Neutral commands**: `echo`, `printf` (no side effects but not "reads")
+- **Команды поиска**: `grep`, `rg`, `find`, `fd`, `ag`, `ack`.
+- **Команды чтения**: `cat`, `head`, `tail`, `wc`, `jq`, `less`, `file`, `stat`.
+- **Список команд**: `ls`, `tree`, `du`, `df`.
+- **Нейтральные команды**: `echo`, `printf` (без побочных эффектов, но не "чтение")
 
-A compound command is read-only only if every non-neutral subcommand is in the search, read, or list set. `ls -la && cat README.md` is safe. `ls -la && rm -rf build/` is not -- the `rm` contaminates the entire command.
-
----
-
-## The Interrupt Behavior Contract
-
-While tools are executing, the user can type a new message. What should happen? The answer depends on the tool.
-
-Each tool declares an `interruptBehavior()` method that returns either `'cancel'` or `'block'`:
-
-- **`'cancel'`**: Stop the tool immediately, discard partial results, and process the new user message. Used by tools where partial execution is harmless (reads, searches).
-- **`'block'`**: Keep the tool running to completion. The user's new message waits. Used by tools where interruption would leave the system in an inconsistent state (writes mid-flight, long-running bash commands). This is the default.
-
-The streaming executor tracks the interruptible state of the current tool set:
-
-The interruptible state is updated by checking all currently executing tools: the set is interruptible only when every executing tool supports cancellation. If even one tool's interrupt behavior is `'block'`, the entire set is treated as non-interruptible.
-
-The UI only shows an "interruptible" indicator when ALL executing tools support cancellation. If even one tool is `'block'`, the entire set is treated as non-interruptible. This is conservative but correct: you cannot meaningfully interrupt a batch where one tool would keep running anyway.
-
-When the user does interrupt and all tools are cancellable, the abort controller fires with reason `'interrupt'`. The executor's `getAbortReason()` method checks each tool's interrupt behavior individually -- a `'cancel'` tool gets a synthetic `user_interrupted` error, while a `'block'` tool (which would not be present in a fully interruptible set, but the code handles the edge case) continues running.
+Составная команда доступна только для чтения, только если каждая ненейтральная подкоманда присутствует в наборе поиска, чтения или списка. `ls -la && cat README.md` безопасен. `ls -la && rm -rf build/` нет — `rm` загрязняет всю команду.
 
 ---
 
-## Context Modifiers: The Serial-Only Contract
+## Контракт поведения прерываний
 
-Context modifiers are functions of type `(context: ToolUseContext) => ToolUseContext`. They let a tool say "I've changed something about the execution environment that subsequent tools need to know about."
+Пока tools выполняются, пользователь может ввести новое сообщение. Что должно произойти? Ответ зависит от tool.
 
-The contract is simple: **context modifiers are only applied for serial (non-concurrent-safe) tools.** This is stated explicitly in the source:
+Каждый tool объявляет метод `interruptBehavior()`, который возвращает либо `'cancel'`, либо `'block'`:
+
+- **`'cancel'`**: немедленно остановите tool, отмените частичные результаты и обработайте новое сообщение пользователя. Используется tools, где частичное выполнение безвредно (чтение, поиск).
+- **`'block'`**: оставьте tool работать до завершения. Новое сообщение пользователя ожидает. Используется tools, прерывание которых может оставить систему в несогласованном State (записывает промежуточные, долго выполняющиеся команды bash). Это значение по умолчанию.
+
+Исполнитель streaming отслеживает прерываемое State текущего набора tools:
+
+State прерывания обновляется путем проверки всех выполняющихся в данный момент tools: набор прерывается только тогда, когда каждый исполняемый tool поддерживает отмену. Если поведение прерывания хотя бы одного tool равно `'block'`, весь набор считается непрерываемым.
+
+Пользовательский интерфейс отображает индикатор «прерываемости» только в том случае, если ВСЕ исполняющие tools поддерживают отмену. Если хотя бы один tool имеет номер `'block'`, весь набор считается бесперебойным. Это консервативно, но правильно: вы не можете осмысленно прерывать batch, в котором один tool все равно будет продолжать работать.
+
+Когда пользователь прерывает работу и все tools можно отменить, контроллер прерывания срабатывает с причиной `'interrupt'`. Метод исполнителя `getAbortReason()` проверяет поведение прерываний каждого tool индивидуально: tool `'cancel'` получает синтетическую ошибку `user_interrupted`, а tool `'block'` (который не будет присутствовать в полностью прерываемом наборе, но код обрабатывает крайний случай) продолжает работу.
+
+---
+
+## Модификаторы контекста: контракт только для последовательного порта
+
+Модификаторы контекста — это функции типа `(context: ToolUseContext) => ToolUseContext`. Они позволяют tool сказать: «Я изменил что-то в среде выполнения, о чем должны знать последующие tools».
+
+Контракт прост: **модификаторы контекста применяются только для последовательных (не параллельных) tools.** Это явно указано в источнике:
 
 ```typescript
 // NOTE: we currently don't support context modifiers for concurrent
@@ -368,32 +368,32 @@ if (!tool.isConcurrencySafe && contextModifiers.length > 0) {
 }
 ```
 
-In the batch orchestration path (`toolOrchestration.ts`), concurrent batch modifiers are collected and applied after the batch completes, in tool-submission order. This means concurrent tools within a batch cannot see each other's context changes, but the batch after them can.
+В пути оркестрации batchа (`toolOrchestration.ts`) модификаторы одновременного batchа собираются и применяются после завершения batchа в порядке отправки tool. Это означает, что параллельные tools в bundleе не могут видеть изменения контекста друг друга, но batch после них может.
 
-The asymmetry is intentional. If Tool A modifies context and Tool B reads that context, they have a data dependency. Data dependencies mean they cannot run concurrently. By definition, if two tools are concurrency-safe, neither should depend on the other's context modifications. The system enforces this by deferring application.
-
----
-
-## Apply This
-
-The concurrency patterns in Claude Code generalize to any system that orchestrates multiple independent operations. Three principles are worth extracting.
-
-**Partition by safety, not by type.** The `isConcurrencySafe(input)` method receives the parsed input, not just the tool name. This per-invocation classification is more precise than a static "this tool type is always safe" declaration. In your own systems, inspect the operation's arguments before deciding whether to parallelize. A database read is safe to parallelize; a database write to the same row is not. The operation type alone does not tell you enough.
-
-**Speculative execution during I/O waits.** The streaming executor starts tools while the API response is still arriving. The same pattern applies anywhere you have a slow producer and fast consumers: start processing early items while later items are still being generated. HTTP/2 server push, compiler pipeline parallelism, and speculative CPU execution all share this structure. The key requirement is that you can identify independent work before the full instruction set is available.
-
-**Preserve submission order in results.** Yielding results in completion order is tempting -- it minimizes latency to first result. But if the consumer (in this case, the language model) expects results in a specific order, reordering them creates confusion that costs more time to resolve than the latency savings. Buffer completed results and release them in the order they were requested. The implementation cost is a simple array walk; the correctness benefit is absolute.
-
-The streaming executor pattern is particularly powerful for agent systems. Any time your agent loop involves a "think, then act" cycle where the thinking phase produces multiple independent actions, you can overlap the tail of thinking with the beginning of acting. The savings are proportional to the ratio of think-time to act-time. For language model agents, where think-time (API response generation) dominates, the savings are substantial.
+Асимметрия намеренная. Если tool A изменяет контекст, а tool B читает этот контекст, у них возникает зависимость от данных. Зависимости данных означают, что они не могут работать одновременно. По определению, если два tool безопасны для одновременного выполнения, ни один из них не должен зависеть от изменений контекста другого. Система обеспечивает это, откладывая применение.
 
 ---
 
-## Summary
+## Примените это
 
-Claude Code's concurrency system operates at two levels. The partition algorithm (`partitionToolCalls`) groups consecutive concurrency-safe tools into batches that run in parallel, while isolating unsafe tools into serial batches where each tool sees the effects of the one before it. The streaming tool executor (`StreamingToolExecutor`) goes further, starting tools speculatively as they arrive during model response streaming, overlapping tool execution with response generation.
+Шаблоны параллелизма в Claude Code распространяются на любую систему, которая управляет несколькими независимыми операциями. Стоит выделить три принципа.
 
-The safety model is conservative by design. Concurrency safety is determined per-invocation by inspecting parsed inputs. Unknown tools default to serial. Parsing failures default to serial. Exceptions in safety checks default to serial. The system never guesses that something is safe to parallelize -- the tool must affirmatively declare it.
+**Разделение по безопасности, а не по типу.** Метод `isConcurrencySafe(input)` получает анализируемые входные данные, а не только имя tool. Эта классификация для каждого вызова является более точной, чем статическое объявление «этот тип tool всегда безопасен». В ваших собственных системах проверьте аргументы операции, прежде чем принимать решение о распараллеливании. Чтение базы данных безопасно распараллеливать; запись в базу данных в одну и ту же строку — нет. Сам по себе тип операции мало что вам скажет.
 
-Error handling follows the dependency structure of the tools. Bash errors cascade to siblings because shell commands often form implicit pipelines. Read and search errors are isolated because they are independent operations. The abort controller hierarchy -- query controller, sibling controller, per-tool controller -- gives each level the ability to cancel its scope without disrupting the level above.
+**Спекулятивное выполнение во время ожидания ввода-вывода.** Исполнитель streaming запускает tools, пока еще поступает ответ API. Тот же шаблон применим везде, где есть медленный производитель и быстрые потребители: начните обрабатывать ранние элементы, пока более поздние элементы все еще генерируются. HTTP/2 передача на сервер, параллелизм конвейера компилятора и спекулятивное выполнение ЦП — все они разделяют эту структуру. Ключевое требование состоит в том, что вы можете определить независимую работу до того, как станет доступен полный набор инструкций.
 
-The result is a system that extracts maximum parallelism from the model's tool requests while maintaining the invariant that the conversation history reflects a coherent, ordered sequence of actions. The model sees results in the order it requested them. The user sees tools complete as fast as the underlying operations allow. The gap between those two -- execution speed vs. presentation order -- is bridged by buffering, and that buffer is the simplest part of the entire system.
+**Сохранять порядок отправки в результатах.** Выдавать результаты в порядке завершения очень заманчиво: это сводит к минимуму задержку до первого результата. Но если потребитель (в данном случае языковая модель) ожидает результатов в определенном порядке, изменение их порядка создает путаницу, на устранение которой уходит больше времени, чем экономия задержек. Поместите завершенные результаты в буфер и выпустите их в том порядке, в котором они были запрошены. Стоимость реализации — простой обход массива; преимущество правильности является абсолютным.
+
+Шаблон потокового исполнителя особенно эффективен для agentic systems. Каждый раз, когда ваш agent loop включает в себя цикл «думай, затем действуй», где фаза мышления производит несколько независимых действий, вы можете перекрывать хвост мышления началом действия. Экономия пропорциональна соотношению времени на обдумывание и времени на действие. Для agents языковой модели, где доминирует время обдумывания (генерация ответа API), экономия существенна.
+
+---
+
+## Краткое содержание
+
+Система параллелизма Claude Code работает на двух уровнях. Алгоритм разделения (`partitionToolCalls`) группирует последовательные безопасные tools в bundlees, которые выполняются параллельно, а небезопасные tools изолируются в последовательные batches, где каждый tool видит эффекты предыдущего. Исполнитель tool streaming (`StreamingToolExecutor`) идет дальше, запуская tools спекулятивно по мере их поступления во время streaming ответов модели, перекрывая tool execution с генерацией ответа.
+
+Модель безопасности консервативна по своей конструкции. Безопасность параллелизма определяется для каждого вызова путем проверки анализируемых входных данных. Неизвестные tools по умолчанию имеют серийный номер. Ошибки синтаксического анализа по умолчанию являются последовательными. Исключения в проверках безопасности по умолчанию являются последовательными. Система никогда не догадывается, что что-то можно безопасно распараллелить — tool должен утвердительно объявить об этом.
+
+Обработка ошибок соответствует структуре зависимостей tools. Ошибки Bash каскадно передаются соседним элементам, поскольку команды оболочки часто образуют неявные конвейеры. Ошибки чтения и поиска изолированы, поскольку они являются независимыми операциями. Иерархия контроллеров прерывания — контроллер запросов, одноуровневый контроллер, контроллер каждого tool — дает каждому уровню возможность отменить свою область действия, не нарушая уровень выше.
+
+Результатом является система, которая извлекает максимальный параллелизм из запросов tools модели, сохраняя при этом инвариант, согласно которому история разговоров отражает последовательную, упорядоченную последовательность действий. Модель видит результаты в том порядке, в котором она их запросила. Пользователь видит, что tools выполняются настолько быстро, насколько позволяют базовые операции. Разрыв между этими двумя параметрами — скоростью выполнения и порядком представления — устраняется буферизацией, а этот буфер является самой простой частью всей системы.

@@ -1,12 +1,12 @@
-# Chapter 16: Remote Control and Cloud Execution
+# Глава 16: Удаленное управление и выполнение в облаке
 
-## The Agent Reaches Beyond Localhost
+## Agent выходит за пределы локального хоста
 
-Every chapter so far has assumed that Claude Code runs on the same machine where the code lives. The terminal is local. The filesystem is local. The model responses stream back to a process that owns both the keyboard and the working directory.
+До сих пор в каждой главе предполагалось, что Claude Code работает на той же машине, где находится код. Терминал местный. Файловая система локальная. Ответы модели возвращаются в процесс, которому принадлежит и клавиатура, и рабочий каталог.
 
-That assumption breaks the moment you want to control Claude Code from a browser, run it inside a cloud container, or expose it as a service on your LAN. The agent needs a way to receive instructions from a web browser, a mobile app, or an automated pipeline -- forward permission prompts to someone who is not sitting at the terminal, and tunnel its API traffic through infrastructure that might inject credentials or terminate TLS on the agent's behalf.
+Это предположение нарушается в тот момент, когда вы хотите управлять Claude Code из браузера, запускать его внутри облачного контейнера или предоставлять его как службу в своей локальной сети. Agent нужен способ получать инструкции из веб-браузера, мобильного приложения или автоматизированного конвейера — пересылать запросы на разрешение тому, кто не сидит за терминалом, и туннелировать свой трафик API через инфраструктуру, которая может вводить учетные данные или завершать TLS от имени agent.
 
-Claude Code solves this with four systems, each addressing a different topology:
+Claude Code решает эту проблему с помощью четырех систем, каждая из которых имеет свою топологию:
 
 <div class="diagram-grid">
 
@@ -44,56 +44,56 @@ graph TB
 
 </div>
 
-These systems share a common design philosophy: reads and writes are asymmetric, reconnection is automatic, and failures degrade gracefully.
+Эти системы имеют общую философию проектирования: операции чтения и записи асимметричны, повторное подключение происходит автоматически, а сбои корректно устраняются.
 
 ---
 
-## Bridge v1: Poll, Dispatch, Spawn
+## Bridge v1: Опрос, Рассылка, Спавн
 
-The v1 bridge is the environment-based remote control system. When a developer runs `claude remote-control`, the CLI registers with the Environments API, polls for work, and spawns a child process per session.
+Мост v1 — это система дистанционного управления на основе среды. Когда разработчик запускает `claude remote-control`, CLI регистрируется в среде API, опрашивает работу и порождает дочерний процесс для каждого сеанса.
 
-Before registration, a gauntlet of pre-flight checks runs: runtime feature gate, OAuth token validation, organization policy check, dead token detection (a cross-process backoff after three consecutive failures with the same expired token), and proactive token refresh that eliminates roughly 9% of registrations that would otherwise fail on the first attempt.
+Перед регистрацией выполняется ряд предполетных проверок: шлюз функций во время выполнения, проверка токена OAuth, проверка политики организации, обнаружение неработающих токенов (межпроцессная отмена после трех последовательных сбоев с одним и тем же токеном с истекшим сроком действия) и упреждающее обновление токена, которое исключает примерно 9% регистраций, которые в противном случае завершились бы неудачно с первой попытки.
 
-Once registered, the bridge enters a long-poll loop. Work items arrive as sessions (with a `secret` field containing session tokens, API base URL, MCP configs, and environment variables) or healthchecks. The bridge throttles "no work" log messages to every 100 empty polls.
+После регистрации мост входит в цикл длительного опроса. Рабочие элементы поступают в виде сеансов (с полем `secret`, содержащим токены сеанса, базовым URL-адресом API, конфигурациями MCP и переменными среды) или проверками работоспособности. Мост ограничивает количество сообщений журнала «нет работы» для каждых 100 пустых опросов.
 
-Each session spawns a child Claude Code process communicating via NDJSON on stdin/stdout. Permission requests flow through the bridge transport to the web interface where the user approves or denies. The round-trip must complete within roughly 10-14 seconds.
-
----
-
-## Bridge v2: Direct Sessions and SSE
-
-The v2 bridge eliminates the entire Environments API layer -- no registration, no polling, no acknowledgment, no heartbeat, no deregistration. The motivation: v1 required the server to know the machine's capabilities before dispatching work. V2 collapses the lifecycle to three steps:
-
-1. **Create session**: `POST /v1/code/sessions` with OAuth credentials.
-2. **Connect bridge**: `POST /v1/code/sessions/{id}/bridge`. Returns a `worker_jwt`, `api_base_url`, and `worker_epoch`. Each `/bridge` call bumps the epoch -- it IS the registration.
-3. **Open transport**: SSE for reads, `CCRClient` for writes.
-
-The transport abstraction (`ReplBridgeTransport`) unifies v1 and v2 behind a common interface, so message handling does not need to know which generation it is talking to.
-
-When the SSE connection drops due to a 401, the transport rebuilds with fresh credentials from a new `/bridge` call while preserving the sequence number cursor -- no messages are lost. The write path uses per-instance `getAuthToken` closures instead of process-wide environment variables, preventing JWT leakage across concurrent sessions.
-
-### The FlushGate
-
-A subtle ordering problem: the bridge needs to send conversation history while accepting live writes from the web interface. If a live write arrives during the history flush, messages could be delivered out of order. The `FlushGate` queues live writes during the flush POST and drains them in order when it completes.
-
-### Token Refresh and Epoch Management
-
-The v2 bridge proactively refreshes worker JWTs before expiry. A new epoch tells the server this is the same worker with fresh credentials. Epoch mismatches (409 responses) are handled aggressively: both connections close and an exception unwinds the caller, preventing split-brain scenarios.
+Каждый сеанс порождает дочерний процесс Claude Code, взаимодействующий через NDJSON на stdin/stdout. Запросы на разрешения передаются через мостовой транспорт к веб-интерфейсу, где пользователь одобряет или отклоняет их. Обращение туда и обратно должно завершиться примерно за 10–14 секунд.
 
 ---
 
-## Message Routing and Echo Deduplication
+## Bridge v2: прямые сеансы и SSE
 
-Both bridge generations share `handleIngressMessage()` as the central router:
+Мост v2 исключает весь уровень Environments API — без регистрации, без опроса, без подтверждения, без контрольного сигнала, без отмены регистрации. Мотивация: версия 1 требовала, чтобы сервер знал возможности машины перед отправкой работы. V2 сводит жизненный цикл к трем этапам:
 
-1. Parse JSON, normalize control message keys.
-2. Route `control_response` to permission handler, `control_request` to request handler.
-3. Check UUID against `recentPostedUUIDs` (echo dedup) and `recentInboundUUIDs` (re-delivery dedup).
-4. Forward validated user messages.
+1. **Создать сеанс**: `POST /v1/code/sessions` с учетными данными OAuth.
+2. **Соединительный мост**: `POST /v1/code/sessions/{id}/bridge`. Возвращает `worker_jwt`, `api_base_url` и `worker_epoch`. Каждый вызов `/bridge` сдвигает эпоху — это и есть регистрация.
+3. **Открытый транспорт**: SSE для чтения, `CCRClient` для записи.
 
-### BoundedUUIDSet: O(1) Lookup, O(capacity) Memory
+Транспортная абстракция (`ReplBridgeTransport`) объединяет версии 1 и 2 в рамках общего интерфейса, поэтому для обработки сообщений не требуется знать, с каким поколением они общаются.
 
-The bridge has an echo problem -- messages may echo back on the read stream or be delivered twice during transport switches. `BoundedUUIDSet` is a FIFO-bounded set backed by a circular buffer:
+Когда соединение SSE разрывается из-за ошибки 401, транспорт восстанавливается с использованием новых учетных данных из нового вызова `/bridge`, сохраняя при этом курсор порядкового номера — никакие сообщения не теряются. В пути записи используются замыкания `getAuthToken` для каждого экземпляра вместо переменных среды всего процесса, что предотвращает утечку JWT между параллельными сеансами.
+
+### FlushGate
+
+Тонкая проблема с упорядочением: мосту необходимо отправлять историю разговоров, одновременно принимая живые записи из веб-интерфейса. Если во время очистки истории поступает оперативная запись, сообщения могут доставляться не по порядку. `FlushGate` ставит в очередь живую запись во время очистки POST и удаляет их по порядку после завершения.
+
+### Обновление токенов и управление эпохами
+
+Мост v2 заранее обновляет рабочие JWT до истечения срока их действия. Новая эпоха сообщает серверу, что это тот же работник с новыми учетными данными. Несовпадения эпох (409 ответов) обрабатываются агрессивно: оба соединения закрываются, а исключение освобождает вызывающую сторону, предотвращая сценарии разделения мозга.
+
+---
+
+## Маршрутизация сообщений и дедупликация эха
+
+Оба поколения мостов используют `handleIngressMessage()` в качестве центрального маршрутизатора:
+
+1. Разобрать JSON, нормализовать ключи управляющих сообщений.
+2. Направьте `control_response` к обработчику разрешений, а `control_request` — к обработчику запроса.
+3. Проверьте UUID на соответствие `recentPostedUUIDs` (дедупликация эхо) и `recentInboundUUIDs` (дедуляция повторной доставки).
+4. Пересылать проверенные сообщения пользователей.
+
+### BoundedUUIDSet: O(1) Поиск, O(ёмкость) memory
+
+У моста есть проблема с эхом: сообщения могут отражаться в потоке чтения или доставляться дважды во время переключения транспорта. `BoundedUUIDSet` — это набор, ограниченный FIFO, поддерживаемый кольцевым буфером:
 
 ```typescript
 class BoundedUUIDSet {
@@ -114,60 +114,60 @@ class BoundedUUIDSet {
 }
 ```
 
-Two instances run in parallel, each with capacity 2000. O(1) lookup via the Set, O(capacity) memory via circular buffer eviction, no timers or TTLs. Unknown control request subtypes get an error response, not silence -- preventing the server from waiting for a response that never comes.
+Два экземпляра работают параллельно, каждый с емкостью 2000. O(1) поиск через Set, O(capacity) memory через вытеснение циклического буфера, без таймеров и TTL. Неизвестные подтипы запросов управления получают ответ об ошибке, а не молчание, что не позволяет серверу ждать ответа, который так и не приходит.
 
 ---
 
-## The Asymmetric Design: Persistent Reads, HTTP POST Writes
+## Асимметричный дизайн: постоянное чтение, HTTP POST запись
 
-The CCR protocol uses asymmetric transport: reads flow through a persistent connection (WebSocket or SSE), writes go through HTTP POST. This reflects a fundamental asymmetry in the communication pattern.
+Протокол CCR использует асимметричный транспорт: чтение осуществляется через постоянное соединение (WebSocket или SSE), запись осуществляется через HTTP POST. Это отражает фундаментальную асимметрию в модели общения.
 
-Reads are high-frequency, low-latency, server-initiated -- hundreds of small messages per second during token streaming. A persistent connection is the only sensible choice. Writes are low-frequency, client-initiated, and require acknowledgment -- messages per minute, not per second. HTTP POST provides reliable delivery, idempotency via UUIDs, and natural integration with load balancers.
+Чтения выполняются с высокой частотой, с низкой задержкой и инициируются сервером — сотни небольших сообщений в секунду во время streaming токенов. Постоянное соединение — единственный разумный выбор. Записи выполняются с низкой частотой, инициируются клиентом и требуют подтверждения — сообщений в минуту, а не в секунду. HTTP POST обеспечивает надежную доставку, идемпотентность через UUID и естественную интеграцию с балансировщиками нагрузки.
 
-Trying to unify them on a single WebSocket creates coupling: if the WebSocket drops during a write, you need retry logic and must distinguish "not sent" from "sent but acknowledgment lost." Separate channels let each be optimized independently.
+Попытка объединить их в одном WebSocket создает связь: если WebSocket падает во время записи, вам нужна логика повтора и вы должны отличать «не отправлено» от «отправлено, но подтверждение потеряно». Отдельные каналы позволяют оптимизировать каждый из них независимо.
 
 ---
 
-## Remote Session Management
+## Управление удаленным сеансом
 
-The `SessionsWebSocket` manages the client side of a CCR WebSocket connection. Its reconnection strategy discriminates between failure types:
+`SessionsWebSocket` управляет клиентской частью соединения CCR WebSocket. Его стратегия повторного подключения различает типы сбоев:
 
-| Failure | Strategy |
+| Неудача | Стратегия |
 |---------|----------|
-| 4003 (unauthorized) | Stop immediately, no retries |
-| 4001 (session not found) | Max 3 retries, linear backoff (transient during compaction) |
-| Other transient | Exponential backoff, max 5 attempts |
+| 4003 (несанкционированный) | Остановиться немедленно, без повторных попыток |
+| 4001 (сеанс не найден) | Макс. 3 повтора, линейная задержка (переходный процесс во время уплотнения) |
+| Другие переходные | Экспоненциальная отсрочка, максимум 5 попыток |
 
-The `isSessionsMessage()` type guard accepts any object with a string `type` field -- deliberately permissive. A hardcoded allowlist would silently drop new message types before the client is updated.
-
----
-
-## Direct Connect: The Local Server
-
-Direct Connect is the simplest topology: Claude Code runs as a server and clients connect via WebSocket. No cloud intermediary, no OAuth tokens.
-
-Sessions have five states: `starting`, `running`, `detached`, `stopping`, `stopped`. Metadata persists to `~/.claude/server-sessions.json` for resume across server restarts. The `cc://` URL scheme provides clean addressing for local connections.
+Защита типа `isSessionsMessage()` принимает любой объект со строковым полем `type` — намеренно разрешающим. Жестко запрограммированный список разрешений будет автоматически удалять новые типы сообщений до обновления клиента.
 
 ---
 
-## Upstream Proxy: Credential Injection in Containers
+## Прямое подключение: локальный сервер
 
-The upstream proxy runs inside CCR containers and solves a specific problem: injecting organization credentials into outbound HTTPS traffic from a container where the agent might execute untrusted commands.
+Direct Connect — это самая простая топология: Claude Code работает как сервер, а клиенты подключаются через WebSocket. Никакого облачного посредника, никаких токенов OAuth.
 
-The setup sequence is carefully ordered:
+Сессии имеют пять State: `starting`, `running`, `detached`, `stopping`, `stopped`. Метаданные сохраняются в `~/.claude/server-sessions.json` для возобновления работы после перезапуска сервера. Схема URL-адресов `cc://` обеспечивает чистую адресацию для локальных подключений.
 
-1. Read the session token from `/run/ccr/session_token`.
-2. Set `prctl(PR_SET_DUMPABLE, 0)` via Bun FFI -- blocking same-UID ptrace of the process heap. Without this, a prompt-injected `gdb -p $PPID` could scrape the token from memory.
-3. Download the upstream proxy CA certificate and concatenate with system CA bundle.
-4. Start a local CONNECT-to-WebSocket relay on an ephemeral port.
-5. Unlink the token file -- the token now exists only on the heap.
-6. Export environment variables for all subprocesses.
+---
 
-Every step fails open: errors disable the proxy rather than killing the session. The correct tradeoff -- a failed proxy means some integrations will not work, but core functionality remains available.
+## Восходящий прокси: внедрение учетных данных в контейнеры
 
-### Protobuf Hand-Encoding
+Восходящий прокси-сервер работает внутри контейнеров CCR и решает конкретную проблему: внедрение учетных данных организации в исходящий HTTPS-трафик из контейнера, где agent может выполнять ненадежные команды.
 
-Bytes through the tunnel are wrapped in `UpstreamProxyChunk` protobuf messages. The schema is trivial -- `message UpstreamProxyChunk { bytes data = 1; }` -- and Claude Code encodes it by hand in ten lines rather than pulling in a protobuf runtime:
+Последовательность установки тщательно упорядочена:
+
+1. Считайте токен сеанса из `/run/ccr/session_token`.
+2. Установите `prctl(PR_SET_DUMPABLE, 0)` через Bun FFI - блокируя ptrace с тем же UID в куче процесса. Без этого внедренный `gdb -p $PPID` мог бы очистить токен из memory.
+3. Загрузите сертификат ЦС восходящего прокси-сервера и объедините его с batchом системного ЦС.
+4. Запустите локальное реле CONNECT-to-WebSocket на временном порту.
+5. Отключите файл токена — теперь токен существует только в куче.
+6. Экспортируйте переменные среды для всех подпроцессов.
+
+Каждый шаг не открывается: ошибки отключают прокси, а не завершают сеанс. Правильный компромисс: неисправный прокси-сервер означает, что некоторые интеграции не будут работать, но основные функции останутся доступными.
+
+### Protobuf Ручное кодирование
+
+Байты, проходящие через туннель, заключаются в сообщения protobuf `UpstreamProxyChunk`. Схема тривиальна — `message UpstreamProxyChunk { bytes data = 1; }` — и Claude Code кодирует ее вручную в десять строк, а не использует среду выполнения protobuf:
 
 ```typescript
 export function encodeChunk(data: Uint8Array): Uint8Array {
@@ -183,22 +183,22 @@ export function encodeChunk(data: Uint8Array): Uint8Array {
 }
 ```
 
-Ten lines replace a full protobuf runtime. A single-field message does not justify a dependency -- the maintenance burden of the bit manipulation is far lower than the supply chain risk.
+Десять строк заменяют полную среду выполнения protobuf. Сообщение с одним полем не оправдывает зависимости: затраты на обслуживание манипуляций с битами намного ниже, чем риск в цепочке поставок.
 
 ---
 
-## Apply This: Designing Remote Agent Execution
+## Примените это: проектирование удаленного выполнения agent
 
-**Separate read and write channels.** When reads are high-frequency streams and writes are low-frequency RPCs, unifying them creates unnecessary coupling. Let each channel fail and recover independently.
+**Отдельные каналы чтения и записи.** Если чтение представляет собой высокочастотные потоки, а запись — низкочастотные RPC, их объединение создает ненужную связь. Пусть каждый канал выходит из строя и восстанавливается независимо.
 
-**Bound your deduplication memory.** The BoundedUUIDSet pattern provides fixed-memory deduplication. Any at-least-once delivery system needs a bounded dedup buffer, not an unbounded Set.
+**Привязка memory для дедупликации.** Шаблон BoundedUUIDSet обеспечивает дедупликацию с фиксированным объемом memory. Любая система доставки хотя бы один раз нуждается в ограниченном буфере дедупликации, а не в неограниченном наборе.
 
-**Make reconnection strategy proportional to the failure signal.** Permanent failures should not retry. Transient failures should retry with backoff. Ambiguous failures should retry with a low cap.
+**Стратегия повторного подключения должна быть пропорциональна сигналу об ошибке.** При постоянных сбоях повторные попытки недопустимы. При временных сбоях следует повторить попытку с отсрочкой. При неоднозначных неудачах следует повторить попытку с низким пределом.
 
-**Keep secrets heap-only in adversarial environments.** Reading the token from a file, disabling ptrace, and unlinking the file eliminates both filesystem and memory-inspection attack vectors.
+**В враждебных средах храните секреты только в куче.** Чтение токена из файла, отключение ptrace и отсоединение файла устраняет векторы атак как на файловую систему, так и на проверку memory.
 
-**Fail open for auxiliary systems.** The upstream proxy fails open because it provides enhanced functionality (credential injection), not core functionality (model inference).
+**Не удалось открыть для вспомогательных систем.** Восходящий прокси-сервер не открывается, поскольку он обеспечивает расширенную функциональность (введение учетных данных), а не базовую функциональность (вывод модели).
 
-The remote execution systems encode a deeper principle: the agent's core loop (Chapter 5) should be agnostic about where instructions come from and where results go. The bridge, Direct Connect, and upstream proxy are transport layers. The message handling, tool execution, and permission flows above them are identical regardless of whether the user is sitting at the terminal or on the other side of a WebSocket.
+В системах удаленного выполнения заложен более глубокий принцип: основной agent loop (глава 5) не должен знать, откуда приходят инструкции и куда идут результаты. Мост, Direct Connect и восходящий прокси-сервер являются транспортными уровнями. Обработка сообщений, выполнение tools и потоки разрешений над ними идентичны независимо от того, сидит ли пользователь за терминалом или на другой стороне WebSocket.
 
-The next chapter examines the other operational concern: performance -- how Claude Code makes every millisecond and token count across startup, rendering, search, and API costs.
+В следующей главе рассматривается другая операционная проблема: производительность — как Claude Code учитывает каждую миллисекунду и токены при запуске, рендеринге, поиске и расходах API.

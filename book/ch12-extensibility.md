@@ -1,22 +1,22 @@
-# Chapter 12: Extensibility -- Skills and Hooks
+# Глава 12: Расширяемость – skills и приемы
 
-## Two Dimensions of Extension
+## Два измерения расширения
 
-Every extensibility system answers two questions: what can the system do, and when does it do it. Most frameworks conflate the two -- a plugin registers both capabilities and lifecycle callbacks in the same object, and the boundary between "adding a feature" and "intercepting a feature" blurs into a single registration API.
+Каждая система расширяемости отвечает на два вопроса: что может делать система и когда она это делает. Большинство фреймворков объединяют эти два понятия: плагин регистрирует как возможности, так и callbacks жизненного цикла в одном и том же объекте, а граница между «добавлением функции» и «hook функции» стирается до одной регистрации API.
 
-Claude Code separates them cleanly. Skills extend what the model can do. They are markdown files that become slash commands, injecting new instructions into the conversation when invoked. Hooks extend when and how things happen. They are lifecycle interceptors that fire at over two dozen distinct points during a session, running arbitrary code that can block actions, modify inputs, force continuation, or silently observe.
+Claude Code четко разделяет их. Skills расширяют возможности модели. Это Markdown files, которые становятся косыми командами, добавляя в диалог новые инструкции при вызове. Hooks расширяются, когда и как что-то происходит. Это hooks жизненного цикла, которые срабатывают в более чем двух дюжинах различных точек во время сеанса, выполняя произвольный код, который может блокировать действия, изменять входные данные, принудительно продолжать или молча наблюдать.
 
-The separation is not accidental. Skills are content -- they expand the model's knowledge and capabilities by adding prompt text. Hooks are control flow -- they modify the execution path without changing what the model knows. A skill might teach the model how to run your team's deployment process. A hook might ensure no deployment command executes without a passing test suite. The skill adds capability; the hook adds constraint.
+Разделение не случайно. Skills — это контент: они расширяют знания и возможности модели, добавляя текст prompt. Hooks — это поток управления: они изменяют путь выполнения, не меняя того, что известно модели. Skill может научить модель управлять процессом развертывания вашей команды. Перехват может гарантировать, что ни одна команда развертывания не будет выполнена без прохождения набора тестов. Skill добавляет возможности; hook добавляет ограничение.
 
-This chapter covers both systems in depth, then examines where they intersect: skill-declared hooks that register as session-scoped lifecycle interceptors when the skill is invoked.
+В этой главе подробно рассматриваются обе системы, а затем рассматривается, где они пересекаются: hooks, объявленные skillsи, которые регистрируются как hooks жизненного цикла в области сеанса при вызове skillа.
 
 ---
 
-## Skills: Teaching the Model New Tricks
+## Skills: обучение модели новым трюкам
 
-### Two-Phase Loading
+### Двухфазная загрузка
 
-The core optimization of the skills system is that frontmatter loads at startup, but full content loads only on invocation.
+Основная оптимизация системы skills заключается в том, что фронтальная часть загружается при запуске, а полный контент загружается только при вызове.
 
 ```mermaid
 flowchart LR
@@ -38,62 +38,62 @@ flowchart LR
     style I5 fill:#bbdefb
 ```
 
-**Phase 1** reads each `SKILL.md` file, splits YAML frontmatter from the markdown body, and extracts metadata. The frontmatter fields become part of the system prompt so the model knows the skill exists. The markdown body is captured in a closure but not processed. A project with 50 skills pays the token cost of 50 short descriptions, not 50 full documents.
+**Фаза 1** считывает каждый файл `SKILL.md`, отделяет frontmatter YAML от тела Markdown и извлекает метаданные. Поля вступительной части становятся частью System Prompt, поэтому модель знает, что skill существует. Тело Markdown фиксируется в замыкании, но не обрабатывается. Проект с 50 skillsи оплачивает символическую стоимость 50 кратких описаний, а не 50 полных документов.
 
-**Phase 2** fires when the model or user invokes a skill. `getPromptForCommand` prepends the base directory, substitutes variables (`$ARGUMENTS`, `${CLAUDE_SKILL_DIR}`, `${CLAUDE_SESSION_ID}`), and executes inline shell commands (backtick-prefixed with `!`). The result is returned as content blocks injected into the conversation.
+**Фаза 2** срабатывает, когда модель или пользователь вызывает skill. `getPromptForCommand` добавляет базовый каталог, заменяет переменные (`$ARGUMENTS`, `${CLAUDE_SKILL_DIR}`, `${CLAUDE_SESSION_ID}`) и выполняет встроенные команды оболочки (обратный апостроф с префиксом `!`). Результат возвращается в виде блоков контента, внедренных в разговор.
 
-### Seven Sources with Priority
+### Семь источников с приоритетом
 
-Skills arrive from seven distinct sources, loaded in parallel and merged by precedence:
+Skills поступают из семи различных источников, загружаются параллельно и объединяются по приоритету:
 
-| Priority | Source | Location | Notes |
+| Приоритет | Источник | Расположение | Заметки |
 |----------|--------|----------|-------|
-| 1 | Managed (Policy) | `<MANAGED_PATH>/.claude/skills/` | Enterprise-controlled |
-| 2 | User | `~/.claude/skills/` | Personal, available everywhere |
-| 3 | Project | `.claude/skills/` (walked up to home) | Checked into version control |
-| 4 | Additional Dirs | `<add-dir>/.claude/skills/` | Via `--add-dir` flag |
-| 5 | Legacy Commands | `.claude/commands/` | Backwards-compatible |
-| 6 | Bundled | Compiled into the binary | Feature-gated |
-| 7 | MCP | MCP server prompts | Remote, untrusted |
+| 1 | Управляемый (Политика) | `<MANAGED_PATH>/.claude/skills/` | Контролируется предприятием |
+| 2 | Пользователь | `~/.claude/skills/` | Персональный, доступный везде |
+| 3 | Проект | `.claude/skills/` (подошел к дому) | Проверено в системе контроля версий |
+| 4 | Дополнительные каталоги | `<add-dir>/.claude/skills/` | Через флаг `--add-dir` |
+| 5 | Устаревшие команды | `.claude/commands/` | Обратная совместимость |
+| 6 | В комплекте | Скомпилировано в двоичный файл | Функция закрыта |
+| 7 | MCP | MCP prompt сервера | Удаленный, ненадежный |
 
-Deduplication uses `realpath` to resolve symlinks and overlapping parent directories. The first-seen source wins. The `getFileIdentity` function resolves to canonical paths via `realpath` rather than relying on inode values, which are unreliable on container/NFS mounts and ExFAT.
+Дедупликация использует `realpath` для разрешения символических ссылок и перекрывающихся родительских каталогов. Побеждает тот, кто первым увидит источник. Функция `getFileIdentity` разрешает канонические пути через `realpath`, а не полагается на значения inode, которые ненадежны при монтировании контейнера/NFS и ExFAT.
 
-### The Frontmatter Contract
+### Контракт с фронтменом
 
-Key frontmatter fields that control skill behavior:
+Ключевые поля, которые контролируют поведение skills:
 
-| YAML Field | Purpose |
+| YAML Поле | Цель |
 |-----------|---------|
-| `name` | User-facing display name |
-| `description` | Shown in autocomplete and system prompt |
-| `when_to_use` | Detailed usage scenarios for model discovery |
-| `allowed-tools` | Which tools the skill can use |
-| `disable-model-invocation` | Block autonomous model use |
-| `context` | `'fork'` to run as sub-agent |
-| `hooks` | Lifecycle hooks registered on invocation |
-| `paths` | Glob patterns for conditional activation |
+| `name` | Отображаемое имя, обращенное к пользователю |
+| `description` | Отображается в автозаполнении и системной prompt |
+| `when_to_use` | Подробные сценарии использования для обнаружения моделей |
+| `allowed-tools` | Какие tools может использовать skill |
+| `disable-model-invocation` | Блокировать использование автономной модели |
+| `context` | `'fork'` будет работать в качестве sub-agent |
+| `hooks` | Перехватчики жизненного цикла, зарегистрированные при вызове |
+| `paths` | Шаблоны Glob для условной активации |
 
-The `context: 'fork'` option runs the skill as a sub-agent with its own context window, essential for skills that need significant work without polluting the main conversation's token budget. The `disable-model-invocation` and `user-invocable` fields control two distinct access paths -- setting both to true makes the skill invisible, useful for hooks-only skills.
+Опция `context: 'fork'` запускает skill в качестве sub-agent с собственным контекстным окном, что важно для skills, требующих значительной доработки, не загрязняя бюджет токенов основного диалога. Поля `disable-model-invocation` и `user-invocable` управляют двумя разными путями доступа — установка для обоих значений true делает skill невидимым, что полезно для skills, использующих только hooks.
 
-### The MCP Security Boundary
+### Граница безопасности MCP
 
-After variable substitution, inline shell commands execute. The security boundary is absolute: **MCP skills never execute inline shell commands.** MCP servers are external systems. An MCP prompt containing `` !`rm -rf /` `` would execute with the user's full permissions if allowed. The system treats MCP skills as content-only. This trust boundary connects to the broader MCP security model discussed in Chapter 15.
+После замены переменной выполняются встроенные команды оболочки. Граница безопасности абсолютна: **Skills MCP никогда не выполняют встроенные команды оболочки.** Серверы MCP являются внешними системами. prompt MCP, содержащее `` !`rm -rf /` ``, будет выполняться с полными разрешениями пользователя, если это разрешено. Система рассматривает skills MCP только как содержательные. Эта граница доверия связана с более широкой моделью безопасности MCP, обсуждаемой в главе 15.
 
-### Dynamic Discovery
+### Динамическое обнаружение
 
-Skills are not only loaded at startup. When the model touches files, `discoverSkillDirsForPaths` walks up from each path looking for `.claude/skills/` directories. Skills with `paths` frontmatter are stored in a `conditionalSkills` map and activate only when touched paths match their patterns. A skill declaring `paths: "packages/database/**"` remains invisible until the model reads or edits a database file -- context-sensitive capability expansion.
+Skills загружаются не только при запуске. Когда модель касается файлов, `discoverSkillDirsForPaths` подходит от каждого пути в поисках каталогов `.claude/skills/`. Skills с фронтальной надписью `paths` хранятся на карте `conditionalSkills` и активируются только тогда, когда пути касания соответствуют их шаблонам. Skill, объявляющий `paths: "packages/database/**"`, остается невидимым до тех пор, пока модель не прочитает или не отредактирует файл базы данных — контекстно-зависимое расширение возможностей.
 
 ---
 
-## Hooks: Controlling When Things Happen
+## Hooks: контроль того, когда что-то происходит
 
-Hooks are Claude Code's mechanism for intercepting and modifying behavior at lifecycle points. The main execution engine exceeds 4,900 lines. The system serves three audiences: individual developers (custom linting, validation), teams (shared quality gates checked into the project), and enterprises (policy-managed compliance rules).
+Hooks — это механизм Claude Code для hook и изменения поведения в точках жизненного цикла. Основной исполнительный механизм превышает 4900 строк. Система обслуживает три аудитории: отдельных разработчиков (индивидуальная проверка, проверка), команд (общие контрольные точки качества, проверенные в проекте) и предприятий (правила соответствия, управляемые политиками).
 
-### A Real-World Hook: Preventing Commits to Main
+### Реальный hook: предотвращение коммитов в Main
 
-Before diving into the machinery, here is what a hook looks like in practice. Suppose your team wants to prevent the model from committing directly to the `main` branch.
+Прежде чем погрузиться в механизм, вот как выглядит hook на практике. Предположим, ваша команда хочет запретить фиксацию модели непосредственно в ветке `main`.
 
-**Step 1: The settings.json configuration:**
+**Шаг 1. Конфигурация settings.json:**
 
 ```json
 {
@@ -114,7 +114,7 @@ Before diving into the machinery, here is what a hook looks like in practice. Su
 }
 ```
 
-**Step 2: The shell script:**
+**Шаг 2. Сценарий оболочки:**
 
 ```bash
 #!/bin/bash
@@ -126,81 +126,81 @@ fi
 exit 0
 ```
 
-**Step 3: What the model experiences.** When the model tries `git commit` on the `main` branch, the hook fires before the command executes. The script checks the branch, writes to stderr, and exits with code 2. The model sees a system message: "Cannot commit directly to main. Create a feature branch first." The commit never runs. The model creates a branch and commits there instead.
+**Шаг 3. Что испытывает модель.** Когда модель пытается выполнить команду `git commit` на ветке `main`, hook срабатывает до выполнения команды. Сценарий проверяет ветку, записывает в stderr и завершает работу с кодом 2. Модель видит системное сообщение: «Невозможно выполнить фиксацию непосредственно в основной. Сначала создайте ветку функции». Коммит никогда не запускается. Модель создает ветку и вместо этого фиксирует ее.
 
-The `if: "Bash(git commit*)"` condition means the script only runs for git commit commands -- not for every Bash invocation. Exit code 2 blocks; exit code 0 passes; any other exit code produces a non-blocking warning. This is the complete protocol.
+Условие `if: "Bash(git commit*)"` означает, что сценарий запускается только для команд фиксации git, а не для каждого вызова Bash. Код выхода 2 блока; код выхода 0 проходит; любой другой код выхода выдает неблокирующее предупреждение. Это полный протокол.
 
-### Four User-Configurable Types
+### Четыре типа, настраиваемые пользователем
 
-Claude Code defines six hook types -- four user-configurable, two internal.
+Claude Code определяет шесть типов hooks: четыре настраиваемых пользователем и два внутренних.
 
-**Command hooks** spawn a shell process. Hook input JSON is piped to stdin; the hook communicates back via exit code and stdout/stderr. This is the workhorse type.
+**Командные hooks** запускают процесс оболочки. Вход крюка JSON подключен к stdin; hook связывается обратно через код выхода и stdout/stderr. Это тип рабочей лошадки.
 
-**Prompt hooks** make a single LLM call, returning `{"ok": true}` or `{"ok": false, "reason": "..."}`. Lightweight AI-powered validation without a full agent loop.
+**Перехватчики запросов** выполняют один вызов LLM, возвращая `{"ok": true}` или `{"ok": false, "reason": "..."}`. Упрощенная проверка на базе искусственного интеллекта без полного agent loop.
 
-**Agent hooks** run a multi-turn agentic loop (max 50 turns, `dontAsk` permissions, thinking disabled). Each gets its own session scope. This is the heavy machinery for "verify that the test suite passes and covers the new feature."
+**Agent hooks** запускают многошаговый agentic цикл (максимум 50 ходов, разрешения `dontAsk`, мышление отключено). Каждый получает свою собственную область сеанса. Это сложный механизм «проверки того, что набор тестов проходит и охватывает новую функцию».
 
-**HTTP hooks** POST the hook input to a URL. Enables remote policy servers and audit logging without local process spawning.
+**HTTP hooks** POST hook для ввода URL-адреса. Включает удаленные серверы политики и ведение журнала аудита без создания локальных процессов.
 
-The two internal types are **callback hooks** (registered programmatically, -70% overhead on the hot path via a fast path that skips span tracking) and **function hooks** (session-scoped TypeScript callbacks for structured output enforcement in agent hooks).
+Двумя внутренними типами являются **hooks обратного вызова** (регистрируются программно, -70% накладных расходов по горячему пути через быстрый путь, который пропускает отслеживание интервалов) и **hooks функций** (callbacks TypeScript в области сеанса для принудительного применения структурированного вывода в hooks agent).
 
-### The Five Most Important Lifecycle Events
+### Пять наиболее важных событий жизненного цикла
 
-The hook system fires at over two dozen lifecycle points. Five dominate real-world usage:
+Система hooks срабатывает в более чем двух десятках точек жизненного цикла. Пять из них доминируют в реальном использовании:
 
-**PreToolUse** -- fires before every tool execution. Can block, modify input, auto-approve, or inject context. Permission behavior follows strict precedence: deny > ask > allow. The most common hook point for quality gates.
+**PreToolUse** – срабатывает перед каждым tool execution. Может блокировать, изменять ввод, автоматически утверждать или вводить контекст. Поведение разрешений имеет строгий приоритет: запретить > спросить > разрешить. Самая распространенная точка крепления качественных ворот.
 
-**PostToolUse** -- fires after successful execution. Can inject context or replace MCP tool output entirely. Useful for automated feedback on tool results.
+**PostToolUse** – срабатывает после успешного выполнения. Может внедрить контекст или полностью заменить выходные данные tool MCP. Полезно для автоматической обратной связи о результатах работы tool.
 
-**Stop** -- fires before Claude concludes its response. A blocking hook forces continuation. This is the mechanism for automated verification loops: "are you really done?"
+**Стоп** — срабатывает до того, как Клод завершает ответ. Блокирующий крюк вызывает продолжение. Это механизм автоматического цикла проверки: «Вы действительно закончили?»
 
-**SessionStart** -- fires at session beginning. Can set environment variables, override the first user message, or register file watch paths. Cannot block (a hook cannot prevent a session from starting).
+**SessionStart** — срабатывает в начале сеанса. Можно устанавливать переменные среды, переопределять первое сообщение пользователя или регистрировать пути наблюдения за файлами. Невозможно заблокировать (hook не может предотвратить запуск сеанса).
 
-**UserPromptSubmit** -- fires when the user submits a prompt. Can block processing, enabling input validation or content filtering before the model sees it.
+**UserPromptSubmit** – срабатывает, когда пользователь отправляет запрос. Может блокировать обработку, включая проверку ввода или фильтрацию контента до того, как модель его увидит.
 
-**Reference table -- remaining events:**
+**Справочная таблица – оставшиеся события:**
 
-| Category | Events |
+| Категория | События |
 |----------|--------|
-| Tool lifecycle | PostToolUseFailure, PermissionDenied, PermissionRequest |
-| Session | SessionEnd (1.5s timeout), Setup |
-| Subagent | SubagentStart, SubagentStop |
-| Compaction | PreCompact, PostCompact |
-| Notification | Notification, Elicitation, ElicitationResult |
-| Configuration | ConfigChange, InstructionsLoaded, CwdChanged, FileChanged, TaskCreated, TaskCompleted, TeammateIdle |
+| Жизненный цикл tool | PostToolUseFailure, PermissionDenied, PermissionRequest |
+| Сессия | SessionEnd (тайм-аут 1,5 с), Настройка |
+| Sub-agent | Sub-agentСтарт, Sub-agentСтоп |
+| Уплотнение | Прекомпакт, Посткомпакт |
+| Уведомление | Уведомление, выявление, ElicitationResult |
+| Конфигурация | ConfigChange, InstructionsLoaded, CwdChanged, FileChanged, TaskCreated, TaskCompleted, TeammateIdle |
 
-The blocking asymmetry is intentional. Events representing recoverable decisions (tool calls, stop conditions) support blocking. Events representing irrevocable facts (session started, API failed) do not.
+Блокирующая асимметрия является преднамеренной. События, представляющие восстанавливаемые решения (tool calls, условия остановки), поддерживают блокировку. События, представляющие собой необратимые факты (сессия началась, провал API), нет.
 
-### Exit Code Semantics
+### Семантика кода выхода
 
-For command hooks, exit codes carry specific meaning:
+Для командных hooks коды выхода имеют особое значение:
 
-| Exit Code | Meaning | Blocks |
+| Код выхода | Значение | Блоки |
 |-----------|---------|--------|
-| 0 | Success, stdout parsed if JSON | No |
-| 2 | Blocking error, stderr shown as system message | Yes |
-| Other | Non-blocking warning, shown to user only | No |
+| 0 | Успех, stdout анализируется, если JSON | Нет |
+| 2 | Ошибка блокировки, stderr отображается как системное сообщение | Да |
+| Другое | Неблокирующее предупреждение, показываемое только пользователю | Нет |
 
-Exit code 2 was chosen deliberately. Exit code 1 is too common -- any unhandled exception, assertion failure, or syntax error produces exit 1. Using exit 2 prevents accidental enforcement.
+Код выхода 2 был выбран сознательно. Код выхода 1 слишком распространен: любое необработанное исключение, сбой утверждения или синтаксическая ошибка приводит к выходу 1. Использование выхода 2 предотвращает случайное применение.
 
-### Six Hook Sources
+### Шесть источников hooks
 
-| Source | Trust Level | Notes |
+| Источник | Уровень доверия | Заметки |
 |--------|-------------|-------|
-| `userSettings` | User | `~/.claude/settings.json`, highest priority |
-| `projectSettings` | Project | `.claude/settings.json`, version-controlled |
-| `localSettings` | Local | `.claude/settings.local.json`, gitignored |
-| `policySettings` | Enterprise | Cannot be overridden |
-| `pluginHook` | Plugin | Priority 999 (lowest) |
-| `sessionHook` | Session | In-memory only, registered by skills |
+| `userSettings` | Пользователь | `~/.claude/settings.json`, высший приоритет |
+| `projectSettings` | Проект | `.claude/settings.json`, с контролем версий |
+| `localSettings` | Местный | `.claude/settings.local.json`, gitignored |
+| `policySettings` | Предприятие | Невозможно переопределить |
+| `pluginHook` | Плагин | Приоритет 999 (самый низкий) |
+| `sessionHook` | Сессия | Только в memory, регистрируется по skills |
 
 ---
 
-## The Snapshot Security Model
+## Модель безопасности моментальных снимков
 
-Hooks execute arbitrary code. A project's `.claude/settings.json` can define hooks that fire before every tool call. What happens if a malicious repository modifies its hooks after the user accepts the workspace trust dialog?
+Hooks выполняют произвольный код. `.claude/settings.json` проекта может определять hooks, которые срабатывают перед каждым вызовом tool. Что произойдет, если вредоносный репозиторий изменит свои hooks после того, как пользователь примет диалог доверия рабочей области?
 
-Nothing. The hooks configuration is frozen at startup.
+Ничего. Конфигурация hooks фиксируется при запуске.
 
 ```mermaid
 sequenceDiagram
@@ -223,15 +223,15 @@ sequenceDiagram
     Note over CC: Reads from frozen snapshot<br/>Ignores filesystem changes
 ```
 
-`captureHooksConfigSnapshot()` is called once during startup. From that point, `executeHooks()` reads from the snapshot, never re-reading settings files implicitly. The snapshot is only updated through explicit channels: the `/hooks` command or a file watcher detection, both of which rebuild through `updateHooksConfigSnapshot()`.
+`captureHooksConfigSnapshot()` вызывается один раз во время запуска. С этого момента `executeHooks()` считывает данные из снимка, никогда неявно перечитывая файлы настроек. Снимок обновляется только через явные каналы: команду `/hooks` или обнаружение средства отслеживания файлов, оба из которых перестраиваются через `updateHooksConfigSnapshot()`.
 
-The policy enforcement cascade: `disableAllHooks` in policy settings clears everything. `allowManagedHooksOnly` excludes user and project hooks. A user can disable their own hooks by setting `disableAllHooks`, but they cannot disable enterprise-managed hooks. The policy layer always wins.
+Каскад применения политики: `disableAllHooks` в настройках политики очищает все. `allowManagedHooksOnly` исключает hooks пользователей и проектов. Пользователь может отключить свои собственные hooks, установив `disableAllHooks`, но он не может отключить hooks, управляемые предприятием. Уровень политики всегда побеждает.
 
-The trust check itself (`shouldSkipHookDueToTrust()`) was introduced after two vulnerabilities: SessionEnd hooks executing when a user *declined* the trust dialog, and SubagentStop hooks firing before trust was presented. Both shared the same root cause -- hooks firing in lifecycle states where the user had not consented to workspace code execution. The fix is a centralized gate at the top of `executeHooks()`.
+Сама проверка доверия (`shouldSkipHookDueToTrust()`) была введена после двух уязвимостей: hook SessionEnd, выполняемые, когда пользователь *отклонил* диалог доверия, и hook SubagentStop, срабатывающие до того, как доверие было предоставлено. У обоих была одна и та же основная причина — срабатывание hooks в State жизненного цикла, когда пользователь не давал согласия на выполнение кода рабочей области. Исправление — централизованные ворота наверху `executeHooks()`.
 
 ---
 
-## Execution Flow
+## Поток выполнения
 
 ```mermaid
 flowchart TD
@@ -251,15 +251,15 @@ flowchart TD
     Remove --> Done
 ```
 
-The fast path for internal callbacks is a significant optimization. When all matched hooks are internal (file access analytics, commit attribution), the system skips span tracking, abort signal creation, progress messages, and the full output processing pipeline. Most PostToolUse invocations hit only internal callbacks.
+Быстрый путь для внутренних callbacks является значительной оптимизацией. Когда все соответствующие hooks являются внутренними (аналитика доступа к файлам, атрибуция фиксации), система пропускает отслеживание интервалов, создание сигналов прерывания, сообщения о ходе выполнения и полный конвейер обработки вывода. Большинство вызовов PostToolUse затрагивают только внутренние callbacks.
 
-Hook input JSON is serialized once via a lazy `getJsonInput()` closure and reused across all parallel hooks. Environment injection sets `CLAUDE_PROJECT_DIR`, `CLAUDE_PLUGIN_ROOT`, and for certain events, `CLAUDE_ENV_FILE` where hooks can write environment exports.
+Ввод hook JSON сериализуется один раз через ленивое замыкание `getJsonInput()` и повторно используется во всех параллельных hooks. Наборы внедрения среды `CLAUDE_PROJECT_DIR`, `CLAUDE_PLUGIN_ROOT` и для определенных событий `CLAUDE_ENV_FILE`, где hooks могут записывать экспорт среды.
 
 ---
 
-## Integration: Where Skills Meet Hooks
+## Интеграция: где skills встречаются с hooks
 
-When a skill is invoked, its frontmatter-declared hooks register as session-scoped hooks. The `skillRoot` becomes `CLAUDE_PLUGIN_ROOT` for the hook's shell commands:
+Когда skill вызывается, его hooks, объявленные в Frontmatter, регистрируются как hooks в области сеанса. `skillRoot` становится `CLAUDE_PLUGIN_ROOT` для команд оболочки hook:
 
 ```
 my-skill/
@@ -267,7 +267,7 @@ my-skill/
   validate.sh       # Called by a PreToolUse hook declared in frontmatter
 ```
 
-The skill's frontmatter declares:
+В описании skillа говорится:
 
 ```yaml
 hooks:
@@ -279,32 +279,32 @@ hooks:
           once: true
 ```
 
-When the user invokes `/my-skill`, the skill content loads into the conversation AND the PreToolUse hook registers. The next Bash tool call triggers `validate.sh`. Because `once: true` is set, the hook removes itself after the first successful execution.
+Когда пользователь вызывает `/my-skill`, содержимое skillа загружается в диалог И регистрируется ловушка PreToolUse. Следующий tool call Bash запускает `validate.sh`. Поскольку установлен `once: true`, hook удаляется после первого успешного выполнения.
 
-For agents, `Stop` hooks declared in frontmatter are automatically converted to `SubagentStop` hooks, because subagents trigger `SubagentStop`, not `Stop`. Without the conversion, an agent's stop-verification hook would never fire.
+Для agents hooks `Stop`, объявленные во входной части, автоматически преобразуются в hooks `SubagentStop`, поскольку sub-agents запускают `SubagentStop`, а не `Stop`. Без преобразования hook остановки проверки agent никогда не сработает.
 
-### Permission Behavior Precedence
+### Приоритет поведения разрешений
 
-`executePreToolHooks()` can block (via `blockingError`), auto-approve (via `permissionBehavior: 'allow'`), force ask (via `'ask'`), deny (via `'deny'`), modify input (via `updatedInput`), or add context (via `additionalContext`). When multiple hooks return different behaviors, deny always wins. This is the correct default for security-relevant decisions.
+`executePreToolHooks()` может блокировать (через `blockingError`), автоматически утверждать (через `permissionBehavior: 'allow'`), принудительно запрашивать (через `'ask'`), отклонять (через `'deny'`), изменять ввод (через `updatedInput`) или добавлять контекст (через `additionalContext`). Когда несколько hooks возвращают разное поведение, всегда побеждает метод Deny. Это правильное значение по умолчанию для решений, связанных с безопасностью.
 
-### Stop Hooks: Forcing Continuation
+### Стоп-hooks: принудительное продолжение
 
-When a Stop hook returns exit code 2, the stderr is shown to the model as feedback and the conversation continues. This turns a single-shot prompt-response into a goal-directed loop. The Stop hook is arguably the most powerful integration point in the entire system.
+Когда hook Stop возвращает код выхода 2, модели stderr отображается в качестве обратной связи, и диалог продолжается. Это превращает одноразовый оперативный ответ в целенаправленный цикл. Стоп-hook, пожалуй, самая мощная точка интеграции во всей системе.
 
 ---
 
-## Apply This: Designing an Extensibility System
+## Примените это: проектирование системы расширяемости
 
-**Separate content from control flow.** Skills add capabilities; hooks constrain behavior. Conflating the two makes it impossible to reason about what a plugin does versus what it prevents.
+**Отделение контента от потока управления.** Skills добавляют возможности; hooks ограничивают поведение. Объединив эти два понятия, становится невозможным рассуждать о том, что плагин делает, а что он предотвращает.
 
-**Freeze configuration at trust boundaries.** The snapshot mechanism captures hooks at the moment of consent and never re-reads implicitly. If your system executes user-provided code, this eliminates TOCTOU attacks.
+**Замораживание конфигурации на границах доверия.** Механизм моментальных снимков фиксирует hooks в момент согласия и никогда не выполняет повторное чтение неявно. Если ваша система выполняет код, предоставленный пользователем, это исключает атаки TOCTOU.
 
-**Use uncommon exit codes for semantic signals.** Exit code 1 is noise -- every unhandled error produces it. Exit code 2 as the blocking signal prevents accidental enforcement. Choose signals that require deliberate intent.
+**Используйте необычные коды завершения для семантических сигналов.** Код выхода 1 — это шум: его создает каждая необработанная ошибка. Код выхода 2, поскольку сигнал блокировки предотвращает случайное срабатывание. Выбирайте сигналы, которые требуют осознанного намерения.
 
-**Validate at the socket level, not the application level.** The SSRF guard runs at DNS lookup time, not as a pre-flight check. This eliminates the DNS rebinding window. When validating network destinations, the check must be atomic with the connection.
+**Проверка выполняется на уровне сокета, а не на уровне приложения.** Защита SSRF запускается во время поиска DNS, а не в качестве предполетной проверки. Это устраняет окно перепривязки DNS. При проверке сетевых адресатов проверка должна быть атомарной по отношению к соединению.
 
-**Optimize for the common case.** The internal callback fast path (-70% overhead) recognizes that most hook invocations hit only internal callbacks. The two-phase skill loading recognizes that most skills are never invoked in a given session. Each optimization targets the actual distribution of usage.
+**Оптимизация для общего случая.** Быстрый путь внутреннего обратного вызова (накладные расходы -70 %) учитывает, что большинство вызовов hooks затрагивают только внутренние callbacks. Двухфазная загрузка skills учитывает, что большинство skills никогда не активируются в данном сеансе. Каждая оптимизация нацелена на фактическое распределение использования.
 
-The extensibility system reflects a mature understanding of the tension between power and safety. Skills give the model new capabilities bounded by the MCP security line (Chapter 15). Hooks give external code influence over the model's actions bounded by the snapshot mechanism, exit code semantics, and policy cascade. Neither system trusts the other -- and that mutual distrust is what makes the combination safe to deploy at scale.
+Система расширяемости отражает зрелое понимание противоречия между мощностью и безопасностью. Skills дают модели новые возможности, ограниченные линией безопасности MCP (глава 15). Hooks обеспечивают влияние внешнего кода на действия модели, ограниченное механизмом моментальных снимков, семантикой кода завершения и каскадом политик. Ни одна из систем не доверяет другой, и именно взаимное недоверие делает эту комбинацию безопасной для масштабного развертывания.
 
-The next chapter turns to the visual layer: how Claude Code renders a reactive terminal UI at 60fps and processes input across five terminal protocols.
+Следующая глава посвящена визуальному уровню: как Claude Code отображает реактивный UI терминала со скоростью 60 кадров в секунду и обрабатывает ввод по пяти терминальным протоколам.

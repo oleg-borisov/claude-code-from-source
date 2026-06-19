@@ -1,54 +1,54 @@
-# Chapter 8: Spawning Sub-Agents
+# Глава 8: Создание sub-agents
 
-## The Multiplication of Intelligence
+## Умножение интеллекта
 
-A single agent is powerful. It can read files, edit code, run tests, search the web, and reason about the results. But there is a hard ceiling on what one agent can do in a single conversation: the context window fills up, the task branches in directions that demand different capabilities, and the serial nature of tool execution becomes a bottleneck. The solution is not a bigger model. It is more agents.
+Один agent обладает силой. Он может читать файлы, редактировать код, запускать тесты, выполнять поиск в Интернете и анализировать результаты. Но существует жесткий потолок того, что может сделать один agent за один диалог: контекстное окно заполняется, Task разветвляются в направлениях, требующих разных возможностей, а последовательный характер выполнения tools становится узким местом. Решение — это не более крупная модель. Это больше agents.
 
-Claude Code's sub-agent system lets the model request help. When the parent agent encounters a task that would benefit from delegation -- a codebase search that should not pollute the main conversation, a verification pass that demands adversarial thinking, a set of independent edits that could run in parallel -- it calls the `Agent` tool. That call spawns a child: a fully independent agent with its own conversation loop, its own tool set, its own permission boundary, and its own abort controller. The child does its work and returns a result. The parent never sees the child's internal reasoning, only the final output.
+Система sub-agents Claude Code позволяет модели запрашивать помощь. Когда parent agent сталкивается с Task, для которой было бы полезно делегирование — поиск по кодовой базе, который не должен загрязнять основной диалог, этап проверки, требующий состязательного мышления, набор независимых изменений, которые могут выполняться параллельно — он вызывает tool `Agent`. Этот вызов порождает дочерний элемент: полностью независимый agent со своим собственным циклом диалога, собственным набором tools, собственной границей разрешений и собственным контроллером прерывания. Ребенок делает свою работу и возвращает результат. Родитель никогда не видит внутренних рассуждений ребенка, а только конечный результат.
 
-This is not a convenience feature. It is the architectural foundation for everything from parallel file exploration to coordinator-worker hierarchies to multi-agent swarm teams. And it all flows through two files: `AgentTool.tsx`, which defines the model-facing interface, and `runAgent.ts`, which implements the lifecycle.
+Это не функция удобства. Это архитектурная основа для всего: от параллельного исследования файлов до иерархий координатор-работник и multi-agent групповых команд. И все это проходит через два файла: `AgentTool.tsx`, который определяет интерфейс, ориентированный на модель, и `runAgent.ts`, который реализует жизненный цикл.
 
-The design challenge is significant. A sub-agent needs enough context to do its job but not so much that it wastes tokens on irrelevant information. It needs permission boundaries that are strict enough for safety but flexible enough for utility. It needs lifecycle management that cleans up every resource it touches without requiring the caller to remember what to clean up. And all of this must work for a spectrum of agent types -- from a cheap, fast, read-only Haiku searcher to an expensive, thorough, Opus-powered verification agent running adversarial tests in the background.
+Task проектирования является значительной. Sub-agent требуется достаточный контекст для выполнения своей работы, но не настолько, чтобы он тратил токены на ненужную информацию. Ему нужны границы разрешений, достаточно строгие для безопасности, но достаточно гибкие для полезности. Ему необходимо управление жизненным циклом, которое очищает каждый ресурс, к которому он прикасается, не требуя от вызывающей стороны запоминания того, что нужно очистить. И все это должно работать для широкого спектра типов agents — от дешевого, быстрого поисковика Haiku только для чтения до дорогого, тщательного agent проверки на базе Opus, выполняющего состязательные тесты в фоновом режиме.
 
-This chapter traces the path from the model's "I need help" to a fully operational child agent. We will examine the tool definition that the model sees, the fifteen-step lifecycle that creates the execution environment, the six built-in agent types and what each optimizes for, the frontmatter system that lets users define custom agents, and the design principles that emerge from all of it.
+В этой главе прослеживается путь от модели «Мне нужна помощь» до полностью работоспособного дочернего agent. Мы рассмотрим определение tool, которое видит модель, пятнадцатиэтапный жизненный цикл, который создает среду выполнения, шесть встроенных типов agents и то, для чего каждый из них оптимизируется, систему фронт-матер, которая позволяет пользователям определять собственные agents, а также принципы проектирования, которые вытекают из всего этого.
 
-A note on terminology: throughout this chapter, "parent" refers to the agent that calls the `Agent` tool, and "child" refers to the agent that is spawned. The parent is usually (but not always) the top-level REPL agent. In coordinator mode, the coordinator spawns workers, which are children. In nested scenarios, a child can itself spawn grandchildren -- the same lifecycle applies recursively.
+Примечание по терминологии: в этой главе «родительский» относится к agent, который вызывает tool `Agent`, а «дочерний» относится к порожденному agent. Родителем обычно (но не всегда) является agent REPL верхнего уровня. В Coordinator Mode координатор порождает рабочих, которые являются детьми. Во вложенных сценариях дочерний элемент сам может порождать внуков — тот же жизненный цикл применяется рекурсивно.
 
-The orchestration layer spans approximately 40 files across `tools/AgentTool/`, `tasks/`, `coordinator/`, `tools/SendMessageTool/`, and `utils/swarm/`. This chapter focuses on the spawning mechanics -- the AgentTool definition and the runAgent lifecycle. The next chapter covers the runtime: progress tracking, result retrieval, and multi-agent coordination patterns.
+Уровень оркестрации охватывает примерно 40 файлов `tools/AgentTool/`, `tasks/`, `coordinator/`, `tools/SendMessageTool/` и `utils/swarm/`. В этой главе основное внимание уделяется механике создания — определению AgentTool и жизненному циклу runAgent. В следующей главе рассматривается среда выполнения: отслеживание прогресса, получение результатов и шаблоны multi-agent координации.
 
 ---
 
-## The AgentTool Definition
+## Определение AgentTool
 
-The `AgentTool` is registered under the name `"Agent"` with a legacy alias `"Task"` for backward compatibility with older transcripts, permission rules, and hook configurations. It is built with the standard `buildTool()` factory, but its schema is more dynamic than any other tool in the system.
+`AgentTool` зарегистрирован под именем `"Agent"` с устаревшим псевдонимом `"Task"` для обратной совместимости со старыми транскриптами, правилами разрешений и конфигурациями hooks. Он построен с использованием стандартной фабрики `buildTool()`, но его схема более динамична, чем у любого другого tool в системе.
 
-### The Input Schema
+### Входная схема
 
-The input schema is constructed lazily via `lazySchema()` -- a pattern we saw in Chapter 6 that defers zod compilation until first use. There are two layers: a base schema and a full schema that adds multi-agent and isolation parameters.
+Входная схема создается лениво с помощью `lazySchema()` — шаблона, который мы видели в главе 6, который откладывает компиляцию zod до первого использования. Существует два уровня: базовая схема и полная схема, которая добавляет параметры multi-agent и изоляции.
 
-The base fields are always present:
+Базовые поля присутствуют всегда:
 
-| Field | Type | Required | Purpose |
+| Поле | Тип | Требуется | Цель |
 |-------|------|----------|---------|
-| `description` | `string` | Yes | Short 3-5 word summary of the task |
-| `prompt` | `string` | Yes | The full task description for the agent |
-| `subagent_type` | `string` | No | Which specialized agent to use |
-| `model` | `enum('sonnet','opus','haiku')` | No | Model override for this agent |
-| `run_in_background` | `boolean` | No | Launch asynchronously |
+| `description` | `string` | Да | Краткое изложение задания из 3-5 слов |
+| `prompt` | `string` | Да | Полное описание Task для agent |
+| `subagent_type` | `string` | Нет | Какой специализированный agent использовать |
+| `model` | `enum('sonnet','opus','haiku')` | Нет | Переопределение модели для этого agent |
+| `run_in_background` | `boolean` | Нет | Запускать асинхронно |
 
-The full schema adds multi-agent parameters (when swarm features are active) and isolation controls:
+Полная схема добавляет параметры мультиagent (когда функции роя активны) и элементы управления изоляцией:
 
-| Field | Type | Purpose |
+| Поле | Тип | Цель |
 |-------|------|---------|
-| `name` | `string` | Makes the agent addressable via `SendMessage({to: name})` |
-| `team_name` | `string` | Team context for spawning |
-| `mode` | `PermissionMode` | Permission mode for spawned teammate |
-| `isolation` | `enum('worktree','remote')` | Filesystem isolation strategy |
-| `cwd` | `string` | Absolute path override for working directory |
+| `name` | `string` | Делает agent доступным через `SendMessage({to: name})` |
+| `team_name` | `string` | Командный контекст для спауна |
+| `mode` | `PermissionMode` | Режим разрешения для созданного товарища по команде |
+| `isolation` | `enum('worktree','remote')` | Стратегия изоляции файловой системы |
+| `cwd` | `string` | Переопределение абсолютного пути для рабочего каталога |
 
-The multi-agent fields enable the swarm pattern covered in Chapter 9: named agents that can send messages to each other via `SendMessage({to: name})` while running concurrently. The isolation fields enable filesystem safety: worktree isolation creates a temporary git worktree so the agent operates on a copy of the repository, preventing conflicting edits when multiple agents work on the same codebase simultaneously.
+Поля с несколькими agentsи позволяют использовать шаблон роя, описанный в главе 9: именованные agents, которые могут отправлять сообщения друг другу через `SendMessage({to: name})` при одновременной работе. Поля изоляции обеспечивают безопасность файловой системы: изоляция рабочего дерева создает временное рабочее дерево git, чтобы agent работал с копией репозитория, предотвращая конфликтующие изменения, когда несколько agents одновременно работают над одной базой кода.
 
-What makes this schema unusual is that it is **dynamically shaped by feature flags**:
+Что делает эту схему необычной, так это то, что она **динамически формируется с помощью флагов функций**:
 
 ```typescript
 // Pseudocode — illustrates the feature-gated schema pattern
@@ -60,49 +60,49 @@ inputSchema = lazySchema(() => {
 })
 ```
 
-When the fork experiment is active, `run_in_background` disappears from the schema entirely because all spawns are forced async under that path. When background tasks are disabled (via `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`), the field is also stripped. When the KAIROS feature flag is off, `cwd` is omitted. The model never sees fields it cannot use.
+Когда эксперимент с разветвлением активен, `run_in_background` полностью исчезает из схемы, поскольку все порождения принудительно асинхронны по этому пути. При отключении фоновых Task (через `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`) поле также удаляется. Если флаг функции KAIROS выключен, `cwd` опускается. Модель никогда не видит полей, которые она не может использовать.
 
-This is a subtle but important design choice. The schema is not just validation -- it is the model's instruction manual. Every field in the schema is described in the tool definition that the model reads. Removing fields the model should not use is more effective than adding "do not use this field" to the prompt. The model cannot misuse what it cannot see.
+Это тонкий, но важный дизайнерский выбор. Схема — это не просто проверка — это инструкция по эксплуатации модели. Каждое поле схемы описано в определении tool, которое считывает модель. Удаление полей, которые модель не должна использовать, более эффективно, чем добавление в prompt «не использовать это поле». Модель не может злоупотреблять тем, чего она не видит.
 
-### The Output Schema
+### Схема вывода
 
-The output is a discriminated union with two public variants:
+Результатом является дискриминируемый союз с двумя общедоступными вариантами:
 
-- `{ status: 'completed', prompt, ...AgentToolResult }` -- synchronous completion with the agent's final output
-- `{ status: 'async_launched', agentId, description, prompt, outputFile }` -- background launch acknowledgment
+- `{ status: 'completed', prompt, ...AgentToolResult }` -- синхронное завершение с окончательным выводом agent
+- `{ status: 'async_launched', agentId, description, prompt, outputFile }` -- подтверждение фонового запуска
 
-Two additional internal variants (`TeammateSpawnedOutput` and `RemoteLaunchedOutput`) exist but are excluded from the exported schema to enable dead code elimination in external builds. The bundler strips these variants and their associated code paths when the corresponding feature flags are disabled, keeping the distributed binary smaller.
+Существуют два дополнительных внутренних варианта (`TeammateSpawnedOutput` и `RemoteLaunchedOutput`), но они исключены из экспортированной схемы, чтобы обеспечить устранение неработающего кода во внешних сборках. Bundler удаляет эти варианты и связанные с ними пути кода, когда соответствующие флаги функций отключены, сохраняя размер распространяемого двоичного файла.
 
-The `async_launched` variant is notable for what it includes: the `outputFile` path where the agent's results will be written when it completes. This lets the parent (or any other consumer) poll or watch the file for results, providing a filesystem-based communication channel that survives process restarts.
+Вариант `async_launched` примечателен тем, что он включает в себя: путь `outputFile`, куда будут записываться результаты работы agent после его завершения. Это позволяет родителю (или любому другому потребителю) опрашивать или просматривать файл на предмет результатов, обеспечивая канал связи на основе файловой системы, который выдерживает перезапуск процесса.
 
-### The Dynamic Prompt
+### Динамическая prompt
 
-The `AgentTool` prompt is generated by `getPrompt()` and is context-sensitive. It adapts based on available agents (listed inline or as an attachment to avoid busting prompt cache), whether fork is active (adds "When to fork" guidance), whether the session is in coordinator mode (slim prompt since the coordinator system prompt already covers usage), and subscription tier. Non-pro users get a note about launching multiple agents concurrently.
+prompt `AgentTool` создается `getPrompt()` и является контекстно-зависимым. Он адаптируется на основе доступных agents (перечисленных в строке или в виде вложения, чтобы избежать перегрузки Prompt Cache), активности разветвления (добавляется указание «Когда разветвлять»), находится ли сеанс в Coordinator Mode (тонкое prompt, поскольку System Prompt координатора уже охватывает использование) и уровня подписки. Непрофессиональные пользователи получают уведомление об одновременном запуске нескольких agents.
 
-The attachment-based agent list is worth highlighting. The codebase comments reference "approximately 10.2% of fleet cache_creation tokens" being caused by dynamic tool descriptions. Moving the agent list from the tool description to an attachment message keeps the tool description static, so connecting an MCP server or loading a plugin does not bust the prompt cache for every subsequent API call.
+Список agents на основе вложений заслуживает внимания. В комментариях к базе кода упоминается, что «приблизительно 10,2% токенов кэша_создания флота» вызваны динамическими описаниями tools. Перемещение списка agents из описания tool в сообщение-вложение сохраняет описание tool статическим, поэтому подключение сервера MCP или загрузка плагина не приводит к перегрузке Prompt Cache для каждого последующего вызова API.
 
-This is a pattern worth internalizing for any system that uses tool definitions with dynamic content. The Anthropic API caches the prompt prefix -- system prompt, tool definitions, and conversation history -- and reuses the cached computation for subsequent requests that share the same prefix. If the tool definition changes between API calls (because an agent was added or an MCP server connected), the entire cache is invalidated. Moving volatile content from the tool definition (which is part of the cached prefix) to an attachment message (which is appended after the cached portion) preserves the cache while still delivering the information to the model.
+Этот шаблон стоит усвоить для любой системы, использующей определения tools с динамическим содержимым. Anthropic API кэширует префикс prompt (System Prompt, определения tools и историю разговоров) и повторно использует кэшированные вычисления для последующих запросов, которые используют тот же префикс. Если определение tool изменяется между вызовами API (поскольку был добавлен agent или подключен сервер MCP), весь кэш становится недействительным. Перемещение изменчивого содержимого из определения tool (которое является частью кэшированного префикса) в сообщение вложения (которое добавляется после кэшированной части) сохраняет кеш, но при этом доставляет информацию в модель.
 
-With the tool definition understood, we can now trace what happens when the model actually calls it.
+Поняв определение tool, мы теперь можем проследить, что происходит, когда модель фактически вызывает его.
 
-### Feature Gating
+### Функция стробирования
 
-The sub-agent system has the most complex feature gating in the codebase. At least twelve feature flags and GrowthBook experiments control which agents are available, which parameters appear in the schema, and which code paths are taken:
+Система sub-agents имеет наиболее сложную функцию шлюзования в кодовой базе. Как минимум двенадцать флагов функций и эксперименты GrowthBook контролируют, какие agents доступны, какие параметры отображаются в схеме и какие пути кода используются:
 
-| Feature Gate | Controls |
+| Особенность Ворота | Элементы управления |
 |-------------|----------|
-| `FORK_SUBAGENT` | Fork agent path |
-| `BUILTIN_EXPLORE_PLAN_AGENTS` | Explore and Plan agents |
-| `VERIFICATION_AGENT` | Verification agent |
-| `KAIROS` | `cwd` override, assistant force-async |
-| `TRANSCRIPT_CLASSIFIER` | Handoff classification, `auto` mode override |
-| `PROACTIVE` | Proactive module integration |
+| `FORK_SUBAGENT` | Форкнуть путь agent |
+| `BUILTIN_EXPLORE_PLAN_AGENTS` | Исследуйте и планируйте agents |
+| `VERIFICATION_AGENT` | Agent проверки |
+| `KAIROS` | `cwd` переопределение, помощник принудительной асинхронности |
+| `TRANSCRIPT_CLASSIFIER` | Классификация передачи обслуживания, переопределение режима `auto` |
+| `PROACTIVE` | Проактивная интеграция модулей |
 
-Each gate uses `feature()` from Bun's dead code elimination system (compile-time) or `getFeatureValue_CACHED_MAY_BE_STALE()` from GrowthBook (runtime A/B testing). The compile-time gates are string-replaced during the build -- when `FORK_SUBAGENT` is `'ant'`, the entire fork code path is included; when it is `'external'`, it may be excluded entirely. The GrowthBook gates allow live experimentation: the `tengu_amber_stoat` experiment can A/B test whether removing Explore and Plan agents changes user behavior, without shipping a new binary.
+Каждый шлюз использует `feature()` из системы устранения мертвого кода Бана (во время компиляции) или `getFeatureValue_CACHED_MAY_BE_STALE()` из GrowthBook (A/B-тестирование во время выполнения). Во время сборки вентили времени компиляции заменяются строками - если `FORK_SUBAGENT` равен `'ant'`, включается весь путь кода ветвления; если это `'external'`, его можно полностью исключить. Ворота GrowthBook позволяют экспериментировать в реальном времени: эксперимент `tengu_amber_stoat` может A/B-тестировать, меняет ли удаление agents Explore и Plan поведение пользователя, без отправки нового двоичного файла.
 
-### The call() Decision Tree
+### Дерево решений call()
 
-Before `runAgent()` is ever invoked, the `call()` method in `AgentTool.tsx` routes the request through a decision tree that determines *what kind* of agent to spawn and *how* to spawn it:
+Прежде чем `runAgent()` будет вызван, метод `call()` в `AgentTool.tsx` направляет запрос через дерево решений, которое определяет *какой тип* agent создавать и *как* его создавать:
 
 ```
 1. Is this a teammate spawn? (team_name + name both set)
@@ -140,19 +140,19 @@ Before `runAgent()` is ever invoked, the `call()` method in `AgentTool.tsx` rout
 10. Execute (async -> registerAsyncAgent + void lifecycle; sync -> iterate runAgent)
 ```
 
-Steps 1 through 6 are pure routing -- no agent has been created yet. The actual lifecycle begins at `runAgent()`, which the sync path iterates directly and the async path wraps in `runAsyncAgentLifecycle()`.
+Шаги с 1 по 6 представляют собой чистую маршрутизацию — agent еще не создан. Фактический жизненный цикл начинается с `runAgent()`, который повторяется непосредственно в пути синхронизации, а асинхронный путь оборачивается в `runAsyncAgentLifecycle()`.
 
-The routing is done in `call()` rather than `runAgent()` for a reason: `runAgent()` is a pure lifecycle function that does not know about teammates, remote agents, or the fork experiment. It receives a resolved agent definition and executes it. The decision of *which* definition to resolve, *how* to isolate the agent, and *whether* to run synchronously or asynchronously belongs to the layer above. This separation keeps `runAgent()` testable and reusable -- it is called from both the normal AgentTool path and from the async lifecycle wrapper when resuming a backgrounded agent.
+Маршрутизация выполняется в `call()`, а не в `runAgent()` по одной причине: `runAgent()` — это чистая функция жизненного цикла, которая не знает о товарищах по команде, удаленных agents или эксперименте с форком. Он получает разрешенное определение agent и выполняет его. Решение о том, *какое* определение разрешать, *как* изолировать agent и *работать* синхронно или асинхронно, принадлежит уровню выше. Такое разделение обеспечивает возможность тестирования и повторного использования `runAgent()` — он вызывается как из обычного пути AgentTool, так и из асинхронной оболочки жизненного цикла при возобновлении работы фонового agent.
 
-The fork guard in step 3 deserves attention. Fork children keep the `Agent` tool in their pool (for cache-identical tool definitions with the parent), but recursive forking would be pathological. Two guards prevent it: `querySource === 'agent:builtin:fork'` (set on the child's context options, survives autocompact) and `isInForkChild(messages)` (scans conversation history for the `<fork-boilerplate>` tag as a fallback). Belt and suspenders -- the primary guard is fast and reliable; the fallback catches edge cases where querySource was not threaded.
+Внимания заслуживает защита вилки на этапе 3. Дочерние элементы ветвления сохраняют tool `Agent` в своем пуле (для определений tools, идентичных кешу родительского tool), но рекурсивное разветвление было бы патологией. Этому препятствуют два охранника: `querySource === 'agent:builtin:fork'` (устанавливается в параметрах контекста дочернего элемента, сохраняется при автосжатии) и `isInForkChild(messages)` (сканирует историю разговоров на предмет тега `<fork-boilerplate>` в качестве запасного варианта). Ремень и подтяжки — основная защита быстрая и надежная; резервный вариант улавливает крайние случаи, когда querySource не был связан с потоком.
 
 ---
 
-## The runAgent Lifecycle
+## Жизненный цикл runAgent
 
-`runAgent()` in `runAgent.ts` is an async generator that drives a sub-agent's entire lifecycle. It yields `Message` objects as the agent works. Every sub-agent -- fork, built-in, custom, coordinator worker -- flows through this single function. The function is approximately 400 lines, and every line exists for a reason.
+`runAgent()` в `runAgent.ts` — это асинхронный генератор, управляющий всем жизненным циклом sub-agent. Во время работы agent он создает объекты `Message`. Каждый sub-agent — ответвленный, встроенный, пользовательский, координатор — выполняет эту единственную функцию. Функция состоит примерно из 400 строк, и каждая строка существует не просто так.
 
-The function signature reveals the complexity of the problem:
+Сигнатура функции раскрывает сложность проблемы:
 
 ```typescript
 export async function* runAgent({
@@ -177,13 +177,13 @@ export async function* runAgent({
 }: { ... }): AsyncGenerator<Message, void>
 ```
 
-Seventeen parameters. Each one represents a dimension of variation that the lifecycle must handle. This is not over-engineering -- it is the natural consequence of a single function serving fork agents, built-in agents, custom agents, sync agents, async agents, worktree-isolated agents, and coordinator workers. The alternative would be seven different lifecycle functions with duplicated logic, which is worse.
+Семнадцать параметров. Каждый из них представляет собой измерение вариаций, с которым должен справиться жизненный цикл. Это не чрезмерная инженерия — это естественное следствие того, что одна функция обслуживает agents разветвления, встроенные agents, пользовательские agents, agents синхронизации, асинхронные agents, agents, изолированные от рабочего дерева, и рабочие-координаторы. Альтернативой было бы семь различных функций жизненного цикла с дублированной логикой, что еще хуже.
 
-The `override` object is particularly important -- it is the escape hatch for fork agents and resumed agents that need to inject pre-computed values (system prompt, abort controller, agent ID) into the lifecycle without re-deriving them.
+Объект `override` особенно важен — это запасной выход для agents ветвления и возобновленных agents, которым необходимо внедрить предварительно вычисленные значения (System Prompt, контроллер прерывания, идентификатор agent) в жизненный цикл без их повторного получения.
 
-Here are the fifteen steps.
+Вот пятнадцать шагов.
 
-### Step 1: Model Resolution
+### Шаг 1: Разрешение модели
 
 ```typescript
 const resolvedAgentModel = getAgentModel(
@@ -194,23 +194,23 @@ const resolvedAgentModel = getAgentModel(
 )
 ```
 
-The resolution chain is: **caller override > agent definition > parent model > default**. The `getAgentModel()` function handles special values like `'inherit'` (use whatever the parent uses) and GrowthBook-gated overrides for specific agent types. The Explore agent, for example, defaults to Haiku for external users -- the cheapest and fastest model, appropriate for a read-only search specialist that runs 34 million times per week.
+Цепочка разрешения: **переопределение вызывающего абонента > определение agent > родительская модель > по умолчанию**. Функция `getAgentModel()` обрабатывает специальные значения, такие как `'inherit'` (используйте все, что использует родительский элемент), а также переопределения, контролируемые GrowthBook, для определенных типов agents. Например, agent Explore для внешних пользователей по умолчанию использует Haiku — самую дешевую и быструю модель, подходящую для специалиста по поиску только для чтения, который запускается 34 миллиона раз в неделю.
 
-Why this order matters: the caller (the parent model) can override the agent definition's preference by passing a `model` parameter in the tool call. This lets the parent promote a normally-cheap agent to a more capable model for a particularly complex search, or demote an expensive agent when the task is simple. But the agent definition's model is the default, not the parent's -- a Haiku Explore agent should not accidentally inherit the parent's Opus model just because no one specified otherwise.
+Почему этот порядок важен: вызывающая сторона (родительская модель) может переопределить предпочтения определения agent, передав параметр `model` при вызове tool. Это позволяет родительскому элементу повысить обычно дешевый agent до более эффективной модели для особенно сложного поиска или понизить в должности дорогой agent, когда Task проста. Но по умолчанию используется модель определения agent, а не родительская — agent Haiku Explore не должен случайно наследовать родительскую модель Opus только потому, что никто не указал иное.
 
-Understanding the model resolution chain is important because it establishes a design principle that recurs throughout the lifecycle: **explicit overrides beat declarations, declarations beat inheritance, inheritance beats defaults.** This same principle governs permission modes, abort controllers, and system prompts. The consistency makes the system predictable -- once you understand one resolution chain, you understand them all.
+Понимание цепочки разрешения модели важно, поскольку оно устанавливает принцип проектирования, который повторяется на протяжении всего жизненного цикла: **явное переопределение объявлений битов, объявление важнее наследования, наследование важнее значений по умолчанию.** Этот же принцип управляет режимами разрешений, контроллерами прерываний и системными prompts. Последовательность делает систему предсказуемой: как только вы поймете одну цепочку решений, вы поймете их все.
 
-### Step 2: Agent ID Creation
+### Шаг 2. Создание идентификатора agent
 
 ```typescript
 const agentId = override?.agentId ? override.agentId : createAgentId()
 ```
 
-Agent IDs follow the pattern `agent-<hex>` where the hex part is derived from `crypto.randomUUID()`. The branded type `AgentId` prevents accidental string confusion at the type level. The override path exists for resumed agents that need to keep their original ID for transcript continuity.
+Идентификаторы agents соответствуют шаблону `agent-<hex>`, где шестнадцатеричная часть получена из `crypto.randomUUID()`. Фирменный тип `AgentId` предотвращает случайную путаницу строк на уровне типа. Путь переопределения существует для возобновленных agents, которым необходимо сохранить исходный идентификатор для обеспечения непрерывности расшифровки.
 
-### Step 3: Context Preparation
+### Шаг 3: Подготовка контекста
 
-Fork agents and fresh agents diverge here:
+Здесь расходятся вилочные и свежие средства:
 
 ```typescript
 const contextMessages: Message[] = forkContextMessages
@@ -223,13 +223,13 @@ const agentReadFileState = forkContextMessages !== undefined
   : createFileStateCacheWithSizeLimit(READ_FILE_STATE_CACHE_SIZE)
 ```
 
-For fork agents, the parent's entire conversation history is cloned into `contextMessages`. But there is a critical filter: `filterIncompleteToolCalls()` strips any `tool_use` blocks that lack matching `tool_result` blocks. Without this filter, the API would reject the malformed conversation. This happens when the parent is mid-tool-execution at the moment of forking -- the tool_use has been emitted but the result has not arrived yet.
+Для fork agents вся история разговоров родителя клонируется в `contextMessages`. Но есть критический фильтр: `filterIncompleteToolCalls()` удаляет все блоки `tool_use`, в которых отсутствуют соответствующие блоки `tool_result`. Без этого фильтра API отклонил бы искаженный диалог. Это происходит, когда родительский tool находится в середине выполнения tool в момент разветвления — Tool_use был отправлен, но результат еще не получен.
 
-The file state cache follows the same fork-or-fresh pattern. Fork children get a clone of the parent's cache (they already "know" which files have been read). Fresh agents start empty. The clone is a shallow copy -- file content strings are shared via reference, not duplicated. This matters for memory: a fork child with a 50-file cache does not duplicate 50 file contents, it duplicates 50 pointers. The LRU eviction behavior is independent -- each cache evicts based on its own access pattern.
+Кэш State файла следует той же схеме «разветвление или обновление». Дочерние элементы форка получают клон родительского кеша (они уже «знают», какие файлы были прочитаны). Свежие agents начинаются пустыми. Клон представляет собой неполную копию: строки содержимого файла передаются по ссылке, а не дублируются. Это важно для memory: дочерний элемент с кешем из 50 файлов не дублирует содержимое 50 файлов, он дублирует 50 указателей. Поведение вытеснения LRU независимо — каждый кеш вытесняет на основе своего собственного шаблона доступа.
 
-### Step 4: CLAUDE.md Stripping
+### Шаг 4: CLAUDE.md Зачистка
 
-Read-only agents like Explore and Plan have `omitClaudeMd: true` in their definitions:
+Agents только для чтения, такие как Explore и Plan, имеют в своих определениях `omitClaudeMd: true`:
 
 ```typescript
 const shouldOmitClaudeMd =
@@ -242,15 +242,15 @@ const resolvedUserContext = shouldOmitClaudeMd
   : baseUserContext
 ```
 
-CLAUDE.md files contain project-specific instructions about commit messages, PR conventions, lint rules, and coding standards. A read-only search agent does not need any of this -- it cannot commit, cannot create PRs, cannot edit files. The parent agent has full context and will interpret the search results. Dropping CLAUDE.md here saves billions of tokens per week across the fleet -- an aggregate cost reduction that justifies the added complexity of conditional context injection.
+Файлы CLAUDE.md содержат инструкции для конкретного проекта о сообщениях о фиксации, соглашениях по связям с общественностью, правилах проверки и стандартах кодирования. Поисковому agent, доступному только для чтения, ничего из этого не требуется — он не может фиксировать, не может создавать PR, не может редактировать файлы. Родительский agent имеет полный контекст и интерпретирует результаты поиска. Удаление CLAUDE.md здесь экономит миллиарды токенов в неделю по всему парку — совокупное снижение затрат, которое оправдывает дополнительную сложность внедрения условного контекста.
 
-Similarly, Explore and Plan agents have `gitStatus` stripped from system context. The git status snapshot taken at session start can be up to 40KB and is explicitly labeled as stale. If these agents need git information, they can run `git status` themselves and get fresh data.
+Аналогично, agents Explore и Plan имеют `gitStatus`, удаленный из системного контекста. Снимок State git, сделанный в начале сеанса, может иметь размер до 40 КБ и явно помечается как устаревший. Если этим agents нужна информация git, они могут запустить `git status` самостоятельно и получить свежие данные.
 
-These are not premature optimizations. At 34 million Explore spawns per week, every unnecessary token compounds into measurable cost. The kill-switch (`tengu_slim_subagent_claudemd`) defaults to true but can be flipped via GrowthBook if the stripping causes regressions.
+Это не преждевременная оптимизация. При 34 миллионах спавнов Explore в неделю каждый ненужный жетон приносит измеримую стоимость. По умолчанию переключатель уничтожения (`tengu_slim_subagent_claudemd`) имеет значение true, но его можно переключить через GrowthBook, если удаление вызывает регрессию.
 
-### Step 5: Permission Isolation
+### Шаг 5. Изоляция разрешений
 
-This is the most intricate step. Each agent gets a custom `getAppState()` wrapper that overlays its permission configuration onto the parent's state:
+Это самый сложный шаг. Каждый agent получает специальную оболочку `getAppState()`, которая накладывает конфигурацию разрешений на State parent agent:
 
 ```typescript
 const agentGetAppState = () => {
@@ -294,17 +294,17 @@ const agentGetAppState = () => {
 }
 ```
 
-There are four distinct concerns layered together:
+Существуют четыре отдельные проблемы, сгруппированные вместе:
 
-**Permission mode cascade.** If the parent is in `bypassPermissions`, `acceptEdits`, or `auto` mode, the parent's mode always wins -- the agent definition cannot weaken it. Otherwise, the agent definition's `permissionMode` is applied. This prevents a custom agent from downgrading security when the user has explicitly set a permissive mode for the session.
+**Каскадный permission mode.** Если родительский объект находится в режиме `bypassPermissions`, `acceptEdits` или `auto`, родительский режим всегда побеждает — определение agent не может его ослабить. В противном случае применяется `permissionMode` определения agent. Это не позволяет пользовательскому agent снизить уровень безопасности, если пользователь явно установил разрешительный режим для сеанса.
 
-**Prompt avoidance.** Background agents cannot show permission dialogs -- there is no terminal attached. So `shouldAvoidPermissionPrompts` is set to `true`, which causes the permission system to auto-deny rather than block. The exception is `bubble` mode: these agents surface prompts to the parent's terminal, so they can always show prompts regardless of sync/async status.
+**Отказ от запроса.** Фоновые agents не могут отображать диалоговые окна разрешений — терминал не подключен. Таким образом, для `shouldAvoidPermissionPrompts` установлено значение `true`, что приводит к тому, что Permission System автоматически запрещает, а не блокирует. Исключением является режим `bubble`: эти agents отображают запросы на родительский терминал, поэтому они всегда могут отображать запросы независимо от статуса синхронизации/асинхронности.
 
-**Automated check ordering.** Background agents that *can* show prompts (bubble mode) set `awaitAutomatedChecksBeforeDialog`. This means the classifier and permission hooks run first; the user is only interrupted if automated resolution fails. For background work, waiting an extra second for the classifier is fine -- the user should not be interrupted unnecessarily.
+**Автоматический заказ чеков.** Фоновые agents, которые *могут* отображать prompt (пузырьковый режим), устанавливают `awaitAutomatedChecksBeforeDialog`. Это означает, что сначала запускаются классификатор и hooks разрешений; работа пользователя прерывается только в том случае, если автоматическое разрешение не удается. Для фоновой работы можно подождать еще одну секунду для классификатора — пользователя не следует прерывать без необходимости.
 
-**Tool permission scoping.** When `allowedTools` is provided, it replaces the session-level allow rules entirely. This prevents parent approvals from leaking through to scoped agents. But SDK-level permissions (from `--allowedTools` CLI flag) are preserved -- those represent the embedding application's explicit security policy and should apply everywhere.
+**Область разрешений tool.** Если указан `allowedTools`, он полностью заменяет разрешающие правила на уровне сеанса. Это предотвращает утечку одобрений родителей agents с ограниченной областью действия. Но разрешения уровня SDK (из флага `--allowedTools` CLI) сохраняются — они представляют собой явную политику безопасности внедряемого приложения и должны применяться везде.
 
-### Step 6: Tool Resolution
+### Шаг 6: Разрешение tool
 
 ```typescript
 const resolvedTools = useExactTools
@@ -312,17 +312,17 @@ const resolvedTools = useExactTools
   : resolveAgentTools(agentDefinition, availableTools, isAsync).resolvedTools
 ```
 
-Fork agents use `useExactTools: true`, which passes the parent's tool array through unchanged. This is not just convenience -- it is a cache optimization. Different tool definitions serialize differently (different permission modes produce different tool metadata), and any divergence in the tool block busts the prompt cache. Fork children need byte-identical prefixes.
+Agents форка используют `useExactTools: true`, который передает родительский массив tools без изменений. Это не просто удобство — это оптимизация кэша. Различные определения tools сериализуются по-разному (разные режимы разрешений создают разные метаданные tool), и любое расхождение в блоке tools разрушает Prompt Cache. Дочерним элементам вилок нужны префиксы, идентичные по байтам.
 
-For normal agents, `resolveAgentTools()` applies a layered filter:
-- `tools: ['*']` means all tools; `tools: ['Read', 'Bash']` means only those
-- `disallowedTools: ['Agent', 'FileEdit']` removes those from the pool
-- Built-in agents and custom agents have different base disallowed tool sets
-- Async agents get filtered through `ASYNC_AGENT_ALLOWED_TOOLS`
+Для обычных agents `resolveAgentTools()` применяет многоуровневый фильтр:
+- `tools: ['*']` означает все tools; `tools: ['Read', 'Bash']` означает только те
+- `disallowedTools: ['Agent', 'FileEdit']` удаляет их из пула.
+- Встроенные и пользовательские agents имеют разные базовые запрещенные наборы tools.
+- Асинхронные agents фильтруются через `ASYNC_AGENT_ALLOWED_TOOLS`.
 
-The result is that each agent type sees exactly the tools it should have. The Explore agent cannot call FileEdit. The Verification agent cannot call Agent (no recursive spawning from a verifier). Custom agents have a more restrictive default deny list than built-ins.
+В результате каждый тип agent видит именно те tools, которые ему необходимы. Explore agent не может вызвать FileEdit. Agent проверки не может вызвать agent (нет рекурсивного создания от проверяющего). Пользовательские agents имеют более строгий список запретов по умолчанию, чем встроенные.
 
-### Step 7: System Prompt
+### Шаг 7: Системная prompt
 
 ```typescript
 const agentSystemPrompt = override?.systemPrompt
@@ -335,11 +335,11 @@ const agentSystemPrompt = override?.systemPrompt
     )
 ```
 
-Fork agents receive the parent's pre-rendered system prompt via `override.systemPrompt`. This is threaded from `toolUseContext.renderedSystemPrompt` -- the exact bytes the parent used in its last API call. Recomputing the system prompt via `getSystemPrompt()` could diverge. GrowthBook features might have transitioned from cold to warm between the parent's call and the child's. A single byte difference in the system prompt busts the entire prompt cache prefix.
+Agents форка получают предварительно обработанное System Prompt родительского объекта через `override.systemPrompt`. Это поток из `toolUseContext.renderedSystemPrompt` — точные байты, которые родитель использовал в своем последнем вызове API. Перерасчет System Prompt через `getSystemPrompt()` может отличаться. Функции GrowthBook могли перейти от холодного к теплому между вызовами родителя и ребенка. Разница в один байт в системном prompt разрушает весь префикс кэша приглашений.
 
-For normal agents, `getAgentSystemPrompt()` calls the agent definition's `getSystemPrompt()` function, then enhances with environment details -- absolute paths, emoji guidance (Claude tends to over-use emojis in certain contexts), and model-specific instructions.
+Для обычных agents `getAgentSystemPrompt()` вызывает функцию определения agent `getSystemPrompt()`, а затем дополняется деталями среды — абсолютными путями, указаниями по смайликам (Клод склонен чрезмерно использовать смайлы в определенных контекстах) и инструкциями для конкретной модели.
 
-### Step 8: Abort Controller Isolation
+### Шаг 8. Прерывание изоляции контроллера
 
 ```typescript
 const agentAbortController = override?.abortController
@@ -349,15 +349,15 @@ const agentAbortController = override?.abortController
     : toolUseContext.abortController
 ```
 
-Three lines, three behaviors:
+Три линии, три поведения:
 
-- **Override**: Used when resuming a backgrounded agent or for special lifecycle management. Takes precedence.
-- **Async agents get a new, unlinked controller.** When the user presses Escape, the parent's abort controller fires. Async agents should survive this -- they are background work that the user chose to delegate. Their independent controller means they keep running.
-- **Sync agents share the parent's controller.** Escape kills both. The child is blocking the parent; if the user wants to stop, they want to stop everything.
+- **Переопределить**: используется при возобновлении работы фонового agent или для специального управления жизненным циклом. Имеет приоритет.
+- **Асинхронные agents получают новый, несвязанный контроллер.** Когда пользователь нажимает Escape, срабатывает родительский контроллер прерывания. Асинхронные agents должны пережить это — они представляют собой фоновую работу, которую пользователь решил делегировать. Их независимый контроллер означает, что они продолжают работать.
+- **Agents синхронизации используют родительский контроллер.** Escape убивает обоих. Ребенок блокирует родителя; если пользователь хочет остановиться, он хочет остановить все.
 
-This is one of those decisions that seems obvious in retrospect but would be catastrophic if wrong. An async agent that aborts when the parent aborts would lose all its work every time the user pressed Escape to ask a follow-up question. A sync agent that ignored the parent's abort would leave the user staring at a frozen terminal.
+Это одно из тех решений, которое в ретроспективе кажется очевидным, но если оно окажется неверным, оно будет иметь катастрофические последствия. Асинхронный agent, который прерывает работу при прерывании родительского процесса, будет терять всю свою работу каждый раз, когда пользователь нажимает Escape, чтобы задать дополнительный вопрос. Agent синхронизации, который игнорировал прерывание родительского процесса, заставлял бы пользователя смотреть на зависший терминал.
 
-### Step 9: Hook Registration
+### Шаг 9: Регистрация hook
 
 ```typescript
 if (agentDefinition.hooks && hooksAllowedForThisAgent) {
@@ -368,13 +368,13 @@ if (agentDefinition.hooks && hooksAllowedForThisAgent) {
 }
 ```
 
-Agent definitions can declare their own hooks (PreToolUse, PostToolUse, etc.) in frontmatter. These hooks are scoped to the agent's lifecycle via the `agentId` -- they only fire for this agent's tool calls, and they are automatically cleaned up in the `finally` block when the agent terminates.
+Определения agents могут объявлять свои собственные hooks (PreToolUse, PostToolUse и т. д.) во фронтовой теме. Эти hooks привязаны к жизненному циклу agent через `agentId` — они срабатывают только при вызовах tools этого agent и автоматически очищаются в блоке `finally` при завершении работы agent.
 
-The `isAgent: true` flag (the final `true` parameter) converts `Stop` hooks to `SubagentStop` hooks. Sub-agents trigger `SubagentStop`, not `Stop`, so the conversion ensures the hooks fire at the right event.
+Флаг `isAgent: true` (последний параметр `true`) преобразует hooks `Stop` в hooks `SubagentStop`. Sub-agents запускают `SubagentStop`, а не `Stop`, поэтому преобразование гарантирует срабатывание hooks в нужном событии.
 
-Security matters here. When `strictPluginOnlyCustomization` is active for hooks, only plugin, built-in, and policy-settings agent hooks are registered. User-controlled agents (from `.claude/agents/`) have their hooks silently skipped. This prevents a malicious or misconfigured agent definition from injecting hooks that bypass security controls.
+Здесь важна безопасность. Когда `strictPluginOnlyCustomization` активен для hooks, регистрируются только подключаемые, встроенные и agentic hooks настроек политики. Agents, управляемые пользователем (из `.claude/agents/`), автоматически пропускают свои hooks. Это предотвращает внедрение вредоносным или неправильно настроенным определением agent hooks, обходящих средства контроля безопасности.
 
-### Step 10: Skill Preloading
+### Шаг 10: Предварительная загрузка skills
 
 ```typescript
 const skillsToPreload = agentDefinition.skills ?? []
@@ -384,27 +384,27 @@ if (skillsToPreload.length > 0) {
 }
 ```
 
-Agent definitions can specify `skills: ["my-skill"]` in their frontmatter. The resolution tries three strategies: exact match, prefix with the agent's plugin name (e.g., `"my-skill"` becomes `"plugin:my-skill"`), and suffix match on `":skillName"` for plugin-namespaced skills. The three-strategy resolution ensures that skill references work regardless of whether the agent author used the fully-qualified name, the short name, or the plugin-relative name.
+Определения agents могут указывать `skills: ["my-skill"]` в своем заголовке. При разрешении используются три стратегии: точное совпадение, префикс с именем плагина agent (e.g., `"my-skill"` становится `"plugin:my-skill"`) и совпадение суффикса с `":skillName"` для skills, находящихся в пространстве имен плагина. Разрешение с тремя стратегиями гарантирует, что ссылки на skills работают независимо от того, использовал ли автор agent полное имя, короткое имя или имя, относящееся к плагину.
 
-Loaded skills become user messages prepended to the agent's conversation. This means the agent "reads" its skill instructions before seeing the task prompt -- the same mechanism used for slash commands in the main REPL, repurposed for automated skill injection. The skill content is loaded concurrently via `Promise.all()` to minimize startup latency when multiple skills are specified.
+Загруженные skills становятся пользовательскими сообщениями, добавляемыми к разговору agent. Это означает, что agent «читает» свои инструкции по skills до того, как увидит prompt о задании — тот же механизм, который используется для команд с косой чертой в основном REPL, перепрофилированный для автоматического внедрения skills. Содержимое skills загружается одновременно через `Promise.all()`, чтобы минимизировать задержку при запуске, когда указано несколько skills.
 
-### Step 11: MCP Initialization
+### Шаг 11: MCP Инициализация
 
 ```typescript
 const { clients: mergedMcpClients, tools: agentMcpTools, cleanup: mcpCleanup } =
   await initializeAgentMcpServers(agentDefinition, toolUseContext.options.mcpClients)
 ```
 
-Agents can define their own MCP servers in frontmatter, additive to the parent's clients. Two forms are supported:
+Agents могут определять свои собственные серверы MCP в качестве дополнения к родительским клиентам. Поддерживаются две формы:
 
-- **Reference by name**: `"slack"` looks up an existing MCP config and gets a shared, memoized client
-- **Inline definition**: `{ "my-server": { command: "...", args: [...] } }` creates a new client that is cleaned up when the agent finishes
+- **Ссылка по имени**: `"slack"` ищет существующую конфигурацию MCP и получает общий сохраненный клиент.
+- **Встроенное определение**: `{ "my-server": { command: "...", args: [...] } }` создает нового клиента, который очищается после завершения работы agent.
 
-Only newly created (inline) clients are cleaned up. Shared clients are memoized at the parent level and persist beyond the agent's lifetime. This distinction prevents an agent from accidentally tearing down an MCP connection that other agents or the parent are still using.
+Очищаются только вновь созданные (встроенные) клиенты. Общие клиенты запоминаются на родительском уровне и сохраняются после срока службы agent. Это различие не позволяет agent случайно разорвать соединение MCP, которое все еще используют другие agents или родительский объект.
 
-The MCP initialization happens *after* hook registration and skill preloading but *before* context creation. This ordering matters: the MCP tools must be merged into the tool pool before `createSubagentContext()` snapshots the tools into the agent's options. Reordering these steps would mean the agent either has no MCP tools or has them but they are not in its tool pool.
+Инициализация MCP происходит *после* регистрации hook и предварительной загрузки skills, но *до* создания контекста. Этот порядок имеет значение: tools MCP должны быть объединены в пул tools, прежде чем `createSubagentContext()` сделает снимки tools в опциях agent. Изменение порядка этих шагов будет означать, что у agent либо нет tools MCP, либо они есть, но их нет в его пуле tools.
 
-### Step 12: Context Creation
+### Шаг 12: Создание контекста
 
 ```typescript
 const agentToolUseContext = createSubagentContext(toolUseContext, {
@@ -423,28 +423,28 @@ const agentToolUseContext = createSubagentContext(toolUseContext, {
 })
 ```
 
-`createSubagentContext()` in `utils/forkedAgent.ts` assembles the new `ToolUseContext`. The key isolation decisions:
+`createSubagentContext()` в `utils/forkedAgent.ts` собирает новый `ToolUseContext`. Ключевые решения по изоляции:
 
-- **Sync agents share `setAppState`** with the parent. State changes (like permission approvals) are immediately visible to both. The user sees one coherent state.
-- **Async agents get isolated `setAppState`**. The parent's copy is a no-op for the child's writes. But `setAppStateForTasks` reaches the root store -- the child can still update task state (progress, completion) that the UI observes.
-- **Both share `setResponseLength`** for response metrics tracking.
-- **Fork agents inherit `thinkingConfig`** for cache-identical API requests. Normal agents get `{ type: 'disabled' }` -- thinking (extended reasoning tokens) is disabled to control output costs. The parent pays for thinking; the children execute.
+- **Agents синхронизации используют общий `setAppState`** с родительским объектом. Изменения State (например, одобрение разрешений) сразу видны обоим. Пользователь видит одно связное State.
+- **Асинхронные agents изолируются `setAppState`**. Родительская копия невозможна для записи дочернего элемента. Но `setAppStateForTasks` достигает корневого хранилища — дочерний элемент по-прежнему может обновлять State Task (ход выполнения, завершение), которое наблюдает UI.
+- **Оба имеют общий номер `setResponseLength`** для отслеживания показателей ответа.
+- **Agents форка наследуют `thinkingConfig`** для запросов API, идентичных кешу. Обычные agents получают `{ type: 'disabled' }` — мышление (жетоны расширенного рассуждения) отключено для контроля выходных затрат. Родитель платит за размышления; дети исполняют.
 
-The `createSubagentContext()` function is worth examining for what it *isolates* versus what it *shares*. The isolation boundary is not all-or-nothing -- it is a carefully chosen set of shared and isolated channels:
+Функцию `createSubagentContext()` стоит изучить на предмет того, что она *изолирует* и что она *разделяет*. Граница изоляции не является принципом «все или ничего» — это тщательно выбранный набор общих и изолированных каналов:
 
-| Concern | Sync Agent | Async Agent |
+| Концерн | Agent синхронизации | Асинхронный agent |
 |---------|-----------|-------------|
-| `setAppState` | Shared (parent sees changes) | Isolated (parent's copy is no-op) |
-| `setAppStateForTasks` | Shared | Shared (task state must reach root) |
-| `setResponseLength` | Shared | Shared (metrics need global view) |
-| `readFileState` | Own cache | Own cache |
-| `abortController` | Parent's | Independent |
-| `thinkingConfig` | Fork: inherited / Normal: disabled | Fork: inherited / Normal: disabled |
-| `messages` | Own array | Own array |
+| `setAppState` | Общий (родитель видит изменения) | Изолировано (родительская копия неактивна) |
+| `setAppStateForTasks` | Общий | Общий (State Task должно достигать корня) |
+| `setResponseLength` | Общий | Общий (показатели требуют глобального просмотра) |
+| `readFileState` | Собственный кэш | Собственный кэш |
+| `abortController` | Родительский | Независимый |
+| `thinkingConfig` | Форк: унаследован/Обычный: отключен | Форк: унаследован/Обычный: отключен |
+| `messages` | Собственный массив | Собственный массив |
 
-The asymmetry between `setAppState` (isolated for async) and `setAppStateForTasks` (always shared) is a key design decision. An async agent cannot push state changes to the parent's reactive store -- that would cause the parent's UI to jump unexpectedly. But the agent must still be able to update the global task registry, because that is how the parent knows the background agent has completed. The split channel solves both requirements.
+Асимметрия между `setAppState` (изолированным для асинхронности) и `setAppStateForTasks` (всегда общим) является ключевым проектным решением. Асинхронный agent не может отправлять изменения State в реактивное хранилище родительского объекта — это может привести к неожиданному переходу UI родительского объекта. Но agent все равно должен иметь возможность обновлять глобальный реестр Task, потому что именно так родитель узнает, что фоновый agent завершил работу. Разделенный канал решает оба требования.
 
-### Step 13: Cache-Safe Params Callback
+### Шаг 13: Обратный вызов параметров, безопасных для кэша
 
 ```typescript
 if (onCacheSafeParams) {
@@ -458,9 +458,9 @@ if (onCacheSafeParams) {
 }
 ```
 
-This callback is consumed by background summarization. When an async agent is running, the summarization service can fork the agent's conversation -- using these exact params to construct a cache-identical prefix -- and generate periodic progress summaries without disturbing the main conversation. The params are "cache-safe" because they produce the same API request prefix the agent is using, maximizing cache hits.
+Этот обратный вызов используется для фонового суммирования. Когда асинхронный agent работает, служба суммирования может разветвлять диалог agent, используя именно эти параметры для создания префикса, идентичного кэшу, и генерировать периодические сводки о ходе работы, не нарушая основной диалог. Параметры являются «безопасными для кэша», поскольку они создают тот же префикс запроса API, который использует agent, что максимально увеличивает количество попаданий в кэш.
 
-### Step 14: The Query Loop
+### Шаг 14: Query Loop
 
 ```typescript
 try {
@@ -482,13 +482,13 @@ try {
 }
 ```
 
-The same `query()` function from Chapter 3 drives the sub-agent's conversation. The sub-agent's messages are yielded back to the caller -- either `AgentTool.call()` for sync agents (which iterates the generator inline) or `runAsyncAgentLifecycle()` for async agents (which consumes the generator in a detached async context).
+Разговор sub-agent осуществляется той же функцией `query()` из главы 3. Сообщения sub-agent возвращаются вызывающему абоненту — либо `AgentTool.call()` для agents синхронизации (который выполняет итерацию встроенного генератора), либо `runAsyncAgentLifecycle()` для асинхронных agents (который использует генератор в отдельном асинхронном контексте).
 
-Each yielded message is recorded to a sidechain transcript via `recordSidechainTranscript()` -- an append-only JSONL file per agent. This enables resume: if the session is interrupted, the agent can be reconstructed from its transcript. The recording is `O(1)` per message, appending only the new message with a reference to the previous UUID for chain continuity.
+Каждое полученное сообщение записывается в транскрипт боковой цепи через `recordSidechainTranscript()` — файл JSONL, предназначенный только для добавления, для каждого agent. Это позволяет возобновить сеанс: если сеанс прерван, agent может быть восстановлен по его стенограмме. Запись составляет `O(1)` для каждого сообщения, добавляя только новое сообщение со ссылкой на предыдущий UUID для обеспечения непрерывности цепочки.
 
-### Step 15: Cleanup
+### Шаг 15: Очистка
 
-The `finally` block runs on normal completion, abort, or error. It is the most comprehensive cleanup sequence in the codebase:
+Блок `finally` выполняется при нормальном завершении, прерывании или ошибке. Это наиболее полная последовательность очистки в базе кода:
 
 ```typescript
 finally {
@@ -507,15 +507,15 @@ finally {
 }
 ```
 
-Every subsystem the agent touched during its lifetime gets cleaned up. MCP connections, hooks, cache tracking, file state, perfetto tracing, todo entries, and orphaned shell processes. The comment about "whale sessions" spawning hundreds of agents is telling -- without this cleanup, each agent would leave small leaks that accumulate into measurable memory pressure over long sessions.
+Каждая подсистема, к которой agent прикасался за время своего существования, очищается. MCP соединения, hooks, отслеживание кэша, State файлов, отслеживание perfetto, записи Task и потерянные процессы оболочки. Комментарий о «китовых сеансах», порождающих сотни agents, говорит о многом — без этой очистки каждый agent оставит небольшие утечки, которые накапливаются в измеримую нехватку memory в течение длительных сеансов.
 
-The `initialMessages.length = 0` line is a manual GC hint. For fork agents, `initialMessages` contains the parent's entire conversation history. Setting the length to zero releases those references so the garbage collector can reclaim the memory. In a session with a 200K-token context that spawns five fork children, that is a megabyte of duplicated message objects per child.
+Строка `initialMessages.length = 0` представляет собой prompt GC вручную. Для fork agents `initialMessages` содержит всю историю разговоров родителя. Установка длины в ноль освобождает эти ссылки, и garbage collector может освободить memory. В сеансе с контекстом в 200 000 токенов, который порождает пять дочерних ветвей, это составляет мегабайт дублированных объектов сообщений на каждого дочернего элемента.
 
-There is a lesson here about resource management in long-running agent systems. Each of the cleanup steps addresses a different kind of leak: MCP connections (file descriptors), hooks (memory in the app state store), file state caches (in-memory file content), Perfetto registrations (tracing metadata), todo entries (reactive state keys), and shell processes (OS-level processes). An agent interacts with many subsystems during its lifetime, and each subsystem must be notified when the agent is done. The `finally` block is the single place where all these notifications happen, and the generator protocol guarantees it runs. This is why the generator-based architecture is not just a convenience -- it is a correctness requirement.
+Здесь есть урок об управлении ресурсами в долго работающих agentic systemsах. Каждый из этапов очистки устраняет различные виды утечек: соединения MCP (дескрипторы файлов), hooks (memory в хранилище State приложений), кэши State файлов (содержимое файлов в memory), регистрации Perfetto (отслеживание метаданных), записи Task (ключи реактивного State) и процессы оболочки (процессы уровня ОС). Agent взаимодействует со многими подсистемами в течение своего существования, и каждая подсистема должна быть уведомлена, когда agent закончит работу. Блок `finally` — это единственное место, где происходят все эти уведомления, и протокол генератора гарантирует его запуск. Вот почему архитектура на основе генератора — это не просто удобство, это требование корректности.
 
-### The Generator Chain
+### Цепь генераторов
 
-Before examining the built-in agent types, it is worth stepping back to see the structural pattern that makes all of this work. The entire sub-agent system is built on async generators. The chain flows:
+Прежде чем изучать типы встроенных agents, стоит сделать шаг назад и увидеть структурную модель, благодаря которой все это работает. Вся система sub-agents построена на асинхронных генераторах. Цепь течет:
 
 ```mermaid
 graph TD
@@ -545,77 +545,77 @@ graph TD
     end
 ```
 
-This generator-based architecture enables four critical capabilities:
+Эта архитектура на основе генератора обеспечивает четыре важные возможности:
 
-**Streaming.** Messages flow through the system incrementally. The parent (or the async lifecycle wrapper) can observe each message as it is produced -- updating progress indicators, forwarding metrics, recording transcripts -- without buffering the entire conversation.
+**Потоковая передача.** Сообщения проходят через систему постепенно. Родитель (или асинхронная оболочка жизненного цикла) может наблюдать за каждым сообщением по мере его создания — обновлять индикаторы выполнения, пересылать метрики, записывать расшифровки — без буферизации всего разговора.
 
-**Cancellation.** Returning the async iterator triggers the `finally` block in `runAgent()`. The fifteen-step cleanup runs regardless of whether the agent completed normally, was aborted by the user, or threw an error. JavaScript's async generator protocol guarantees this.
+**Отмена.** Возврат асинхронного итератора запускает блок `finally` в `runAgent()`. Пятнадцатиэтапная очистка выполняется независимо от того, завершился ли agent нормально, был ли прерван пользователем или выдал ошибку. Протокол асинхронного генератора JavaScript гарантирует это.
 
-**Backgrounding.** A sync agent that is taking too long can be backgrounded mid-execution. The iterator is handed off from the foreground (where `AgentTool.call()` is iterating it) to an async context (where `runAsyncAgentLifecycle()` takes over). The agent does not restart -- it continues from where it was.
+**Фоновый режим.** Agent синхронизации, работающий слишком долго, может быть переведен в фоновый режим в середине выполнения. Итератор передается с переднего плана (где его выполняет `AgentTool.call()`) в асинхронный контекст (где `runAsyncAgentLifecycle()` берет на себя управление). Agent не перезапускается — он продолжает работу с того места, где был.
 
-**Progress tracking.** Each yielded message is an observation point. The async lifecycle wrapper uses these observation points to update the task state machine, compute progress percentages, and generate notifications when the agent completes.
+**Отслеживание прогресса.** Каждое полученное сообщение является точкой наблюдения. Оболочка асинхронного жизненного цикла использует эти точки наблюдения для обновления конечного автомата Task, вычисления процентов выполнения и создания уведомлений после завершения работы agent.
 
 ---
 
-## Built-In Agent Types
+## Типы встроенных agents
 
-Built-in agents are registered via `getBuiltInAgents()` in `builtInAgents.ts`. The registry is dynamic -- which agents are available depends on feature flags, GrowthBook experiments, and the session's entrypoint type. Six built-in agents ship with the system, each optimized for a specific class of work.
+Встроенные agents регистрируются через `getBuiltInAgents()` в `builtInAgents.ts`. Реестр является динамическим: доступные agents зависят от флагов функций, экспериментов GrowthBook и типа точки входа сеанса. В комплект поставки системы входят шесть встроенных agents, каждый из которых оптимизирован для определенного класса работ.
 
-### General-Purpose
+### общего назначения
 
-The default agent when `subagent_type` is omitted and fork is not active. Full tool access, no CLAUDE.md omission, model determined by `getDefaultSubagentModel()`. Its system prompt positions it as a completion-oriented worker: "Complete the task fully -- don't gold-plate, but don't leave it half-done." It includes guidelines for search strategy (broad first, then narrow) and file creation discipline (never create files unless the task requires it).
+Agent по умолчанию, если `subagent_type` опущен и разветвление не активно. Полный доступ к tool, отсутствие пропусков CLAUDE.md, модель определяется `getDefaultSubagentModel()`. Его системные prompt позиционируют его как работника, ориентированного на завершение: «Завершите Task полностью — не преувеличивайте, но и не оставляйте ее наполовину выполненной». Он включает рекомендации по стратегии поиска (сначала широкий, затем узкий) и дисциплине создания файлов (никогда не создавайте файлы, если этого не требует Task).
 
-This is the workhorse. When the model does not know what kind of agent it needs, it gets a general-purpose agent that can do everything the parent can do, minus spawning its own sub-agents. The "minus spawning" restriction is important: without it, a general-purpose child could spawn its own children, which could spawn theirs, creating an exponential fan-out that burns through API budget in seconds. The `Agent` tool is in the default disallowed list for good reason.
+Это рабочая лошадка. Когда модель не знает, какой тип agent ей нужен, она получает agent общего назначения, который может делать все, что может родительский объект, за исключением создания собственных sub-agents. Ограничение «минус порождение» важно: без него дочерний элемент общего назначения может порождать своих собственных дочерних элементов, которые могут порождать своих, создавая экспоненциальное разветвление, которое сжигает бюджет API за секунды. Tool `Agent` не зря находится в списке запрещенных по умолчанию.
 
-### Explore
+### Исследовать
 
-A read-only search specialist. Uses Haiku (the cheapest, fastest model). Omits CLAUDE.md and git status. Has `FileEdit`, `FileWrite`, `NotebookEdit`, and `Agent` removed from its tool pool, enforced at both the tooling level and via a `=== CRITICAL: READ-ONLY MODE ===` section in its system prompt.
+Специалист по поиску только для чтения. Использует Haiku (самая дешевая и быстрая модель). Пропускает статусы CLAUDE.md и git. Удалены `FileEdit`, `FileWrite`, `NotebookEdit` и `Agent` из пула tools, что принудительно применяется как на уровне tools, так и через раздел `=== CRITICAL: READ-ONLY MODE ===` в системной prompt.
 
-The Explore agent is the most aggressively optimized built-in because it is the most frequently spawned -- 34 million times per week across the fleet. It is marked as a one-shot agent (`ONE_SHOT_BUILTIN_AGENT_TYPES`), which means the agentId, SendMessage instructions, and usage trailer are skipped from its prompt, saving approximately 135 characters per invocation. At 34 million invocations, those 135 characters add up to roughly 4.6 billion characters per week of saved prompt tokens.
+Explore agent является наиболее оптимизированным встроенным модулем, поскольку он запускается наиболее часто — 34 миллиона раз в неделю во всем парке. Он помечен как одноразовый agent (`ONE_SHOT_BUILTIN_AGENT_TYPES`), что означает, что идентификатор agent, инструкции SendMessage и трейлер использования пропускаются из его prompt, что позволяет сэкономить примерно 135 символов на каждый вызов. При 34 миллионах вызовов эти 135 символов составляют примерно 4,6 миллиарда символов в неделю сохраненных токенов prompts.
 
-Availability is gated by the `BUILTIN_EXPLORE_PLAN_AGENTS` feature flag AND the `tengu_amber_stoat` GrowthBook experiment, which A/B tests the impact of removing these specialized agents.
+Доступность зависит от функционального флага `BUILTIN_EXPLORE_PLAN_AGENTS` И эксперимента `tengu_amber_stoat` GrowthBook, в ходе которого A/B проверяется влияние удаления этих специализированных agents.
 
-### Plan
+### План
 
-A software architect agent. Same read-only tool set as Explore but uses `'inherit'` for its model (same capability as the parent). Its system prompt guides it through a structured four-step process: Understand Requirements, Explore Thoroughly, Design Solution, Detail the Plan. It must end with a "Critical Files for Implementation" list.
+Agent-архитектор программного обеспечения. Тот же набор tools только для чтения, что и Explore, но для своей модели используется `'inherit'` (те же возможности, что и у родительского элемента). Его System Prompt проводит его через структурированный четырехэтапный процесс: понять требования, тщательно изучить, разработать решение, детализировать план. Он должен заканчиваться списком «Критических файлов для реализации».
 
-The Plan agent inherits the parent's model because architecture requires the same reasoning capability as implementation. You do not want a Haiku-class model making design decisions that an Opus-class model will have to execute. The model mismatch would produce plans that the executing agent cannot follow -- or worse, plans that sound plausible but are subtly wrong in ways that only a more capable model would catch.
+Agent Plan наследует родительскую модель, поскольку архитектура требует тех же возможностей рассуждения, что и реализация. Вы не хотите, чтобы модель класса Haiku принимала проектные решения, которые должна будет выполнять модель класса Opus. Несоответствие моделей приведет к появлению планов, которым исполнительный agent не сможет следовать, или, что еще хуже, к планам, которые кажутся правдоподобными, но слегка неправильными, и это может уловить только более способная модель.
 
-Same availability gate as Explore (`BUILTIN_EXPLORE_PLAN_AGENTS` + `tengu_amber_stoat`).
+Тот же шлюз доступности, что и у Explore (`BUILTIN_EXPLORE_PLAN_AGENTS` + `tengu_amber_stoat`).
 
-### Verification
+### Проверка
 
-The adversarial tester. Read-only tools, `'inherit'` model, always runs in background (`background: true`), displayed in red in the terminal. Its system prompt is the most elaborate of any built-in agent at approximately 130 lines.
+Противоборствующий тестер. Tools только для чтения, модель `'inherit'`, всегда работают в фоновом режиме (`background: true`), отображаются в терминале красным цветом. Его System Prompt является самой сложной из всех встроенных agents и содержит примерно 130 строк.
 
-What makes the Verification agent interesting is its anti-avoidance programming. The prompt explicitly lists excuses the model might reach for and instructs it to "recognize them and do the opposite." Every check must include a "Command run" block with actual terminal output -- no hand-waving, no "this should work." The agent must include at least one adversarial probe (concurrency, boundary, idempotency, orphan cleanup). And before reporting a failure, it must check whether the behavior is intentional or handled elsewhere.
+Что делает agent проверки интересным, так это его программа предотвращения уклонения от уплаты налогов. В prompt явно перечисляются оправдания, к которым может прибегнуть модель, и предписывается «распознать их и сделать противоположное». Каждая проверка должна включать блок «Командный запуск» с реальными выводами терминала — никаких размахиваний руками, никаких «это должно работать». Agent должен включать хотя бы одну состязательную проверку (параллелизм, граница, идемпотентность, очистка потерянных объектов). И прежде чем сообщить о сбое, он должен проверить, является ли такое поведение преднамеренным или обрабатывается где-то еще.
 
-The `criticalSystemReminder_EXPERIMENTAL` field injects a reminder after every tool result, reinforcing that this is verification-only. This is a guardrail against the model drifting from "verify" to "fix" -- a tendency that would undermine the entire purpose of an independent verification pass. Language models have a strong inclination to be helpful, and "helpful" in most contexts means "fix the problem." The Verification agent's entire value proposition depends on resisting that inclination.
+Поле `criticalSystemReminder_EXPERIMENTAL` вводит напоминание после каждого результата tool, подтверждая, что это только проверка. Это препятствие на пути перехода модели от «проверки» к «исправлению» — тенденция, которая подорвет всю цель независимой проверки. Языковые модели имеют сильную склонность быть полезными, а «полезность» в большинстве контекстов означает «решить проблему». Вся ценность agent по проверке зависит от сопротивления этой склонности.
 
-The `background: true` flag means the Verification agent always runs asynchronously. The parent does not wait for verification results -- it continues working while the verifier probes in the background. When the verifier finishes, a notification appears with the results. This mirrors how human code review works: the developer does not stop coding while the reviewer reads their PR.
+Флаг `background: true` означает, что agent проверки всегда работает асинхронно. Родительский объект не ждет результатов проверки — он продолжает работать, пока проверяющий выполняет проверку в фоновом режиме. По завершении верификатора появится уведомление с результатами. Это отражает то, как работает проверка кода человеком: разработчик не прекращает писать код, пока рецензент читает его PR.
 
-Availability is gated by the `VERIFICATION_AGENT` feature flag AND the `tengu_hive_evidence` GrowthBook experiment.
+Доступность зависит от функционального флага `VERIFICATION_AGENT` И эксперимента `tengu_hive_evidence` GrowthBook.
 
-### Claude Code Guide
+### Claude Code Руководство
 
-A documentation-fetching agent for questions about Claude Code itself, the Claude Agent SDK, and the Claude API. Uses Haiku, runs with `dontAsk` permission mode (no user prompts needed -- it only reads documentation), and has two hardcoded documentation URLs.
+Agent по сбору документации для вопросов о самом Claude Code, agent Клода SDK и Клоде API. Использует Haiku, работает с режимом разрешений `dontAsk` (prompt пользователя не требуются — он только читает документацию) и имеет два жестко запрограммированных URL-адреса документации.
 
-Its `getSystemPrompt()` is unique because it receives the `toolUseContext` and dynamically includes context about the project's custom skills, custom agents, configured MCP servers, plugin commands, and user settings. This lets it answer "how do I configure X?" by knowing what is already configured.
+Его `getSystemPrompt()` уникален, поскольку он получает `toolUseContext` и динамически включает контекст о пользовательских skills проекта, пользовательских agents, настроенных серверах MCP, командах плагинов и настройках пользователя. Это позволяет ему ответить: «Как мне настроить X?» зная, что уже настроено.
 
-Excluded when the entrypoint is SDK (TypeScript, Python, or CLI), since SDK users are not asking Claude Code how to use Claude Code. They are building their own tools on top of it.
+Исключается, когда точка входа — SDK (TypeScript, Python или CLI), поскольку пользователи SDK не запрашивают Claude Code, как использовать Claude Code. На основе этого они создают свои собственные tools.
 
-The Guide agent is an interesting case study in agent design because it is the only built-in agent whose system prompt is dynamic in a way that depends on the user's project. It needs to know what is configured to answer "how do I configure X?" effectively. This makes its `getSystemPrompt()` function more complex than the others, but the trade-off is worth it -- a documentation agent that does not know what the user has already set up gives worse answers than one that does.
+Guide agent представляет собой интересный пример разработки agents, поскольку это единственный встроенный agent, System Prompt которого является динамическим и зависит от проекта пользователя. Ему необходимо знать, что настроено, чтобы ответить на вопрос: «Как мне настроить X?» эффективно. Это делает его функцию `getSystemPrompt()` более сложной, чем другие, но компромисс того стоит — agent документации, который не знает, что уже настроил пользователь, дает худшие ответы, чем тот, который знает.
 
-### Statusline Setup
+### Настройка status line
 
-A specialized agent for configuring the terminal status line. Uses Sonnet, displayed in orange, limited to `Read` and `Edit` tools only. Knows how to convert shell PS1 escape sequences to shell commands, write to `~/.claude/settings.json`, and handle the `statusLine` command's JSON input format.
+Специализированный agent для настройки status line терминала. Использует Sonnet, отображается оранжевым цветом, ограничено только tools `Read` и `Edit`. Умеет преобразовывать escape-последовательности оболочки PS1 в команды оболочки, писать в `~/.claude/settings.json` и обрабатывать входной формат JSON команды `statusLine`.
 
-This is the most narrowly-scoped built-in agent -- it exists because status line configuration is a self-contained domain with specific formatting rules that would clutter a general-purpose agent's context. Always available, no feature gate.
+Это встроенный agent с наиболее узкой областью действия — он существует потому, что конфигурация status line представляет собой автономный домен со специальными правилами форматирования, которые могут загромождать контекст agent общего назначения. Всегда доступен, без ворот.
 
-The Statusline Setup agent illustrates an important principle: **sometimes a specialized agent is better than a general-purpose agent with more context.** A general-purpose agent given the status line documentation as context would probably configure it correctly. But it would also be more expensive (bigger model), slower (more context to process), and more likely to get confused by the interaction between status line syntax and the task at hand. A dedicated Sonnet agent with Read and Edit tools and a focused system prompt does the job faster, cheaper, and more reliably.
+Agent установки status line иллюстрирует важный принцип: **иногда специализированный agent лучше, чем agent общего назначения с большим количеством контекста.** Agent общего назначения, учитывая документацию status line в качестве контекста, вероятно, настроит его правильно. Но это также будет дороже (большая модель), медленнее (больше контекста для обработки) и с большей вероятностью запутается из-за взаимодействия между синтаксисом status line и текущей Task. Специальный agent Sonnet с tools чтения и редактирования и специализированной системной prompt выполняет работу быстрее, дешевле и надежнее.
 
-### The Worker Agent (Coordinator Mode)
+### Worker agent (Coordinator Mode)
 
-Not in the `built-in/` directory but loaded dynamically when coordinator mode is active:
+Не в каталоге `built-in/`, а загружается динамически, когда активен Coordinator Mode:
 
 ```typescript
 if (isEnvTruthy(process.env.CLAUDE_CODE_COORDINATOR_MODE)) {
@@ -624,19 +624,19 @@ if (isEnvTruthy(process.env.CLAUDE_CODE_COORDINATOR_MODE)) {
 }
 ```
 
-The worker agent replaces all standard built-in agents in coordinator mode. It has a single type `"worker"` and full tool access. This simplification is deliberate -- when a coordinator is orchestrating workers, the coordinator decides what each worker does. The worker does not need the specialization of Explore or Plan; it needs the flexibility to do whatever the coordinator assigns.
+Worker agent заменяет все стандартные встроенные agents в Coordinator Mode. Он имеет один тип `"worker"` и полный доступ к tools. Это упрощение сделано намеренно: когда координатор управляет работниками, он решает, что будет делать каждый работник. Работнику не нужна специализация «Исследование» или «Планирование»; ему нужна гибкость, чтобы делать все, что поручит координатор.
 
 ---
 
-## Fork Agents
+## Agents форка
 
-Fork agents -- where the child inherits the parent's full conversation history, system prompt, and tool array for prompt cache exploitation -- are the subject of Chapter 9. The fork path triggers when the model omits `subagent_type` from the Agent tool call and the fork experiment is active. Every design decision in the fork system traces back to a single goal: byte-identical API request prefixes across parallel children, enabling 90% cache discounts on shared context.
+Fork Agents, где дочерний элемент наследует полную историю разговоров родителя, System Prompt и массив tools для использования Prompt Cache, являются предметом главы 9. Путь ветвления срабатывает, когда модель опускает `subagent_type` в вызове tool agent и эксперимент с вилкой активен. Каждое проектное решение в системе разветвлений связано с единственной целью: байт-идентичными префиксами запросов API для параллельных дочерних элементов, что обеспечивает 90% скидку на кэш в общем контексте.
 
 ---
 
-## Agent Definitions from Frontmatter
+## Определения agents из Frontmatter
 
-Users and plugins can define custom agents by placing markdown files in `.claude/agents/`. The frontmatter schema supports the full range of agent configuration:
+Пользователи и плагины могут определять собственные agents, помещая Markdown files в `.claude/agents/`. Схема frontmatter поддерживает полный спектр настроек agent:
 
 ```yaml
 ---
@@ -672,82 +672,82 @@ effort: high
 You are a specialized agent for...
 ```
 
-The markdown body becomes the agent's system prompt. The frontmatter fields map directly to the `AgentDefinition` interface that `runAgent()` consumes. The loading pipeline in `loadAgentsDir.ts` validates the frontmatter against `AgentJsonSchema`, resolves the source (user, plugin, or policy), and registers the agent in the available agents list.
+Текст Markdown становится System Prompt agent. Поля заголовка сопоставляются непосредственно с интерфейсом `AgentDefinition`, который использует `runAgent()`. Конвейер загрузки в `loadAgentsDir.ts` проверяет frontmatter на соответствие `AgentJsonSchema`, определяет источник (пользователя, плагин или политику) и регистрирует agent в списке доступных agents.
 
-Four sources of agent definitions exist, in priority order:
+Существуют четыре источника определений agents в порядке приоритета:
 
-1. **Built-in agents** -- hardcoded in TypeScript, always available (subject to feature gates)
-2. **User agents** -- markdown files in `.claude/agents/`
-3. **Plugin agents** -- loaded via `loadPluginAgents()`
-4. **Policy agents** -- loaded via organizational policy settings
+1. **Встроенные agents** — жестко запрограммированы в TypeScript, доступны всегда (с учетом ограничений функций).
+2. **Пользовательские agents** — Markdown files в формате `.claude/agents/`.
+3. **Agents плагинов** – загружаются через `loadPluginAgents()`.
+4. **Agents политики** — загружаются через настройки политики организации.
 
-When the model calls `Agent` with a `subagent_type`, the system resolves the name against this combined list, filtering by permission rules (deny rules for `Agent(AgentName)`) and by `allowedAgentTypes` from the tool spec. If the requested agent type is not found or is denied, the tool call fails with an error.
+Когда модель вызывает `Agent` с помощью `subagent_type`, система разрешает имя по этому объединенному списку, фильтруя по правилам разрешений (правила запрета для `Agent(AgentName)`) и по `allowedAgentTypes` из спецификации tool. Если запрошенный тип agent не найден или ему отказано, tool call завершается с ошибкой.
 
-This design means that organizations can ship custom agents via plugins (a code review agent, a security audit agent, a deployment agent) and have them appear seamlessly alongside the built-in agents. The model sees them in the same list, with the same interface, and delegates to them the same way.
+Такая конструкция означает, что организации могут поставлять собственные agents через плагины (agent проверки кода, agent аудита безопасности, agent развертывания) и легко отображать их рядом со встроенными agentsи. Модель видит их в одном списке, с одним и тем же интерфейсом и делегирует им одинаковые полномочия.
 
-The power of frontmatter-defined agents is that they require zero TypeScript. A team lead who wants a "PR review" agent writes a markdown file with the right frontmatter, drops it in `.claude/agents/`, and it appears in every team member's agent list on their next session. The system prompt is the markdown body. The tool restrictions, model preference, and permission mode are declared in YAML. The `runAgent()` lifecycle handles everything else -- the same fifteen steps, the same cleanup, the same isolation guarantees.
+Преимущество agents, определяемых frontmatter, заключается в том, что они не требуют TypeScript. Руководитель группы, которому нужен agent по «PR-просмотру», пишет файл Markdown с правильным заголовком, помещает его в `.claude/agents/`, и он появляется в списке agents каждого члена команды на их следующем сеансе. Системное prompt — это тело Markdown. Ограничения tool, предпочтения модели и permission mode объявлены в YAML. Жизненный цикл `runAgent()` обрабатывает все остальное — те же пятнадцать шагов, та же очистка, те же гарантии изоляции.
 
-This also means that agent definitions are version-controlled alongside the codebase. A repository can ship agents tailored to its architecture, conventions, and tooling. The agents evolve with the code. When the team adopts a new testing framework, the verification agent's prompt is updated in the same commit that adds the framework dependency.
+Это также означает, что определения agents контролируются версиями наряду с базой кода. Репозиторий может поставлять agents, адаптированные к его архитектуре, соглашениям и tools. Agents развиваются вместе с кодом. Когда команда принимает новую платформу тестирования, prompt agent проверки обновляется в том же коммите, который добавляет зависимость платформы.
 
-There is one important security consideration: the trust boundary. User agents (from `.claude/agents/`) are user-controlled -- their hooks, MCP servers, and tool configurations are subject to `strictPluginOnlyCustomization` restrictions when those policies are active. Plugin agents and policy agents are admin-trusted and bypass these restrictions. Built-in agents are part of the Claude Code binary itself. The system tracks the `source` of each agent definition precisely so that security policies can distinguish between "the user wrote this" and "the organization approved this."
+Существует одно важное соображение безопасности: граница доверия. Пользовательские agents (из `.claude/agents/`) контролируются пользователем — их hooks, серверы MCP и конфигурации tools подпадают под ограничения `strictPluginOnlyCustomization`, когда эти политики активны. Agents подключаемых модулей и agents политик доверяет администратор, и они обходят эти ограничения. Встроенные agents являются частью двоичного файла Claude Code. Система точно отслеживает `source` каждого определения agent, чтобы политики безопасности могли различать «это написал пользователь» и «организация одобрила это».
 
-The `source` field is not just metadata -- it gates real behavior. When a plugin-only policy is active for MCP, user agent frontmatter that declares MCP servers is silently skipped (the MCP connections are not established). When a plugin-only policy is active for hooks, user agent frontmatter hooks are not registered. The agent still runs -- it just runs without the untrusted extensions. This is a principle of graceful degradation: the agent is useful even when its full capabilities are restricted by policy.
+Поле `source` — это не просто метаданные, оно определяет реальное поведение. Когда для MCP активна политика только для плагинов, frontmatter пользовательского agent, объявляющий серверы MCP, автоматически пропускается (соединения MCP не устанавливаются). Когда для hooks активна политика «только для плагинов», hook переднего плана пользовательского agent не регистрируются. Agent по-прежнему работает — он просто работает без ненадежных расширений. Это принцип постепенной деградации: agent полезен, даже если его полные возможности ограничены политикой.
 
 ---
 
-## Apply This: Designing Agent Types
+## Примените это: проектирование типов agents
 
-The built-in agents demonstrate a pattern language for agent design. If you are building a system that spawns sub-agents -- whether using Claude Code's AgentTool directly or designing your own multi-agent architecture -- the design space breaks down into five dimensions.
+Встроенные agents демонстрируют язык шаблонов для проектирования agents. Если вы создаете систему, которая порождает sub-agents, независимо от того, используете ли вы Claude Code AgentTool напрямую или разрабатываете собственную multi-agent архитектуру, пространство проектирования разбивается на пять измерений.
 
-### Dimension 1: What Can It See?
+### Измерение 1: Что оно может видеть?
 
-The combination of `omitClaudeMd`, git status stripping, and skill preloading controls the agent's awareness. Read-only agents see less (they do not need project conventions). Specialized agents see more (preloaded skills inject domain knowledge).
+Комбинация удаления статуса `omitClaudeMd`, git и предварительной загрузки skills контролирует осведомленность оператора. Agents только для чтения видят меньше (им не нужны соглашения проекта). Специализированные agents видят больше (предварительно загруженные skills добавляют знания предметной области).
 
-The key insight is that context is not free. Every token in the system prompt, user context, or conversation history costs money and displaces working memory. Claude Code strips CLAUDE.md from Explore agents not because those instructions are harmful, but because they are irrelevant -- and irrelevance at 34 million spawns per week becomes a line item on the infrastructure bill. When designing your own agent types, ask: "What does this agent need to know to do its job?" and strip everything else.
+Ключевой вывод заключается в том, что контекст не является свободным. Каждый токен в системном prompt, пользовательском контексте или истории разговоров стоит денег и заменяет рабочую memory. Claude Code удаляет CLAUDE.md из agents Explore не потому, что эти инструкции вредны, а потому, что они неуместны - и неуместность при 34 миллионах спавн в неделю становится статьей в счете за инфраструктуру. При разработке собственных типов agents задайте вопрос: «Что этому agent нужно знать, чтобы выполнять свою работу?» и снять все остальное.
 
-### Dimension 2: What Can It Do?
+### Измерение 2: Что оно может сделать?
 
-The `tools` and `disallowedTools` fields set hard boundaries. The Verification agent cannot edit files. The Explore agent cannot write anything. The General-Purpose agent can do everything except spawn sub-agents of its own.
+Поля `tools` и `disallowedTools` устанавливают жесткие границы. Agent проверки не может редактировать файлы. Explore agent не может ничего писать. Agent общего назначения может делать все, кроме создания собственных sub-agents.
 
-Tool restrictions serve two purposes: **safety** (the Verification agent cannot accidentally "fix" what it finds, preserving its independence) and **focus** (an agent with fewer tools spends less time deciding which tool to use). The pattern of combining tool-level restrictions with system prompt guidance (Explore's `=== CRITICAL: READ-ONLY MODE ===`) is defense in depth -- the tools enforce the boundary mechanically, and the prompt explains *why* the boundary exists so the model does not waste turns trying to work around it.
+Ограничения tools служат двум целям: **безопасность** (agent проверки не может случайно «исправить» то, что он находит, сохраняя при этом свою независимость) и **фокусировка** (agent с меньшим количеством tools тратит меньше времени на принятие решения, какой tool использовать). Схема сочетания ограничений на уровне tools с системными prompts (`=== CRITICAL: READ-ONLY MODE ===` компании Explore) представляет собой глубокоэшелонированную защиту: tools механически обеспечивают соблюдение границы, а prompt объясняет, *почему* граница существует, чтобы модель не тратила ходы, пытаясь обойти ее.
 
-### Dimension 3: How Does It Interact with the User?
+### Параметр 3: Как он взаимодействует с пользователем?
 
-The `permissionMode` and `canShowPermissionPrompts` settings determine whether the agent asks for permission, auto-denies, or bubbles prompts to the parent's terminal. Background agents that cannot interrupt the user must either work within pre-approved boundaries or bubble.
+Параметры `permissionMode` и `canShowPermissionPrompts` определяют, запрашивает ли agent разрешение, автоматически отклоняет или выводит всплывающие prompt на родительский терминал. Фоновые agents, которые не могут прервать работу пользователя, должны либо работать в заранее утвержденных границах, либо всплывать.
 
-The `awaitAutomatedChecksBeforeDialog` setting is a nuance worth understanding. Background agents that *can* show prompts (bubble mode) wait for the classifier and permission hooks to run before interrupting the user. This means the user is only interrupted for genuinely ambiguous permissions -- not for things the automated system could have resolved. In a multi-agent system where five background agents are running simultaneously, this is the difference between a usable interface and a permission-prompt barrage.
+Настройка `awaitAutomatedChecksBeforeDialog` — нюанс, который стоит понять. Фоновые agents, которые *могут* отображать prompt (пузырьковый режим), ждут запуска классификатора и hooks разрешений, прежде чем прерывать работу пользователя. Это означает, что работу пользователя прерывают только в случае действительно неоднозначных разрешений, а не в случае проблем, которые могла бы разрешить автоматизированная система. В multi-agent system, где одновременно работают пять фоновых agents, в этом заключается разница между удобным интерфейсом и заграждением с запросом разрешения.
 
-### Dimension 4: How Does It Relate to the Parent?
+### Измерение 4: Как оно связано с родителем?
 
-Sync agents block the parent and share its state. Async agents run independently with their own abort controller. Fork agents inherit the full conversation context. The choice shapes both the user experience (does the parent wait?) and the system behavior (does Escape kill the child?).
+Agents синхронизации блокируют родительский элемент и делятся его State. Асинхронные agents работают независимо со своим собственным контроллером прерывания. Agents форка наследуют полный контекст разговора. Выбор влияет как на пользовательский опыт (ждет ли родитель?), так и на поведение системы (убивает ли Escape дочерний элемент?).
 
-The abort controller decision in Step 8 crystallizes this: sync agents share the parent's controller (Escape kills both), async agents get their own (Escape leaves them running). Fork agents go further -- they inherit the parent's system prompt, tool array, and message history to maximize prompt cache sharing. Each relationship type has a clear use case: sync for sequential delegation ("do this then I'll continue"), async for parallel work ("do this while I do something else"), and fork for context-heavy delegation ("you know everything I know, now go handle this part").
+Решение контроллера прерывания на шаге 8 кристаллизует это: agents синхронизации совместно используют родительский контроллер (Escape убивает оба), асинхронные agents получают свои собственные (Escape оставляет их работающими). Agents форка идут еще дальше — они наследуют System Prompt родителя, массив tools и историю сообщений, чтобы максимизировать совместное использование кэша приглашений. Каждый тип отношений имеет четкий вариант использования: синхронизация для последовательного делегирования («сделай это, а я продолжу»), асинхронность для параллельной работы («делай это, пока я делаю что-то другое») и разветвление для контекстно-зависимого делегирования («ты знаешь все, что знаю я, теперь займись этой частью»).
 
-### Dimension 5: How Expensive Is It?
+### Параметр 5: Насколько это дорого?
 
-The model choice, thinking config, and context size all contribute to cost. Haiku for cheap read-only work. Sonnet for moderate tasks. Inherit-from-parent for tasks requiring the parent's reasoning capability. Thinking is disabled for non-fork agents to control output token costs -- the parent pays for reasoning; the children execute.
+Выбор модели, конфигурация мышления и размер контекста — все это влияет на стоимость. Haiku для дешевой работы только для чтения. Sonnet для умеренных Task. Наследование от родителя для Task, требующих способности родителя рассуждать. Для agents, не являющихся форками, мышление отключено, чтобы контролировать стоимость выходных токенов — за рассуждения платит родительский элемент; дети исполняют.
 
-The economic dimension is often an afterthought in multi-agent system design, but it is central to Claude Code's architecture. An Explore agent that used Opus instead of Haiku would work fine for any individual invocation. But at 34 million invocations per week, the model choice is a multiplicative cost factor. The one-shot optimization that saves 135 characters per Explore invocation translates to 4.6 billion characters per week of saved prompt tokens. These are not micro-optimizations -- they are the difference between a viable product and an unaffordable one.
+Экономический аспект часто отходит на второй план при проектировании multi-agent system, но он занимает центральное место в архитектуре Claude Code. Explore agent, использующий Opus вместо Haiku, отлично подойдет для любого отдельного вызова. Но при 34 миллионах вызовов в неделю выбор модели становится мультипликативным фактором затрат. Одноразовая оптимизация, которая экономит 135 символов на каждый вызов Explore, преобразуется в 4,6 миллиарда символов в неделю сохраненных токенов prompt. Это не микрооптимизация — это разница между жизнеспособным продуктом и недоступным.
 
-### The Unified Lifecycle
+### Единый жизненный цикл
 
-The `runAgent()` lifecycle implements all five dimensions through its fifteen steps, assembling a unique execution environment for each agent type from the same set of building blocks. The result is a system where spawning a sub-agent is not "run another copy of the parent." It is the creation of a precisely-scoped, resource-controlled, isolated execution context -- tailored to the work at hand, and cleaned up completely when the work is done.
+Жизненный цикл `runAgent()` реализует все пять измерений посредством пятнадцати шагов, собирая уникальную среду выполнения для каждого типа agent из одного и того же набора строительных блоков. Результатом является система, в которой создание sub-agent не означает «запуск другой копии parent agent». Это создание изолированного контекста выполнения с точной областью действия, контролируемого ресурсами, адаптированного к текущей работе и полностью очищаемого по завершении работы.
 
-The architectural elegance is in the uniformity. Whether the agent is a Haiku-powered read-only searcher or an Opus-powered fork child with full tool access and bubble permissions, it flows through the same fifteen steps. The steps do not branch based on agent type -- they parameterize. Model resolution picks the right model. Context preparation picks the right file state. Permission isolation picks the right mode. The agent type is not encoded in control flow; it is encoded in configuration. And that is what makes the system extensible: adding a new agent type means writing a definition, not modifying the lifecycle.
+Архитектурная элегантность – в единообразии. Независимо от того, является ли agent поисковиком на базе Haiku, доступным только для чтения, или дочерним форком на базе Opus с полным доступом к tools и пузырьковыми разрешениями, он проходит одни и те же пятнадцать шагов. Шаги не разветвляются в зависимости от типа agent — они параметризуются. Разрешение модели выбирает правильную модель. Подготовка контекста выбирает правильное State файла. Изоляция разрешений выбирает правильный режим. Тип agent не кодируется в потоке управления; это закодировано в конфигурации. Именно это делает систему расширяемой: добавление нового типа agent означает написание определения, а не изменение жизненного цикла.
 
-### The Design Space Summarized
+### Краткое описание пространства дизайна
 
-The six built-in agents cover a spectrum:
+Шесть встроенных agents охватывают широкий спектр:
 
-| Agent | Model | Tools | Context | Sync/Async | Purpose |
+| Agent | Модель | Tools | Контекст | Синхронизация/Асинхронность | Цель |
 |-------|-------|-------|---------|------------|---------|
-| General-Purpose | Default | All | Full | Either | Workhorse delegation |
-| Explore | Haiku | Read-only | Stripped | Sync | Fast, cheap search |
-| Plan | Inherit | Read-only | Stripped | Sync | Architecture design |
-| Verification | Inherit | Read-only | Full | Always async | Adversarial testing |
-| Guide | Haiku | Read + Web | Dynamic | Sync | Documentation lookup |
-| Statusline | Sonnet | Read + Edit | Minimal | Sync | Config task |
+| Общего назначения | По умолчанию | Все | Полный | Либо | Рабочая делегация |
+| Исследуйте | Хайку | Только для чтения | Раздетый | Синхронизировать | Быстрый и дешевый поиск |
+| План | Наследовать | Только для чтения | Раздетый | Синхронизировать | Архитектурный дизайн |
+| Проверка | Наследовать | Только для чтения | Полный | Всегда асинхронно | Состязательное тестирование |
+| Путеводитель | Хайку | Чтение + Интернет | Динамический | Синхронизировать | Поиск документации |
+| Статуслайн | Sonnet | Читать + редактировать | Минимальный | Синхронизировать | Task настройки |
 
-No two agents make the same choices across all five dimensions. Each is optimized for its specific use case. And the `runAgent()` lifecycle handles all of them through the same fifteen steps, parameterized by the agent definition. This is the power of the architecture: the lifecycle is a universal machine, and the agent definitions are the programs that run on it.
+Никакие два agent не делают одинаковый выбор во всех пяти измерениях. Каждый из них оптимизирован для своего конкретного случая использования. И жизненный цикл `runAgent()` обрабатывает все из них посредством одних и тех же пятнадцати шагов, параметризованных определением agent. В этом сила архитектуры: жизненный цикл — это универсальная машина, а определения agents — это программы, которые на ней выполняются.
 
-The next chapter examines fork agents in depth -- the prompt cache exploitation mechanism that makes parallel delegation economically viable. Chapter 10 then follows with the orchestration layer: how async agents report progress through the task state machine, how the parent retrieves results, and how the coordinator pattern orchestrates dozens of agents working toward a single goal. If this chapter was about *creating* agents, Chapter 9 is about making them cheap, and Chapter 10 is about *managing* them.
+В следующей главе подробно рассматриваются agents ветвления — механизм оперативного использования кэша, который делает параллельное делегирование экономически выгодным. Далее следует глава 10, посвященная уровню оркестрации: как асинхронные agents сообщают о ходе работы через конечный автомат Task, как родительский объект получает результаты и как шаблон координатора оркестрирует десятки agents, работающих над достижением единой цели. Если эта глава посвящена *созданию* agents, то глава 9 — о том, как сделать их дешевыми, а глава 10 — об *управлении* ими.

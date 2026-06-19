@@ -1,40 +1,40 @@
-# Chapter 6: Tools -- From Definition to Execution
+# Глава 6: Tools – от определения до исполнения
 
-## The Nervous System
+## Нервная система
 
-Chapter 5 showed you the agent loop -- the `while(true)` that streams model responses, collects tool calls, and feeds results back. The loop is the heartbeat. But the heartbeat is meaningless without the nervous system that translates "the model wants to run `git status`" into an actual shell command, with permission checks, result budgeting, and error handling.
+В главе 5 был показан agent loop — `while(true)`, который передает потоковые ответы модели, собирает tool calls и возвращает результаты. Петля — это сердцебиение. Но этот пульс не имеет смысла без нервной системы, которая преобразует фразу «модель хочет запустить `git status`» в реальную команду оболочки с проверкой разрешений, бюджетированием результатов и обработкой ошибок.
 
-The tool system is that nervous system. It spans 40+ tool implementations, a centralized registry with feature-flag gating, a 14-step execution pipeline, a permission resolver with seven modes, and a streaming executor that starts tools before the model finishes its response.
+Tool System — это нервная система. Он включает в себя более 40 реализаций tools, централизованный реестр со шлюзованием по флагам функций, 14-шаговый конвейер выполнения, преобразователь разрешений с семью режимами и потоковый исполнитель, который запускает tools до того, как модель завершит свой ответ.
 
-Every tool call in Claude Code -- every file read, every shell command, every grep, every sub-agent dispatch -- flows through the same pipeline. The uniformity is the point: whether the tool is a built-in Bash executor or a third-party MCP server, it gets the same validation, the same permission checks, the same result budgeting, the same error classification.
+Каждый tool call в Claude Code — каждое чтение файла, каждая команда оболочки, каждая команда grep, каждая отправка sub-agent — проходит через один и тот же конвейер. Суть в единообразии: независимо от того, является ли tool встроенным исполнителем Bash или сторонним сервером MCP, он получает одинаковую проверку, одинаковые проверки разрешений, одинаковое бюджетирование результатов, одну и ту же классификацию ошибок.
 
-The `Tool` interface has approximately 45 members. That sounds overwhelming, but only five matter for understanding how the system works:
+Интерфейс `Tool` содержит около 45 участников. Это звучит ошеломляюще, но для понимания того, как работает система, важны только пять:
 
-1. **`call()`** -- execute the tool
-2. **`inputSchema`** -- validate and parse the input
-3. **`isConcurrencySafe()`** -- can this run in parallel?
-4. **`checkPermissions()`** -- is this allowed?
-5. **`validateInput()`** -- does this input make semantic sense?
+1. **`call()`** — запустить tool
+2. **`inputSchema`** — проверка и анализ введенных данных.
+3. **`isConcurrencySafe()`** — может ли это работать параллельно?
+4. **`checkPermissions()`** -- это разрешено?
+5. **`validateInput()`** – имеет ли этот ввод семантический смысл?
 
-Everything else -- the 12 rendering methods, the analytics hooks, the search hints -- exists to support the UI and telemetry layers. Start with the five, and the rest falls into place.
+Все остальное — 12 методов рендеринга, средства аналитики, prompt поиска — существует для поддержки уровней UI и телеметрии. Начните с пятерки, а остальное встанет на свои места.
 
 ---
 
-## The Tool Interface
+## Tool interface
 
-### Three Type Parameters
+### Три параметра типа
 
-Every tool is parameterized over three types:
+Каждый tool параметризуется тремя типами:
 
 ```typescript
 Tool<Input extends AnyObject, Output, P extends ToolProgressData>
 ```
 
-`Input` is a Zod object schema that serves double duty: it generates the JSON Schema sent to the API (so the model knows what parameters to provide), and it validates the model's response at runtime via `safeParse`. `Output` is the TypeScript type of the tool's result. `P` is the progress event type the tool emits while running -- BashTool emits stdout chunks, GrepTool emits match counts, AgentTool emits sub-agent transcripts.
+`Input` — это объектная схема Zod, выполняющая двойную функцию: она генерирует JSON Schema, отправляемый в API (чтобы модель знала, какие параметры предоставить), и проверяет ответ модели во время выполнения через `safeParse`. `Output` — это тип TypeScript результата tool. `P` — это тип события прогресса, который tool генерирует во время работы: BashTool выдает фрагменты stdout, GrepTool выдает количество совпадений, AgentTool выдает расшифровки sub-agent.
 
-### buildTool() and Fail-Closed Defaults
+### buildTool() и значения по умолчанию для аварийного закрытия
 
-No tool definition directly constructs a `Tool` object. Every tool passes through `buildTool()`, a factory that spreads a defaults object under the tool-specific definition:
+Никакое определение tool не создает объект `Tool` напрямую. Каждый tool проходит через `buildTool()`, фабрику, которая распространяет объект по умолчанию в соответствии с определением, специфичным для tool:
 
 ```typescript
 // Pseudocode — illustrates the fail-closed defaults pattern
@@ -51,17 +51,17 @@ function buildTool(definition) {
 }
 ```
 
-The defaults are deliberately fail-closed where it matters for safety. A new tool that forgets to implement `isConcurrencySafe` defaults to `false` -- it runs serially, never in parallel. A tool that forgets `isReadOnly` defaults to `false` -- the system treats it as a write operation. A tool that forgets `toAutoClassifierInput` returns an empty string -- the auto-mode security classifier skips it, which means the general permission system handles it instead of an automated bypass.
+По умолчанию они намеренно закрываются при отказе там, где это важно для безопасности. Новый tool, который забывает реализовать `isConcurrencySafe`, по умолчанию использует `false` — он работает последовательно, а не параллельно. Tool, который забывает `isReadOnly`, по умолчанию использует `false` — система рассматривает это как операцию записи. Tool, который забывает `toAutoClassifierInput`, возвращает пустую строку — классификатор безопасности автоматического режима пропускает ее, что означает, что ее обрабатывает система общих разрешений вместо автоматического обхода.
 
-The one default that is *not* fail-closed is `checkPermissions`, which returns `allow`. This seems backwards until you understand the layered permission model: `checkPermissions` is tool-specific logic that runs *after* the general permission system has already evaluated rules, hooks, and mode-based policies. A tool returning `allow` from `checkPermissions` is saying "I have no tool-specific objection" -- it is not granting blanket access. The grouping into sub-objects (`options`, named fields like `readFileState`) provides the structure that focused interfaces would provide, without the ceremony of declaring, implementing, and threading five separate interface types through 40+ call sites.
+Единственным значением по умолчанию, которое *не* закрыто при отказе, является `checkPermissions`, который возвращает `allow`. Это кажется обратным, пока вы не поймете многоуровневую permission model: `checkPermissions` — это логика, специфичная для tool, которая запускается *после того, как* общая Permission System уже оценила правила, hooks и политики на основе режима. Tool, возвращающий `allow` из `checkPermissions`, говорит: «У меня нет возражений по поводу конкретного tool» — он не предоставляет полный доступ. Группировка в подобъекты (`options`, именованные поля типа `readFileState`) обеспечивает структуру, которую могут обеспечить специализированные интерфейсы, без церемоний объявления, реализации и streaming пяти отдельных типов интерфейсов через более чем 40 сайтов вызовов.
 
-### Concurrency Is Input-Dependent
+### Параллелизм зависит от ввода
 
-The signature `isConcurrencySafe(input: z.infer<Input>): boolean` takes the parsed input because the same tool can be safe for some inputs and unsafe for others. BashTool is the canonical example: `ls -la` is read-only and concurrency-safe, but `rm -rf /tmp/build` is not. The tool parses the command, classifies each subcommand against known-safe sets, and returns `true` only when every non-neutral part is a search or read operation.
+Подпись `isConcurrencySafe(input: z.infer<Input>): boolean` принимает анализируемые входные данные, поскольку один и тот же tool может быть безопасным для одних входных данных и небезопасным для других. BashTool — канонический пример: `ls -la` доступен только для чтения и безопасен для одновременного выполнения, а `rm -rf /tmp/build` — нет. Tool анализирует команду, классифицирует каждую подкоманду по известным безопасным наборам и возвращает `true` только в том случае, если каждая ненейтральная часть является операцией поиска или чтения.
 
-### The ToolResult Return Type
+### Тип возвращаемого значения ToolResult
 
-Every `call()` returns a `ToolResult<T>`:
+Каждый `call()` возвращает `ToolResult<T>`:
 
 ```typescript
 type ToolResult<T> = {
@@ -71,33 +71,33 @@ type ToolResult<T> = {
 }
 ```
 
-`data` is the typed output that gets serialized into the API's `tool_result` content block. `newMessages` lets a tool inject additional messages into the conversation -- AgentTool uses this to append sub-agent transcripts. `contextModifier` is a function that mutates the `ToolUseContext` for subsequent tools -- this is how `EnterPlanMode` switches the permission mode. Context modifiers are only honored for non-concurrency-safe tools; if your tool runs in parallel, its modifier is queued until the batch completes.
+`data` — это типизированный вывод, который сериализуется в блок содержимого `tool_result` API. `newMessages` позволяет tool вставлять в разговор дополнительные сообщения — AgentTool использует это для добавления расшифровок sub-agent. `contextModifier` — это функция, которая изменяет `ToolUseContext` для последующих tools — именно так `EnterPlanMode` переключает permission mode. Модификаторы контекста учитываются только для tools, не защищенных от параллелизма; если ваш tool работает параллельно, его модификатор ставится в очередь до тех пор, пока batch не завершится.
 
 ---
 
-## ToolUseContext: The God Object
+## ToolUseContext: Объект Бога
 
-`ToolUseContext` is the massive context bag threaded through every tool call. It has approximately 40 fields. It is, by any reasonable definition, a god object. It exists because the alternative is worse.
+`ToolUseContext` — это массивный контекстный batch, проходящий через каждый tool call. Он имеет около 40 полей. По любому разумному определению это объект бога. Оно существует, потому что альтернатива хуже.
 
-A tool like BashTool needs the abort controller, the file state cache, the app state, the message history, the tool set, MCP connections, and half a dozen UI callbacks. Threading these as individual parameters would produce function signatures with 15+ arguments. The pragmatic solution is a single context object, grouped by concern:
+Для такого tool, как BashTool, необходим контроллер прерывания, кэш State файла, AppState, история сообщений, набор tools, соединения MCP и полдюжины callbacks UI. Обработка их как отдельных параметров приведет к созданию сигнатур функций с более чем 15 аргументами. Прагматическое решение — это единый контекстный объект, сгруппированный по интересам:
 
-**Configuration** (`options` sub-object): The tool set, model name, MCP connections, debug flags. Set once at query start, mostly immutable.
+**Конфигурация** (подобъект `options`): набор tools, название модели, соединения MCP, флаги отладки. Устанавливается один раз в начале запроса, в основном неизменяемый.
 
-**Execution state**: The `abortController` for cancellation, `readFileState` for the LRU file cache, `messages` for the full conversation history. These change during execution.
+**State выполнения**: `abortController` для отмены, `readFileState` для кэша файлов LRU, `messages` для полной истории разговоров. Они меняются во время выполнения.
 
-**UI callbacks**: `setToolJSX`, `addNotification`, `requestPrompt`. Only wired in interactive (REPL) contexts. SDK and headless modes leave them undefined.
+**Обратные вызовы UI**: `setToolJSX`, `addNotification`, `requestPrompt`. Подключается только в интерактивном (REPL) контексте. SDK и безголовые режимы оставляют их неопределенными.
 
-**Agent context**: `agentId`, `renderedSystemPrompt` (frozen parent prompt for fork sub-agents -- re-rendering could diverge due to feature flag warm-up and bust the cache).
+**Контекст agent**: `agentId`, `renderedSystemPrompt` (замороженное родительское prompt для ответвленных sub-agents – повторный рендеринг может отклониться из-за прогрева флага функции и привести к повреждению кеша).
 
-The sub-agent variant of `ToolUseContext` is particularly revealing. When `createSubagentContext()` builds a context for a child agent, it makes deliberate choices about which fields to share and which to isolate: `setAppState` becomes a no-op for async agents, `localDenialTracking` gets a fresh object, `contentReplacementState` is cloned from the parent. Each choice encodes a lesson learned from a production bug.
+Особенно показателен вариант sub-agent `ToolUseContext`. Когда `createSubagentContext()` создает контекст для дочернего agent, он сознательно выбирает, какие поля использовать совместно, а какие изолировать: `setAppState` становится неактивным для асинхронных agents, `localDenialTracking` получает новый объект, `contentReplacementState` клонируется из parent agent. Каждый выбор отражает урок, извлеченный из производственной ошибки.
 
 ---
 
-## The Registry
+## Реестр
 
-### getAllBaseTools(): The Single Source of Truth
+### getAllBaseTools(): Единственный источник истины
 
-The function `getAllBaseTools()` returns the exhaustive list of every tool that could exist in the current process. Always-present tools come first, then conditionally-included tools gated by feature flags:
+Функция `getAllBaseTools()` возвращает исчерпывающий список всех tools, которые могут существовать в текущем процессе. Сначала идут всегда присутствующие tools, затем условно включенные tools, ограниченные флагами функций:
 
 ```typescript
 const SleepTool = feature('PROACTIVE') || feature('KAIROS')
@@ -105,24 +105,24 @@ const SleepTool = feature('PROACTIVE') || feature('KAIROS')
   : null
 ```
 
-The `feature()` import from `bun:bundle` is resolved at bundle time. When `feature('AGENT_TRIGGERS')` is statically false, the bundler eliminates the entire `require()` call -- dead code elimination that keeps the binary small.
+Импорт `feature()` из `bun:bundle` разрешается во время сборки. Когда `feature('AGENT_TRIGGERS')` является статически ложным, bundler удаляет весь вызов `require()` — устранение мертвого кода, что позволяет сохранить небольшой размер двоичного файла.
 
-### assembleToolPool(): Merging Built-in and MCP Tools
+### assembleToolPool(): объединение встроенных и MCP tools
 
-The final tool set that reaches the model comes from `assembleToolPool()`:
+Последний набор tools, дошедший до модели, получен от `assembleToolPool()`:
 
-1. Get built-in tools (with deny-rule filtering, REPL mode hiding, and `isEnabled()` checks)
-2. Filter MCP tools by deny rules
-3. Sort each partition alphabetically by name
-4. Concatenate built-ins (prefix) + MCP tools (suffix)
+1. Получите встроенные tools (с фильтрацией запретных правил, скрытием режима REPL и проверками `isEnabled()`).
+2. Фильтрация tools MCP по правилам запрета.
+3. Отсортируйте каждый раздел в алфавитном порядке по имени.
+4. Объединить встроенные модули (префикс) + tools MCP (суффикс)
 
-The sort-then-concatenate approach is not aesthetic preference. The API server places a prompt-cache breakpoint after the last built-in tool. A flat sort across all tools would interleave MCP tools into the built-in list, and adding or removing an MCP tool would shift built-in tool positions, invalidating the cache.
+Подход «сортировка-затем-объединение» не является эстетическим предпочтением. Сервер API размещает точку останова Prompt Cache после последнего встроенного tool. Плоская сортировка по всем tools приведет к чередованию tools MCP во встроенном списке, а добавление или удаление tool MCP приведет к смещению позиций встроенных tools, что приведет к аннулированию кэша.
 
 ---
 
-## The 14-Step Execution Pipeline
+## 14-шаговый конвейер выполнения
 
-The function `checkPermissionsAndCallTool()` is where intent becomes action. Every tool call passes through these 14 steps.
+Функция `checkPermissionsAndCallTool()` — это то, где намерение становится действием. Каждый tool call проходит через эти 14 шагов.
 
 ```mermaid
 graph TD
@@ -155,154 +155,154 @@ graph TD
     style STOP fill:#f66
 ```
 
-### Steps 1-4: Validation
+### Шаги 1–4: Проверка
 
-**Tool Lookup** falls back to `getAllBaseTools()` for alias matches, handling transcripts from older sessions where a tool was renamed. **Abort Check** prevents wasted computation on tool calls queued before Ctrl+C propagated. **Zod Validation** catches type mismatches; for deferred tools, the error appends a hint to call ToolSearch first. **Semantic Validation** goes beyond schema conformance -- FileEditTool rejects no-op edits, BashTool blocks standalone `sleep` when MonitorTool is available.
+**Поиск tool** возвращается к `getAllBaseTools()` для совпадений псевдонимов, обрабатывая расшифровки старых сеансов, в которых tool был переименован. **Проверка прерывания** предотвращает ненужные вычисления при вызовах tools, поставленных в очередь до распространения Ctrl+C. **Проверка Zod** выявляет несоответствия типов; для отложенных tools к ошибке добавляется prompt о необходимости сначала вызвать ToolSearch. **Семантическая проверка** выходит за рамки соответствия схемы: FileEditTool отклоняет неактивные изменения, BashTool блокирует автономный `sleep`, когда доступен MonitorTool.
 
-### Steps 5-6: Preparation
+### Шаги 5–6: Подготовка
 
-**Speculative Classifier Start** kicks off the auto-mode security classifier in parallel for Bash commands, shaving hundreds of milliseconds off the common path. **Input Backfill** clones the parsed input and adds derived fields (expanding `~/foo.txt` to absolute paths) for hooks and permissions, preserving the original for transcript stability.
+**Спекулятивный запуск классификатора** параллельно запускает классификатор безопасности в автоматическом режиме для команд Bash, сокращая сотни миллисекунд общего пути. **Заполнение входных данных** клонирует проанализированные входные данные и добавляет производные поля (расширяя `~/foo.txt` до абсолютных путей) для hooks и разрешений, сохраняя оригинал для стабильности расшифровки.
 
-### Steps 7-9: Permission
+### Шаги 7–9: Разрешение
 
-**PreToolUse Hooks** are the extension mechanism -- they can make permission decisions, modify inputs, inject context, or stop execution entirely. **Permission Resolution** bridges hooks and the general permission system: if a hook already decided, that is final; otherwise `canUseTool()` triggers rule matching, tool-specific checks, mode-based defaults, and interactive prompts. **Permission Denied Handling** builds an error message and executes `PermissionDenied` hooks.
+**PreToolUse Hooks** — это механизм расширения. Они могут принимать решения о разрешении, изменять входные данные, внедрять контекст или полностью останавливать выполнение. **Разрешение разрешений** объединяет hooks и общую систему разрешений: если hook уже принял решение, это окончательное решение; в противном случае `canUseTool()` запускает сопоставление правил, проверки конкретного tool, настройки по умолчанию на основе режима и интерактивные prompt. **Обработка отказа в разрешении** создает сообщение об ошибке и выполняет hooks `PermissionDenied`.
 
-### Steps 10-14: Execution and Cleanup
+### Шаги 10–14: Выполнение и очистка
 
-**Tool Execution** runs the actual `call()` with the original input. **Result Budgeting** persists oversized output to `~/.claude/tool-results/{hash}.txt` and replaces it with a preview. **PostToolUse Hooks** can modify MCP output or block continuation. **New Messages** are appended (sub-agent transcripts, system reminders). **Error Handling** classifies errors for telemetry, extracts safe strings from potentially mangled names, and emits OTel events.
+**Выполнение tool** запускает фактический `call()` с исходным вводом. **Бюджетирование результатов** сохраняет увеличенный размер вывода в `~/.claude/tool-results/{hash}.txt` и заменяет его предварительным просмотром. **Hooks PostToolUse** могут изменять вывод MCP или блокировать продолжение. **Прикрепляются новые сообщения** (расшифровки sub-agents, системные напоминания). **Обработка ошибок** классифицирует ошибки телеметрии, извлекает безопасные строки из потенциально искаженных имен и генерирует события OTel.
 
 ---
 
-## The Permission System
+## Permission System
 
-### Seven Modes
+### Семь режимов
 
-| Mode | Behavior |
+| Режим | Поведение |
 |------|----------|
-| `default` | Tool-specific checks; prompt user for unrecognized operations |
-| `acceptEdits` | Auto-allow file edits; prompt for other operations |
-| `plan` | Read-only -- deny all write operations |
-| `dontAsk` | Auto-deny anything that would normally prompt (background agents) |
-| `bypassPermissions` | Allow everything without prompting |
-| `auto` | Use the transcript classifier to decide (feature-flagged) |
-| `bubble` | Internal mode for sub-agents that escalate to the parent |
+| `default` | Проверки конкретного tool; запрашивать у пользователя нераспознанные операции |
+| `acceptEdits` | Автоматическое разрешение редактирования файлов; prompt для других операций |
+| `plan` | Только чтение — запретить все операции записи |
+| `dontAsk` | Автоматически отклонять все, что обычно вызывает запрос (фоновые agents) |
+| `bypassPermissions` | Разрешить все без запроса |
+| `auto` | Используйте классификатор стенограмм для принятия решения (отмечено функцией) |
+| `bubble` | Внутренний режим для sub-agents, которые переходят к родительскому |
 
-### The Resolution Chain
+### Цепочка разрешения
 
-When a tool call reaches permission resolution:
+Когда tool call достигает разрешения разрешения:
 
-1. **Hook decision**: If a PreToolUse hook already returned `allow` or `deny`, that is final.
-2. **Rule matching**: Three rule sets -- `alwaysAllowRules`, `alwaysDenyRules`, `alwaysAskRules` -- match on tool name and optional content patterns. `Bash(git *)` matches any Bash command starting with `git`.
-3. **Tool-specific check**: The tool's `checkPermissions()` method. Most return `passthrough`.
-4. **Mode-based default**: `bypassPermissions` allows everything. `plan` denies writes. `dontAsk` denies prompts.
-5. **Interactive prompt**: In `default` and `acceptEdits` modes, unresolved decisions show a prompt.
-6. **Auto-mode classifier**: A two-stage classifier (fast model, then extended thinking for ambiguous cases).
+1. **Решение о hook**: если hook PreToolUse уже вернул `allow` или `deny`, это окончательное решение.
+2. **Сопоставление правил**: три набора правил — `alwaysAllowRules`, `alwaysDenyRules`, `alwaysAskRules` — совпадают по названию tool и дополнительным шаблонам контента. `Bash(git *)` соответствует любой команде Bash, начинающейся с `git`.
+3. **Проверка конкретного tool**: метод tool `checkPermissions()`. Большая часть возврата `passthrough`.
+4. **По умолчанию в зависимости от режима**: `bypassPermissions` разрешает все. `plan` запрещает запись. `dontAsk` отклоняет запросы.
+5. **Интерактивная prompt**. В режимах `default` и `acceptEdits` нерешенные решения отображаются prompts.
+6. **Классификатор в автоматическом режиме**: двухэтапный классификатор (быстрая модель, затем расширенное мышление для неоднозначных случаев).
 
-The `safetyCheck` variant has a `classifierApprovable` boolean: `.claude/` and `.git/` edits are `classifierApprovable: true` (unusual but sometimes legitimate), while Windows path bypass attempts are `classifierApprovable: false` (almost always adversarial).
+Вариант `safetyCheck` имеет логическое значение `classifierApprovable`: изменения `.claude/` и `.git/` — это `classifierApprovable: true` (необычно, но иногда законно), а попытки обхода пути Windows — `classifierApprovable: false` (почти всегда состязательные).
 
-### Permission Rules and Matching
+### Правила разрешений и сопоставление
 
-Permission rules are stored as `PermissionRule` objects with three parts: a `source` tracing provenance (userSettings, projectSettings, localSettings, cliArg, policySettings, session, etc.), a `ruleBehavior` (allow, deny, ask), and a `ruleValue` with the tool name and optional content pattern.
+Правила разрешений хранятся как объекты `PermissionRule`, состоящие из трех частей: объект `source`, отслеживающий происхождение (userSettings, projectSettings, localSettings, cliArg, policySettings, сеанс и т. д.), `ruleBehavior` (разрешить, запретить, спросить) и `ruleValue` с именем tool и необязательным шаблоном содержимого.
 
-The `ruleContent` field enables fine-grained matching. `Bash(git *)` allows any Bash command starting with `git`. `Edit(/src/**)` allows edits only within `/src`. `Fetch(domain:example.com)` allows fetching from a specific domain. Rules without `ruleContent` match all invocations of that tool.
+Поле `ruleContent` обеспечивает детальное сопоставление. `Bash(git *)` позволяет использовать любую команду Bash, начинающуюся с `git`. `Edit(/src/**)` позволяет редактировать только внутри `/src`. `Fetch(domain:example.com)` позволяет получать данные из определенного домена. Правила без `ruleContent` соответствуют всем вызовам этого tool.
 
-BashTool's permission matcher parses the command via `parseForSecurity()` (a bash AST parser) and splits compound commands into subcommands. If AST parsing fails (complex syntax with heredocs or nested subshells), the matcher returns `() => true` -- fail-safe, meaning the hook always runs. The assumption is that if the command is too complex to parse, it is too complex to confidently exclude from safety checks.
+Сопоставитель разрешений BashTool анализирует команду с помощью `parseForSecurity()` (парсер bash AST) и разбивает составные команды на подкоманды. Если синтаксический анализ AST завершается неудачно (сложный синтаксис с heredocs или вложенными подоболочками), средство сопоставления возвращает `() => true` — отказоустойчивый вариант, то есть hook выполняется всегда. Предполагается, что если команда слишком сложна для анализа, она слишком сложна, чтобы ее можно было уверенно исключить из проверок безопасности.
 
-### Bubble Mode for Sub-Agents
+### Bubble Mode для sub-agents
 
-Sub-agents in coordinator-worker patterns cannot show permission prompts -- they have no terminal. The `bubble` mode causes permission requests to propagate up to the parent context. The coordinator agent, running in the main thread with terminal access, handles the prompt and sends the decision back down.
-
----
-
-## Tool Deferred Loading
-
-Tools with `shouldDefer: true` are sent to the API with `defer_loading: true` -- names and descriptions but not full parameter schemas. This reduces initial prompt size. To use a deferred tool, the model must first call `ToolSearchTool` to load its schema. The failure mode is instructive: calling a deferred tool without loading it causes Zod validation to fail (all typed parameters arrive as strings), and the system appends a targeted recovery hint.
-
-Deferred loading also improves cache hit rates: tools sent with `defer_loading: true` contribute only their name to the prompt, so adding or removing a deferred MCP tool changes the prompt by a few tokens rather than hundreds.
+Sub-agents в шаблонах координатор-работник не могут отображать запросы разрешений — у них нет терминала. Режим `bubble` приводит к тому, что запросы разрешений распространяются до родительского контекста. Agent-координатор, работающий в основном потоке с терминальным доступом, обрабатывает prompt и отправляет решение обратно.
 
 ---
 
-## Result Budgeting
+## Отложенная загрузка tool
 
-### Per-Tool Size Limits
+Tools с `shouldDefer: true` отправляются на API с `defer_loading: true` — имена и описания, но не полные схемы параметров. Это уменьшает первоначальный размер prompt. Чтобы использовать отложенный tool, модель должна сначала вызвать `ToolSearchTool`, чтобы загрузить свою схему. Режим сбоя поучителен: вызов отложенного tool без его загрузки приводит к сбою проверки Zod (все типизированные параметры поступают в виде строк), и система добавляет целевую prompt по восстановлению.
 
-Each tool declares `maxResultSizeChars`:
+Отложенная загрузка также повышает частоту попаданий в кеш: tools, отправленные с `defer_loading: true`, добавляют в prompt только свое имя, поэтому добавление или удаление отложенного tool MCP изменяет prompt на несколько токенов, а не на сотни.
 
-| Tool | maxResultSizeChars | Rationale |
+---
+
+## Бюджетирование результатов
+
+### Ограничения на размер каждого tool
+
+Каждый tool декларирует `maxResultSizeChars`:
+
+| Tool | maxResultSizeChars | Обоснование |
 |------|-------------------|-----------|
-| BashTool | 30,000 | Enough for most useful output |
-| FileEditTool | 100,000 | Diffs can be large but the model needs them |
-| GrepTool | 100,000 | Search results with context lines add up fast |
-| FileReadTool | Infinity | Self-bounds via its own token limits; persisting would create circular Read loops |
+| BashTool | 30 000 | Достаточно для наиболее полезного вывода |
+| FileEditTool | 100 000 | Различия могут быть большими, но они нужны модели |
+| GrepTool | 100 000 | Результаты поиска с контекстными строками быстро суммируются |
+| FileReadTool | Бесконечность | Самостоятельно ограничивается собственными лимитами токенов; сохранение создаст циклические циклы чтения |
 
-When a result exceeds the threshold, the full content is saved to disk and replaced with a `<persisted-output>` wrapper containing a preview and file path. The model can then use `Read` to access the full output if needed.
+Когда результат превышает пороговое значение, все содержимое сохраняется на диск и заменяется оболочкой `<persisted-output>`, содержащей предварительный просмотр и путь к файлу. Затем модель может использовать `Read` для доступа к полному выводу, если это необходимо.
 
-### Per-Conversation Aggregate Budget
+### Совокупный бюджет на разговор
 
-Beyond per-tool limits, `ContentReplacementState` tracks an aggregate budget across the entire conversation, preventing death by a thousand cuts -- many tools each returning 90% of their individual limit can still overwhelm the context window.
-
----
-
-## Individual Tool Highlights
-
-### BashTool: The Most Complex Tool
-
-BashTool is the system's most complex tool by far. It parses compound commands, classifies subcommands as read-only or write, manages background tasks, detects image output by magic bytes, and implements a sed simulation for safe edit previews.
-
-The compound command parsing is particularly interesting. `splitCommandWithOperators()` breaks a command like `cd /tmp && mkdir build && ls build` into individual subcommands. Each is classified against known-safe command sets (`BASH_SEARCH_COMMANDS`, `BASH_READ_COMMANDS`, `BASH_LIST_COMMANDS`). A compound command is read-only only if ALL non-neutral parts are safe. The neutral set (echo, printf) is ignored -- they do not make a command read-only, but they also do not make it write-only.
-
-The sed simulation (`_simulatedSedEdit`) deserves special attention. When a user approves a sed command in the permission dialog, the system pre-computes the result by running the sed command in a sandbox and capturing the output. The pre-computed result is injected into the input as `_simulatedSedEdit`. When `call()` executes, it applies the edit directly, bypassing shell execution. This guarantees that what the user previewed is exactly what gets written -- not a re-execution that might produce different results if the file changed between preview and execution.
-
-### FileEditTool: Staleness Detection
-
-FileEditTool integrates with `readFileState`, the LRU cache of file contents and timestamps maintained across the conversation. Before applying an edit, it checks whether the file has been modified since the model last read it. If the file is stale -- modified by a background process, another tool, or the user -- the edit is rejected with a message telling the model to re-read the file first.
-
-The fuzzy matching in `findActualString()` handles the common case where the model gets whitespace slightly wrong. It normalizes whitespace and quote styles before matching, so an edit targeting `old_string` with trailing spaces still matches the file's actual content. The `replace_all` flag enables bulk replacements; without it, non-unique matches are rejected, requiring the model to provide enough context to identify a single location.
-
-### FileReadTool: The Versatile Reader
-
-FileReadTool is the only built-in tool with `maxResultSizeChars: Infinity`. If Read output were persisted to disk, the model would need to Read the persisted file, which could itself exceed the limit, creating an infinite loop. The tool instead self-bounds via token estimation and truncates at the source.
-
-The tool is remarkably versatile: it reads text files with line numbers, images (returning base64 multimodal content blocks), PDFs (via `extractPDFPages()`), Jupyter notebooks (via `readNotebook()`), and directories (falling back to `ls`). It blocks dangerous device paths (`/dev/zero`, `/dev/random`, `/dev/stdin`) and handles macOS screenshot filename quirks (U+202F narrow no-break space vs regular space in "Screen Shot" filenames).
-
-### GrepTool: Pagination via head_limit
-
-GrepTool wraps `ripGrep()` and adds a pagination mechanism via `head_limit`. The default is 250 entries -- enough for useful results but small enough to avoid context bloat. When truncation occurs, the response includes `appliedLimit: 250`, signaling the model to use `offset` on the next call to paginate. An explicit `head_limit: 0` disables the limit entirely.
-
-GrepTool automatically excludes six VCS directories (`.git`, `.svn`, `.hg`, `.bzr`, `.jj`, `.sl`). Searching inside `.git/objects` is almost never what the model wants, and accidental inclusion of binary pack files would blow through token budgets.
-
-### AgentTool and Context Modifiers
-
-AgentTool spawns sub-agents that run their own query loops. Its `call()` returns `newMessages` containing the sub-agent's transcript, and optionally a `contextModifier` that propagates state changes back to the parent. Because AgentTool is not concurrency-safe by default, multiple Agent tool calls in a single response run serially -- each sub-agent's context modifier is applied before the next sub-agent starts. In coordinator mode, the pattern inverts: the coordinator dispatches sub-agents for independent tasks, and the `isAgentSwarmsEnabled()` check unlocks parallel agent execution.
+Помимо ограничений для каждого tool, `ContentReplacementState` отслеживает совокупный бюджет на протяжении всего разговора, предотвращая смерть тысячами сокращений - многие tools, каждый из которых возвращает 90% своего индивидуального лимита, все равно могут перегрузить контекстное окно.
 
 ---
 
-## How Tools Interact with the Message History
+## Особенности отдельных tools
 
-Tool results do not simply return data to the model. They participate in the conversation as structured messages.
+### BashTool: Самый сложный tool
 
-The API expects tool results as `ToolResultBlockParam` objects that reference the original `tool_use` block by ID. Most tools serialize to text. FileReadTool can serialize to image content blocks (base64-encoded) for multimodal responses. BashTool detects image output by inspecting magic bytes in stdout and switches to image blocks accordingly.
+BashTool — безусловно, самый сложный tool системы. Он анализирует составные команды, классифицирует подкоманды как доступные только для чтения или записи, управляет фоновыми Task, обнаруживает вывод изображения по магическим байтам и реализует симуляцию sed для безопасного предварительного просмотра редактирования.
 
-`ToolResult.newMessages` is how tools extend the conversation beyond the simple call-and-response pattern. **Agent transcripts**: AgentTool injects the sub-agent's message history as attachment messages. **System reminders**: Memory tools inject system messages that appear after the tool result -- visible to the model on the next turn but stripped at the `normalizeMessagesForAPI` boundary. **Attachment messages**: Hook results, additional context, and error details carry structured metadata that the model can reference in subsequent turns.
+Анализ составных команд особенно интересен. `splitCommandWithOperators()` разбивает команду типа `cd /tmp && mkdir build && ls build` на отдельные подкоманды. Каждый из них классифицируется по наборам известных безопасных команд (`BASH_SEARCH_COMMANDS`, `BASH_READ_COMMANDS`, `BASH_LIST_COMMANDS`). Составная команда доступна только для чтения, только если ВСЕ ненейтральные части безопасны. Нейтральный набор (echo, printf) игнорируется — они не делают команду доступной только для чтения, но и не делают ее доступной только для записи.
 
-The `contextModifier` function is the mechanism for tools that change the execution environment. When `EnterPlanMode` executes, it returns a modifier that sets the permission mode to `'plan'`. When `ExitWorktree` executes, it modifies the working directory. These modifiers are the only way for a tool to affect subsequent tools -- direct mutation of `ToolUseContext` is not possible because the context is spread-copied before each tool call. The serial-only restriction is enforced by the orchestration layer: if two concurrent tools both modify the working directory, which wins?
+Особого внимания заслуживает симуляция sed (`_simulatedSedEdit`). Когда пользователь утверждает команду sed в диалоговом окне разрешений, система предварительно вычисляет результат, запуская команду sed в песочнице и записывая выходные данные. Предварительно вычисленный результат вводится на вход как `_simulatedSedEdit`. При выполнении `call()` редактирование применяется напрямую, минуя выполнение оболочки. Это гарантирует, что то, что просматривал пользователь, будет именно тем, что и будет записано, а не повторным выполнением, которое может привести к другим результатам, если файл изменился между предварительным просмотром и выполнением.
+
+### FileEditTool: Обнаружение устаревания
+
+FileEditTool интегрируется с `readFileState`, кэшем LRU содержимого файлов и временных меток, сохраняемых на протяжении всего разговора. Прежде чем применить редактирование, он проверяет, был ли файл изменен с момента его последнего чтения моделью. Если файл устарел (изменен фоновым процессом, другим tool или пользователем), редактирование отклоняется с сообщением, предлагающим модели сначала перечитать файл.
+
+Нечеткое сопоставление в `findActualString()` обрабатывает распространенный случай, когда в модели немного неправильно отображаются пробелы. Он нормализует стили пробелов и кавычек перед сопоставлением, поэтому редактирование, нацеленное на `old_string` с конечными пробелами, по-прежнему соответствует фактическому содержимому файла. Флаг `replace_all` разрешает массовую замену; без него неуникальные совпадения отклоняются, что требует от модели предоставления достаточного контекста для идентификации одного местоположения.
+
+### FileReadTool: универсальное устройство чтения
+
+FileReadTool — единственный встроенный tool с `maxResultSizeChars: Infinity`. Если бы выходные данные чтения были сохранены на диске, модели пришлось бы прочитать сохраненный файл, что само по себе могло бы превысить предел, создавая бесконечный цикл. Вместо этого tool самостоятельно ограничивается посредством оценки токена и усекается в источнике.
+
+Tool удивительно универсален: он читает текстовые файлы с номерами строк, изображения (возвращает блоки мультимодального контента в формате Base64), PDF-файлы (через `extractPDFPages()`), блокноты Jupyter (через `readNotebook()`) и каталоги (возврат к `ls`). Он блокирует опасные пути к устройствам (`/dev/zero`, `/dev/random`, `/dev/stdin`) и обрабатывает особенности имен файлов скриншотов macOS (U+202F узкий неразрывный пробел вместо обычного пробела в именах файлов «Снимок экрана»).
+
+### GrepTool: Пагинация через head_limit
+
+GrepTool оборачивает `ripGrep()` и добавляет механизм нумерации страниц через `head_limit`. По умолчанию — 250 записей — достаточно для получения полезных результатов, но достаточно мало, чтобы избежать раздувания контекста. Когда происходит усечение, ответ включает `appliedLimit: 250`, сигнализируя модели о необходимости использовать `offset` при следующем вызове разбивки на страницы. Явный `head_limit: 0` полностью отключает ограничение.
+
+GrepTool автоматически исключает шесть каталогов VCS (`.git`, `.svn`, `.hg`, `.bzr`, `.jj`, `.sl`). Поиск внутри `.git/objects` почти никогда не является тем, чего хочет модель, и случайное включение файлов двоичного batchа может привести к потере бюджета токенов.
+
+### AgentTool и модификаторы контекста
+
+AgentTool порождает sub-agents, которые запускают свои собственные циклы запросов. Его `call()` возвращает `newMessages`, содержащий транскрипт sub-agent, и, необязательно, `contextModifier`, который передает изменения State обратно parent agent. Поскольку AgentTool по умолчанию не является безопасным для параллелизма, несколько tool calls agent в одном ответе выполняются последовательно — модификатор контекста каждого sub-agent применяется перед запуском следующего sub-agent. В Coordinator Mode схема меняется: координатор отправляет sub-agents для независимых Task, а проверка `isAgentSwarmsEnabled()` разблокирует параллельное выполнение agent.
 
 ---
 
-## Apply This: Designing a Tool System
+## Как tools взаимодействуют с историей сообщений
 
-**Fail-closed defaults.** New tools should be conservative until explicitly marked otherwise. A developer who forgets to set a flag gets the safe behavior, not the dangerous one.
+Tool results не просто возвращают данные в модель. Они участвуют в разговоре как структурированные сообщения.
 
-**Input-dependent safety.** `isConcurrencySafe(input)` and `isReadOnly(input)` take the parsed input because the same tool at different inputs has different safety profiles. A tool registry that marks BashTool as "always serial" is correct but wasteful.
+API ожидает tool results в виде объектов `ToolResultBlockParam`, которые ссылаются на исходный блок `tool_use` по идентификатору. Большинство tools сериализуются в текст. FileReadTool может сериализоваться в блоки содержимого изображения (в кодировке Base64) для мультимодальных ответов. BashTool обнаруживает вывод изображения, проверяя магические байты в stdout, и соответствующим образом переключается на блоки изображения.
 
-**Layer your permissions.** Tool-specific checks, rule-based matching, mode-based defaults, interactive prompts, and automated classifiers each handle different cases. No single mechanism is sufficient.
+`ToolResult.newMessages` — это то, как tools расширяют общение, выходя за рамки простого шаблона звонков и ответов. **Стенограммы agent**: AgentTool вставляет историю сообщений sub-agent в виде вложенных сообщений. **Системные напоминания**. Tools memory вводят системные сообщения, которые появляются после результатов работы tool. Они видны модели на следующем повороте, но удаляются на границе `normalizeMessagesForAPI`. **Сообщения о вложениях**. Результаты hook, дополнительный контекст и сведения об ошибках содержат структурированные метаданные, на которые модель может ссылаться в последующих поворотах.
 
-**Budget results, not just inputs.** Token limits on input are standard. But tool results can be arbitrarily large and they accumulate across turns. Per-tool limits prevent individual explosions. Aggregate conversation limits prevent cumulative overflow.
-
-**Make error classification telemetry-safe.** In minified builds, `error.constructor.name` is mangled. The `classifyToolError()` function extracts the most informative safe string available -- telemetry-safe messages, errno codes, stable error names -- without ever logging the raw error message to analytics.
+Функция `contextModifier` — это механизм для tools, изменяющих среду выполнения. При выполнении `EnterPlanMode` он возвращает модификатор, который устанавливает permission mode `'plan'`. Когда `ExitWorktree` выполняется, он изменяет рабочий каталог. Эти модификаторы — единственный способ воздействия tool на последующие tools — прямая мутация `ToolUseContext` невозможна, поскольку контекст копируется в расширенном виде перед каждым вызовом tool. Ограничение только на последовательный порт применяется на уровне оркестровки: если два одновременно работающих tool изменяют рабочий каталог, какой из них выигрывает?
 
 ---
 
-## What Comes Next
+## Примените это: проектирование Tool System
 
-This chapter traced how a single tool call flows from definition through validation, permission, execution, and result budgeting. But the model rarely requests just one tool at a time. How tools are orchestrated into concurrent batches is the subject of Chapter 7.
+**Значения по умолчанию, закрывающиеся при сбое.** Новые tools должны быть консервативными, пока явно не указано иное. Разработчик, который забывает установить флаг, получает безопасное, а не опасное поведение.
+
+**Безопасность, зависящая от входных данных.** `isConcurrencySafe(input)` и `isReadOnly(input)` принимают анализируемые входные данные, поскольку один и тот же tool на разных входах имеет разные профили безопасности. Реестр tools, в котором BashTool помечается как «всегда серийный», является правильным, но расточительным.
+
+**Уровень разрешений.** Проверки для конкретных tools, сопоставление на основе правил, настройки по умолчанию на основе режима, интерактивные prompt и автоматические классификаторы обрабатывают разные случаи. Ни один механизм не является достаточным.
+
+**Результаты бюджета, а не только входные данные.** Ограничения на вводимые токены являются стандартными. Но результаты работы tool могут быть сколь угодно большими и накапливаться при каждом повороте. Ограничения для каждого tool предотвращают отдельные взрывы. Совокупные ограничения на количество разговоров предотвращают накопительное переполнение.
+
+**Сделайте классификацию ошибок безопасной для телеметрии.** В мини-сборках `error.constructor.name` искажен. Функция `classifyToolError()` извлекает наиболее информативную безопасную строку из доступных — телеметрические сообщения, коды ошибок, стабильные имена ошибок — без необходимости регистрации необработанного сообщения об ошибке в аналитике.
+
+---
+
+## Что будет дальше
+
+В этой главе показано, как один tool call проходит путь от определения до проверки, разрешения, выполнения и составления бюджета результатов. Но модель редко запрашивает только один tool одновременно. То, как tools объединяются в параллельные batches, является предметом главы 7.

@@ -1,36 +1,36 @@
-# Chapter 10: Tasks, Coordination, and Swarms
+# Глава 10: Task, координация и стаи
 
-## The Limits of a Single Thread
+## Ограничения одного потока
 
-Chapter 8 showed how to create a sub-agent -- the fifteen-step lifecycle that builds an isolated execution context from an agent definition. Chapter 9 showed how to make parallel spawns economical through prompt cache exploitation. But creating agents and managing agents are different problems. This chapter addresses the second.
+В главе 8 показано, как создать sub-agent — жизненный цикл из пятнадцати шагов, который создает изолированный контекст выполнения на основе определения agent. В главе 9 показано, как сделать параллельное создание экономичным за счет быстрого использования кэша. Но создание agents и управление agentsи — это разные проблемы. Эта глава посвящена второму.
 
-A single agent loop -- one model, one conversation, one tool at a time -- can accomplish a remarkable amount of work. It can read files, edit code, run tests, search the web, and reason about complex problems. But it hits a ceiling.
+Один agent loop — одна модель, один диалог, один tool за раз — может выполнить значительный объем работы. Он может читать файлы, редактировать код, запускать тесты, выполнять поиск в Интернете и решать сложные проблемы. Но это упирается в потолок.
 
-The ceiling is not intelligence. It is parallelism and scope. A developer working on a large refactoring needs to update 40 files, run tests after each batch, and verify nothing broke. A codebase migration touches frontend, backend, and database layers simultaneously. A thorough code review reads dozens of files while running the test suite in the background. These are not harder problems -- they are wider ones. They require the ability to do multiple things at once, to delegate work to specialists, and to coordinate the results.
+Потолок – это не интеллект. Это параллелизм и масштаб. Разработчику, работающему над масштабным рефакторингом, необходимо обновить 40 файлов, запустить тесты после каждого batchа и убедиться, что ничего не сломалось. Миграция кодовой базы одновременно затрагивает уровни внешнего интерфейса, серверной части и базы данных. При тщательной проверке кода считываются десятки файлов во время выполнения набора тестов в фоновом режиме. Это не более сложные проблемы, а более широкие. Они требуют умения делать несколько дел одновременно, делегировать работу специалистам и согласовывать результаты.
 
-Claude Code's answer to this problem is not one mechanism but a layered stack of orchestration patterns, each suited to a different shape of work. Background tasks for fire-and-forget commands. Coordinator mode for manager-worker hierarchies. Swarm teams for peer-to-peer collaboration. And a unified communication protocol that ties them all together.
+Ответом Claude Code на эту проблему является не один механизм, а многоуровневый набор шаблонов оркестровки, каждый из которых подходит для разных форм работы. Фоновые Task для команд «выстрелил и забыл». Coordinator Mode для иерархий менеджер-работник. Swarm-команды для однорангового сотрудничества. И единый протокол связи, который связывает их всех вместе.
 
-The orchestration layer spans approximately 40 files across `tools/AgentTool/`, `tasks/`, `coordinator/`, `tools/SendMessageTool/`, and `utils/swarm/`. Despite this breadth, the design is anchored by a single state machine that all patterns share. Understanding that state machine -- the `Task` abstraction in `Task.ts` -- is the prerequisite for understanding everything else.
+Уровень оркестрации охватывает примерно 40 файлов `tools/AgentTool/`, `tasks/`, `coordinator/`, `tools/SendMessageTool/` и `utils/swarm/`. Несмотря на такую ​​широту, проект опирается на единый конечный автомат, общий для всех шаблонов. Понимание этого конечного автомата — абстракции `Task` в `Task.ts` — является необходимым условием для понимания всего остального.
 
-This chapter traces the full stack, from the foundational task state machine up through the most sophisticated multi-agent topologies.
+В этой главе рассматривается весь стек, от базового конечного автомата Task до самых сложных multi-agent топологий.
 
 ---
 
-## The Task State Machine
+## Конечный автомат Task
 
-Every background operation in Claude Code -- a shell command, a sub-agent, a remote session, a workflow script -- is tracked as a *task*. The task abstraction lives in `Task.ts` and provides the unified state model that the rest of the orchestration layer builds on.
+Каждая фоновая операция в Claude Code — команда оболочки, sub-agent, удаленный сеанс, сценарий рабочего процесса — отслеживается как *Task*. Абстракция Task находится в `Task.ts` и предоставляет унифицированную модель State, на которой строится остальная часть уровня оркестровки.
 
-### Seven Types
+### Семь типов
 
-The system defines seven task types, each representing a different execution model:
+Система определяет семь типов Task, каждый из которых представляет свою модель выполнения:
 
-The seven task types are: `local_bash` (background shell commands), `local_agent` (background sub-agents), `remote_agent` (remote sessions), `in_process_teammate` (swarm teammates), `local_workflow` (workflow script executions), `monitor_mcp` (MCP server monitors), and `dream` (speculative background thinking).
+Семь типов Task: `local_bash` (фоновые команды оболочки), `local_agent` (фоновые sub-agents), `remote_agent` (удаленные сеансы), `in_process_teammate` (соратники по группе), `local_workflow` (выполнение сценариев рабочего процесса), `monitor_mcp` (серверные мониторы MCP) и `dream` (спекулятивное фоновое мышление).
 
-`local_bash` and `local_agent` are the workhorses -- background shell commands and background sub-agents, respectively. `in_process_teammate` is the swarm primitive. `remote_agent` bridges to remote Claude Code Runtime environments. `local_workflow` runs multi-step scripts. `monitor_mcp` watches MCP server health. `dream` is the most unusual -- a background task that lets the agent think speculatively while waiting for user input.
+`local_bash` и `local_agent` — это рабочие лошадки — фоновые команды оболочки и фоновые sub-agents соответственно. `in_process_teammate` — примитивный рой. `remote_agent` обеспечивает мосты к удаленным средам выполнения Claude Code. `local_workflow` запускает многошаговые сценарии. `monitor_mcp` следит за State сервера MCP. `dream` — самая необычная — фоновая Task, которая позволяет agent размышлять, ожидая ввода пользователя.
 
-Each type gets a single-character ID prefix for instant visual identification:
+Каждый тип получает односимвольный префикс идентификатора для мгновенной визуальной идентификации:
 
-| Type | Prefix | Example ID |
+| Тип | Префикс | Пример идентификатора |
 |------|--------|------------|
 | `local_bash` | `b` | `b4k2m8x1` |
 | `local_agent` | `a` | `a7j3n9p2` |
@@ -40,13 +40,13 @@ Each type gets a single-character ID prefix for instant visual identification:
 | `monitor_mcp` | `m` | `m2g7k1z8` |
 | `dream` | `d` | `d5b4n3r6` |
 
-Task IDs use a single-character prefix (a for agents, b for bash, t for teammates, etc.) followed by 8 random alphanumeric characters drawn from a case-insensitive-safe alphabet (digits plus lowercase letters). This yields approximately 2.8 trillion combinations -- enough to resist brute-force symlink attacks against the task output files on disk.
+Идентификаторы Task используют односимвольный префикс (a для agents, b для bash, t для товарищей по команде и т. д.), за которым следуют 8 случайных буквенно-цифровых символов, взятых из регистронезависимого алфавита (цифры плюс строчные буквы). Это дает примерно 2,8 триллиона комбинаций — достаточно, чтобы противостоять атакам методом перебора символических ссылок на выходные файлы Task на диске.
 
-When you see `a7j3n9p2` in a log line, you know immediately it is a background agent. When you see `b4k2m8x1`, a shell command. The prefix is a micro-optimization for human readers, but in a system that can have dozens of concurrent tasks, it matters.
+Когда вы видите `a7j3n9p2` в строке журнала, вы сразу понимаете, что это фоновый agent. Когда вы увидите `b4k2m8x1`, команду оболочки. Префикс — это микрооптимизация для людей-читателей, но в системе, которая может выполнять десятки одновременных Task, это имеет значение.
 
-### Five Statuses
+### Пять статусов
 
-The lifecycle is a simple directed graph with no cycles:
+Жизненный цикл представляет собой простой ориентированный граф без циклов:
 
 ```mermaid
 stateDiagram-v2
@@ -56,7 +56,7 @@ stateDiagram-v2
     running --> killed: abort / user stop
 ```
 
-`pending` is the brief state between registration and first execution. `running` means the task is actively doing work. The three terminal states are `completed` (success), `failed` (error), and `killed` (explicitly stopped by the user, the coordinator, or an abort signal). A helper function guards against interacting with dead tasks:
+`pending` — это кратковременное State между регистрацией и первым выполнением. `running` означает, что Task активно выполняет работу. Тремя терминальными состояниями являются `completed` (успех), `failed` (ошибка) и `killed` (явное остановлено пользователем, координатором или сигналом прерывания). Вспомогательная функция защищает от взаимодействия с мертвыми Task:
 
 ```typescript
 export function isTerminalTaskStatus(status: TaskStatus): boolean {
@@ -64,11 +64,11 @@ export function isTerminalTaskStatus(status: TaskStatus): boolean {
 }
 ```
 
-This function appears everywhere -- in message injection guards, eviction logic, orphan cleanup, and the SendMessage routing that decides whether to queue a message or resume a dead agent.
+Эта функция появляется повсюду — в средствах защиты от внедрения сообщений, логике вытеснения, очистке потерянных сообщений и маршрутизации SendMessage, которая решает, поставить ли сообщение в очередь или возобновить работу мертвого agent.
 
-### The Base State
+### Базовое State
 
-Every task state extends `TaskStateBase`, which carries the fields that all seven types share:
+Каждое State Task расширяет `TaskStateBase`, который содержит поля, общие для всех семи типов:
 
 ```typescript
 export type TaskStateBase = {
@@ -86,11 +86,11 @@ export type TaskStateBase = {
 }
 ```
 
-Two fields deserve attention. `outputFile` is the bridge between async execution and the parent's conversation -- every task writes its output to a file on disk, and the parent can read it incrementally via `outputOffset`. `notified` prevents duplicate completion messages; once the parent has been told a task finished, the flag flips to `true` and the notification is never sent again. Without this guard, a task that completes between two consecutive polls of the notification queue would generate duplicate notifications, confusing the model into thinking two tasks finished when only one did.
+Два поля заслуживают внимания. `outputFile` — это мост между асинхронным выполнением и диалогом родителя — каждая Task записывает свои выходные данные в файл на диске, и родитель может читать их постепенно через `outputOffset`. `notified` предотвращает дублирование сообщений о завершении; как только родителю сообщают, что Task завершена, флаг меняется на `true`, и уведомление больше никогда не отправляется. Без этой защиты Task, которая завершается между двумя последовательными опросами очереди уведомлений, будет генерировать дублирующиеся уведомления, что сбивает модель с толку, заставляя ее думать, что две Task завершены, хотя завершилась только одна.
 
-### The Agent Task State
+### State Task agent
 
-`LocalAgentTaskState` is the most complex variant, carrying everything needed to manage a background sub-agent's full lifecycle:
+`LocalAgentTaskState` — самый сложный вариант, содержащий все необходимое для управления полным жизненным циклом фонового sub-agent:
 
 ```typescript
 export type LocalAgentTaskState = TaskStateBase & {
@@ -113,13 +113,13 @@ export type LocalAgentTaskState = TaskStateBase & {
 }
 ```
 
-Three fields reveal important design decisions. `pendingMessages` is the inbox -- when `SendMessage` targets a running agent, the message is queued here rather than injected immediately. Messages are drained at tool-round boundaries, which preserves the agent's turn structure. `isBackgrounded` distinguishes agents that were born async from those that started as foreground sync agents and were later backgrounded by the user pressing a key. `evictAfter` is a garbage collection mechanism: non-retained completed tasks get a grace period before their state is purged from memory.
+Три поля раскрывают важные дизайнерские решения. `pendingMessages` — это почтовый ящик: когда `SendMessage` нацелен на работающий agent, сообщение ставится в очередь здесь, а не вводится немедленно. Сообщения удаляются на границах раундов tools, что сохраняет структуру хода agent. `isBackgrounded` отличает agents, которые были созданы асинхронными, от agents, которые начинались как agents синхронизации на переднем плане, а затем были переведены в фоновый режим при нажатии пользователем клавиши. `evictAfter` — это механизм сбора мусора: несохраняемые завершенные Task получают льготный период, прежде чем их State будет очищено из memory.
 
-All task states are stored in `AppState.tasks` as a `Record<string, TaskState>`, keyed by the prefixed ID. This is a flat map, not a tree -- the system does not model parent-child relationships in the state store. The parent-child relationship is implicit in the conversation flow: the parent holds the `toolUseId` that spawned the child.
+Все State Task хранятся в `AppState.tasks` как `Record<string, TaskState>`, с ключом по префиксному идентификатору. Это плоская карта, а не дерево — система не моделирует отношения родитель-потомок в хранилище State. Отношения родитель-потомок неявно присутствуют в потоке диалога: родительский элемент содержит `toolUseId`, который породил дочерний элемент.
 
-### The Task Registry
+### Реестр Task
 
-Each task type is backed by a `Task` object with a minimal interface:
+Каждый тип Task поддерживается объектом `Task` с минимальным интерфейсом:
 
 ```typescript
 export type Task = {
@@ -129,7 +129,7 @@ export type Task = {
 }
 ```
 
-The registry collects all task implementations:
+В реестре собраны все реализации Task:
 
 ```typescript
 export function getAllTasks(): Task[] {
@@ -144,19 +144,19 @@ export function getAllTasks(): Task[] {
 }
 ```
 
-Notice the conditional inclusion -- `LocalWorkflowTask` and `MonitorMcpTask` are feature-gated and may not exist at runtime. The `Task` interface is deliberately minimal. Earlier iterations included `spawn()` and `render()` methods, but these were removed when it became clear that spawning and rendering were never called polymorphically. Each task type has its own spawn logic, its own state management, and its own rendering. The only operation that genuinely needs to dispatch by type is `kill()`, and so that is all the interface requires.
+Обратите внимание на условное включение: `LocalWorkflowTask` и `MonitorMcpTask` являются функционально-зависимыми и могут не существовать во время выполнения. Интерфейс `Task` намеренно минимален. Более ранние итерации включали методы `spawn()` и `render()`, но они были удалены, когда стало ясно, что порождение и рендеринг никогда не вызывались полиморфно. Каждый тип Task имеет свою собственную логику появления, собственное управление State и собственный рендеринг. Единственная операция, которую действительно необходимо распределять по типу, — это `kill()`, и это все, что требуется интерфейсу.
 
-This is an example of interface evolution through subtraction. The initial design imagined that all task types would share a common lifecycle interface. In practice, the types diverged enough that the shared interface became a fiction -- `spawn()` for a shell command and `spawn()` for an in-process teammate have almost nothing in common. Rather than maintain a leaky abstraction, the team removed everything except the one method that actually benefits from polymorphism.
+Это пример эволюции интерфейса посредством вычитания. Первоначальный проект предполагал, что все типы tasks будут иметь общий интерфейс жизненного цикла. На практике типы разошлись настолько, что общий интерфейс стал фикцией: `spawn()` для команды оболочки и `spawn()` для команды, находящейся в процессе, не имеют почти ничего общего. Вместо того, чтобы поддерживать дырявую абстракцию, команда удалила все, кроме одного метода, который действительно выигрывает от полиморфизма.
 
 ---
 
-## Communication Patterns
+## Шаблоны общения
 
-A task that runs in the background is only useful if the parent can observe its progress and receive its results. Claude Code supports three communication channels, each optimized for a different access pattern.
+Task, выполняемая в фоновом режиме, полезна только в том случае, если родитель может наблюдать за ее ходом и получать результаты. Claude Code поддерживает три канала связи, каждый из которых оптимизирован для разных шаблонов доступа.
 
-### Foreground: The Generator Chain
+### На переднем плане: цепь генераторов
 
-When an agent runs synchronously, the parent iterates its `runAgent()` async generator directly, yielding each message back up the call stack. The interesting mechanism here is the background escape hatch -- the sync loop races between "next message from agent" and "background signal":
+Когда agent работает синхронно, parent agent напрямую выполняет итерацию своего асинхронного генератора `runAgent()`, возвращая каждое сообщение в стек вызовов. Интересным механизмом здесь является фоновый аварийный люк: цикл синхронизации переключается между «следующим сообщением от agent» и «фоновым сигналом»:
 
 ```typescript
 const agentIterator = runAgent({ ...params })[Symbol.asyncIterator]()
@@ -178,15 +178,15 @@ while (true) {
 }
 ```
 
-If the user decides mid-execution that a sync agent should become a background task, the foreground iterator is cleanly returned (triggering its `finally` block for resource cleanup), and the agent is re-spawned as an async task with the same ID. The transition is seamless -- no work is lost, and the agent continues from where it left off with an async abort controller that is unlinked from the parent's ESC key.
+Если в середине выполнения пользователь решает, что agent синхронизации должен стать фоновой Task, итератор переднего плана возвращается без ошибок (запуская его блок `finally` для очистки ресурсов), а agent повторно создается как асинхронная Task с тем же идентификатором. Переход происходит плавно — никакая работа не теряется, и agent продолжает с того места, где остановился, с помощью контроллера асинхронного прерывания, который не связан с родительским ключом ESC.
 
-This is a genuinely difficult state transition to get right. The foreground agent shares the parent's abort controller (ESC kills both). The background agent needs its own controller (ESC should not kill it). The agent's messages need to transfer from the foreground generator stream to the background notification system. The task state needs to flip `isBackgrounded` so the UI knows to show it in the background panel. And all of this must happen atomically -- no messages lost in the transition, no zombie iterators left running. The `Promise.race` between the next message and the background signal is the mechanism that makes this possible.
+Это действительно сложный переходный период, который нужно осуществить правильно. Agent переднего плана использует родительский контроллер прерывания (ESC убивает обоих). Фоновому agent нужен собственный контроллер (ESC не должен его убивать). Сообщения agent необходимо передать из потока генератора переднего плана в систему фоновых уведомлений. State Task должно измениться на `isBackgrounded`, чтобы UI знал, что его следует отображать на фоновой панели. И все это должно происходить атомарно — никакие сообщения не теряются при переходе, ни один итератор-зомби не остается работающим. `Promise.race` между следующим сообщением и фоновым сигналом — это механизм, который делает это возможным.
 
-### Background: Three Channels
+### Фон: три канала
 
-Background agents communicate through disk, notifications, and queued messages.
+Фоновые agents взаимодействуют через диск, уведомления и сообщения в очереди.
 
-**Disk output files.** Every task writes to an `outputFile` path -- a symlink to the agent's transcript in JSONL format. The parent (or any observer) can read this file incrementally using `outputOffset`, which tracks how far into the file has been consumed. The `TaskOutputTool` exposes this to the model:
+**Выходные файлы на диске.** Каждая Task записывается по пути `outputFile` — символической ссылке на стенограмму agent в формате JSONL. Родитель (или любой наблюдатель) может читать этот файл постепенно, используя `outputOffset`, который отслеживает, как далеко был использован файл. `TaskOutputTool` предоставляет это модели:
 
 ```typescript
 inputSchema = z.strictObject({
@@ -196,9 +196,9 @@ inputSchema = z.strictObject({
 })
 ```
 
-When `block: true`, the tool polls until the task reaches a terminal state or the timeout expires. This is the primary mechanism for a coordinator that spawns a worker and waits for its result.
+Если `block: true`, tool выполняет опрос до тех пор, пока Task не достигнет конечного State или пока не истечет время ожидания. Это основной механизм координатора, который порождает работника и ждет его результата.
 
-**Task notifications.** When a background agent completes, the system generates an XML notification and enqueues it for delivery into the parent's conversation:
+**Уведомления о Task.** Когда фоновый agent завершает работу, система генерирует уведомление XML и ставит его в очередь для доставки в беседу родителя:
 
 ```xml
 <task-notification>
@@ -216,9 +216,9 @@ When `block: true`, the tool polls until the task reaches a terminal state or th
 </task-notification>
 ```
 
-The notification is injected as a user-role message in the parent's conversation, which means the model sees it in its normal message flow. It does not need a special tool to check for completions -- they arrive as context. The `notified` flag on the task state prevents duplicate delivery.
+Уведомление вводится как сообщение роли пользователя в беседу родителя, что означает, что модель видит его в своем обычном потоке сообщений. Для проверки завершений не требуется специальный tool — они поступают в виде контекста. Флаг `notified` в State Task предотвращает дублирование доставки.
 
-**Command queue.** The `pendingMessages` array on `LocalAgentTaskState` is the third channel. When `SendMessage` targets a running agent, the message is queued:
+**Очередь команд.** Массив `pendingMessages` на `LocalAgentTaskState` является третьим каналом. Когда `SendMessage` нацелен на работающий agent, сообщение ставится в очередь:
 
 ```typescript
 if (isLocalAgentTask(task) && task.status === 'running') {
@@ -227,11 +227,11 @@ if (isLocalAgentTask(task) && task.status === 'running') {
 }
 ```
 
-These messages are drained at tool-round boundaries by `drainPendingMessages()` and injected as user messages into the agent's conversation. This is a crucial design choice -- messages arrive between tool rounds, not mid-execution. The agent finishes its current thought, then receives the new information. No race conditions, no corrupted state.
+Эти сообщения обрабатываются на границах tool rounds с помощью `drainPendingMessages()` и вводятся как пользовательские сообщения в разговор agent. Это решающий выбор при проектировании — сообщения приходят между этапами разработки tool, а не в середине выполнения. Agent заканчивает свою текущую мысль, а затем получает новую информацию. Никаких расовых условий, никакого коррумпированного государства.
 
-### Progress Tracking
+### Отслеживание прогресса
 
-The `ProgressTracker` provides real-time visibility into agent activity:
+`ProgressTracker` обеспечивает видимость активности agent в режиме реального времени:
 
 ```typescript
 export type ProgressTracker = {
@@ -242,29 +242,29 @@ export type ProgressTracker = {
 }
 ```
 
-The distinction between input and output token tracking is deliberate and reflects a subtlety of the API's billing model. Input tokens are cumulative per API call because the full conversation is re-sent each time -- the 15th turn includes all 14 previous turns, so the input token count reported by the API already reflects the total. Keeping the latest value is the correct aggregation. Output tokens are per-turn -- the model generates new tokens each time -- so summing is the correct aggregation. Getting this wrong would either dramatically overcount (summing cumulative input tokens) or dramatically undercount (keeping only the latest output tokens).
+Различие между отслеживанием входных и выходных токенов сделано намеренно и отражает тонкости модели выставления счетов API. Входные токены накапливаются для каждого вызова API, поскольку каждый раз пересылается полный диалог — 15-й ход включает в себя все 14 предыдущих ходов, поэтому количество входных токенов, сообщаемое API, уже отражает общую сумму. Сохранение последнего значения является правильным агрегированием. Выходные токены выдаются за ход — модель каждый раз генерирует новые токены, поэтому правильное агрегирование — это суммирование. Ошибка приведет либо к значительному завышению значения (суммирование совокупных входных токенов), либо к значительному занижению значения (оставление только последних выходных токенов).
 
-The `recentActivities` array (capped at 5 entries) provides a human-readable stream of what the agent is doing: "Read src/auth/validate.ts", "Bash: npm test", "Edit src/auth/validate.ts". This appears in the VS Code subagent panel and the terminal's background task indicator, giving users visibility into agent work without requiring them to read full transcripts.
+Массив `recentActivities` (не более 5 записей) предоставляет удобочитаемый поток того, что делает agent: «Читать src/auth/validate.ts», «Bash: npm test», «Редактировать src/auth/validate.ts». Он отображается на панели sub-agent VS Code и индикаторе фоновой Task терминала, предоставляя пользователям возможность видеть работу agent, не требуя от них чтения полных стенограмм.
 
-For background agents, progress is written to `AppState` via `updateAsyncAgentProgress()` and emitted as SDK events via `emitTaskProgress()`. The VS Code subagent panel consumes these events to render live progress bars, tool counts, and activity streams. The progress tracking is not just cosmetic -- it is the primary feedback mechanism that tells users whether a background agent is making progress or stuck in a loop.
+Для фоновых agents прогресс записывается в `AppState` через `updateAsyncAgentProgress()` и генерируется как события SDK через `emitTaskProgress()`. Панель sub-agent VS Code использует эти события для отображения в реальном времени индикаторов выполнения, количества tools и потоков активности. Отслеживание прогресса носит не просто косметический характер — это основной механизм обратной связи, который сообщает пользователям, продвигается ли фоновый agent или застрял в цикле.
 
 ---
 
 ## Coordinator Mode
 
-Coordinator mode transforms Claude Code from a single agent with background helpers into a true manager-worker architecture. It is the most opinionated orchestration pattern in the system, and its design reveals deep thinking about how LLMs should and should not delegate work.
+Coordinator Mode превращает Claude Code из одного agent с фоновыми помощниками в настоящую архитектуру менеджер-работник. Это наиболее самоуверенная модель оркестровки в системе, и ее дизайн свидетельствует о глубоком размышлении о том, как LLM следует и не следует делегировать работу.
 
-### The Problem Coordinator Mode Solves
+### Coordinator Mode решает проблемы
 
-The standard agent loop has a single conversation and a single context window. When it spawns a background agent, the background agent runs independently and reports results via task notifications. This works well for simple delegation -- "run the tests while I keep editing" -- but breaks down for complex multi-step workflows.
+Стандартный agent loop имеет один диалог и одно контекстное окно. Когда он создает фоновый agent, фоновый agent запускается независимо и сообщает о результатах через уведомления о Task. Это хорошо работает для простого делегирования — «запускайте тесты, пока я продолжаю редактировать», — но не работает для сложных многоэтапных рабочих процессов.
 
-Consider a codebase migration. The agent needs to: (1) understand the current patterns across 200 files, (2) design the migration strategy, (3) apply changes to each file, and (4) verify nothing broke. Steps 1 and 3 benefit from parallelism. Step 2 requires synthesizing the results of step 1. Step 4 depends on step 3. A single agent doing this sequentially would spend most of its token budget re-reading files. Multiple background agents doing this without coordination would produce inconsistent changes.
+Рассмотрим миграцию кодовой базы. Agent необходимо: (1) понять текущие закономерности в 200 файлах, (2) разработать стратегию миграции, (3) применить изменения к каждому файлу и (4) убедиться, что ничего не сломалось. Шаги 1 и 3 выигрывают от параллелизма. Шаг 2 требует синтеза результатов шага 1. Шаг 4 зависит от шага 3. Один agent, выполняющий это последовательно, потратит большую часть своего бюджета токенов на перечитывание файлов. Несколько фоновых agents, выполняющих это без координации, приведут к противоречивым изменениям.
 
-Coordinator mode solves this by splitting the "thinking" agent from the "doing" agents. The coordinator handles steps 1 and 2 (dispatching research workers, then synthesizing). Workers handle steps 3 and 4 (applying changes, running tests). The coordinator sees the full picture; workers see their specific task.
+Coordinator Mode решает эту проблему, отделяя «думающего» agent от «действующих». Координатор выполняет этапы 1 и 2 (направление научных работников, затем синтез). Воркеры выполняют шаги 3 и 4 (применение изменений, запуск тестов). Координатор видит полную картину; работники видят свою конкретную Task.
 
-### Activation
+### Активация
 
-A single environment variable flips the switch:
+Одна переменная среды переключает переключатель:
 
 ```typescript
 export function isCoordinatorMode(): boolean {
@@ -275,19 +275,19 @@ export function isCoordinatorMode(): boolean {
 }
 ```
 
-On session resume, `matchSessionMode()` checks whether the resumed session's stored mode matches the current environment. If they diverge, the environment variable is flipped to match. This prevents the confusing scenario where a coordinator session resumes as a regular agent (losing awareness of its workers) or a regular session resumes as a coordinator (losing access to its tools). The session's mode is the source of truth; the environment variable is the runtime signal.
+При возобновлении сеанса `matchSessionMode()` проверяет, соответствует ли сохраненный режим возобновленного сеанса текущей среде. Если они расходятся, переменная среды переворачивается для соответствия. Это предотвращает запутанный сценарий, когда сеанс координатора возобновляется в качестве обычного agent (теряя осведомленность о своих работниках) или обычный сеанс возобновляется в качестве координатора (теряя доступ к своим tools). Режим сеанса является источником истины; переменная среды является сигналом времени выполнения.
 
-### Tool Restrictions
+### Ограничения tools
 
-The coordinator's power comes not from having more tools, but from having fewer. In coordinator mode, the coordinator agent gets exactly three tools:
+Сила координатора заключается не в том, что у него больше tools, а в том, что у него меньше. В Coordinator Mode agent-координатор получает ровно три tool:
 
-- **Agent** -- spawn workers
-- **SendMessage** -- communicate with existing workers
-- **TaskStop** -- terminate running workers
+- **Agent** -- порождает рабочих
+- **SendMessage** — общение с существующими работниками.
+- **TaskStop** — завершить работу рабочих процессов
 
-That is it. No file reading. No code editing. No shell commands. The coordinator cannot directly touch the codebase. This restriction is not a limitation -- it is the core design principle. The coordinator's job is to think, plan, decompose, and synthesize. Workers do the work.
+Вот и все. Нет чтения файлов. Никакого редактирования кода. Никаких команд оболочки. Координатор не может напрямую касаться базы кода. Это ограничение не является ограничением — это основной принцип проектирования. Работа координатора — думать, планировать, разлагать и синтезировать. Рабочие делают работу.
 
-Workers, conversely, get the full tool set minus internal coordination tools:
+Рабочие, наоборот, получают полный набор tools за вычетом tools внутренней координации:
 
 ```typescript
 const INTERNAL_WORKER_TOOLS = new Set([
@@ -298,17 +298,17 @@ const INTERNAL_WORKER_TOOLS = new Set([
 ])
 ```
 
-Workers cannot spawn their own sub-teams or send messages to peers. They report results through the normal task completion mechanism, and the coordinator synthesizes across them.
+Работники не могут создавать свои собственные подгруппы или отправлять сообщения коллегам. Они сообщают о результатах через обычный механизм выполнения Task, а координатор обобщает их.
 
-### The 370-Line System Prompt
+### Системная prompt из 370 строк
 
-The coordinator system prompt is, line for line, the most instructive document in the codebase about how to use LLMs for orchestration. It runs approximately 370 lines and encodes hard-won lessons about delegation patterns. The key teachings:
+prompt системы координатора — это, строка за строкой, самый поучительный документ в базе кода о том, как использовать LLM для оркестровки. Он содержит около 370 строк и содержит полученные с таким трудом уроки о шаблонах делегирования. Ключевые учения:
 
-**"Never delegate understanding."** This is the central thesis. The coordinator must synthesize research findings into specific prompts with file paths, line numbers, and exact changes. The prompt explicitly calls out anti-patterns like "based on your findings, fix the bug" -- a prompt that delegates *comprehension* to the worker, forcing it to re-derive context the coordinator already has. The correct pattern is: "In `src/auth/validate.ts` at line 42, the `userId` parameter can be null when called from the OAuth flow. Add a null check that returns a 401 response."
+** «Никогда не делегируйте понимание».** Это центральный тезис. Координатор должен синтезировать результаты исследования в конкретные запросы с указанием путей к файлам, номеров строк и точных изменений. prompt явно вызывает антишаблоны, такие как «на основе ваших выводов, исправьте ошибку» — prompt, которая делегирует *понимание* работнику, заставляя его повторно извлечь контекст, который уже есть у координатора. Правильный шаблон: «В `src/auth/validate.ts` в строке 42 параметр `userId` может иметь значение null при вызове из потока OAuth. Добавьте нулевую проверку, которая возвращает ответ 401».
 
-**"Parallelism is your superpower."** The prompt establishes a clear concurrency model. Read-only tasks run freely in parallel -- research, exploration, file reading. Write-heavy tasks serialize per file set. The coordinator is expected to reason about which tasks can overlap and which must sequence. A good coordinator spawns five research workers simultaneously, waits for all of them, synthesizes, then spawns three implementation workers that touch disjoint file sets. A bad coordinator spawns one worker, waits, spawns the next, waits again -- serializing work that could have been parallel.
+**"Параллелизм — ваша суперсила".** prompt устанавливает четкую модель параллелизма. Task только для чтения выполняются свободно параллельно — исследование, исследование, чтение файлов. Task с большим объемом записи сериализуются для каждого набора файлов. Ожидается, что координатор определит, какие Task могут пересекаться, а какие должны быть упорядочены. Хороший координатор одновременно порождает пять исследователей, ждет их всех, синтезирует, а затем порождает трех специалистов по реализации, которые работают с непересекающимися наборами файлов. Плохой координатор порождает одного работника, ждет, порождает следующего, снова ждет — сериализуя работу, которая могла бы быть параллельной.
 
-**Task workflow phases.** The prompt defines four phases:
+**Фазы рабочего процесса Task.** В prompt определены четыре этапа:
 
 ```mermaid
 graph LR
@@ -322,35 +322,35 @@ graph LR
     V -.- V1[Workers run tests\nverify changes]
 ```
 
-1. **Research** -- workers explore the codebase in parallel, reading files, running tests, gathering information
-2. **Synthesis** -- the coordinator (not a worker) reads all research results and builds a unified understanding
-3. **Implementation** -- workers receive precise instructions derived from the synthesis
-4. **Verification** -- workers run tests and verify the changes
+1. **Исследование** – сотрудники параллельно изучают кодовую базу, читают файлы, выполняют тесты, собирают информацию.
+2. **Синтез** — координатор (не сотрудник) читает все результаты исследования и выстраивает единое понимание.
+3. **Внедрение** — работники получают точные инструкции, полученные в результате синтеза.
+4. **Проверка** — работники запускают тесты и проверяют изменения.
 
-The coordinator should not skip phases. The most common failure mode is jumping from research directly to implementation without synthesis. When this happens, the coordinator delegates understanding to the implementation workers -- each one must re-derive context from scratch, leading to inconsistent changes and wasted tokens.
+Координатор не должен пропускать этапы. Самый распространенный вариант неудачи — это переход от исследования непосредственно к реализации без синтеза. Когда это происходит, координатор делегирует понимание работникам реализации — каждый из них должен заново получить контекст с нуля, что приводит к противоречивым изменениям и бесполезной трате токенов.
 
-**The continue-vs-spawn decision.** When a worker finishes and the coordinator has follow-up work, should it send a message to the existing worker (via SendMessage) or spawn a fresh one (via Agent)? The decision is a function of context overlap:
+**Решение о продолжении или создании.** Когда работник завершает работу и координатор выполняет дальнейшую работу, должен ли он отправить сообщение существующему работнику (через SendMessage) или создать новое (через agent)? Решение является функцией перекрытия контекста:
 
-- **High overlap, same files**: Continue. The worker already has the file contents in its context, understands the patterns, and can build on its previous work. Spawning fresh would force re-reading the same files and re-deriving the same understanding.
-- **Low overlap, different domain**: Spawn fresh. A worker that just investigated the authentication system carries 20,000 tokens of auth-specific context that is dead weight for a CSS refactoring task. Starting clean is cheaper.
-- **High overlap but the worker failed**: Spawn fresh with explicit guidance about what went wrong. Continuing a failed worker often means fighting against confused context. A fresh start with "the previous attempt failed because X, avoid Y" is more reliable.
-- **Follow-up requires the worker's output**: Continue, with the output included in the SendMessage. The worker does not need to re-derive its own results.
+- **Высокое перекрытие, одни и те же файлы**: Продолжить. Рабочий процесс уже имеет содержимое файла в своем контексте, понимает шаблоны и может опираться на свою предыдущую работу. Создание новых файлов потребует повторного чтения одних и тех же файлов и повторного получения того же понимания.
+- **Низкое перекрытие, другой домен**: Свежее появление. Работник, который только что исследовал систему аутентификации, имеет 20 000 токенов контекста, специфичного для аутентификации, что является мертвым грузом для Task рефакторинга CSS. Начать с чистого листа дешевле.
+- **Высокое перекрытие, но рабочий не справился**: создайте новую версию с четкими указаниями о том, что пошло не так. Продолжение работы неудачника часто означает борьбу с запутанным контекстом. Начать заново с фразы «предыдущая попытка не удалась, потому что X, избегайте Y» более надежен.
+- **Для отслеживания требуются выходные данные работника**: Продолжить, включив выходные данные в SendMessage. Работнику не нужно повторно получать свои собственные результаты.
 
-**Worker prompt writing and anti-patterns.** The prompt teaches the coordinator how to write effective worker prompts and explicitly flags bad patterns:
+**Написание prompts для работников и антишаблоны.** prompt учит координатора писать эффективные prompt для работников и явно отмечает неправильные шаблоны:
 
-Anti-pattern: *"Based on your research findings, implement the fix."* This delegates comprehension. The worker was not the one who did the research -- the coordinator read the research results.
+Антишаблон: * «На основе результатов вашего исследования внедрите исправление». * Это делегирует понимание. Исследование проводил не работник — координатор зачитывал результаты исследования.
 
-Anti-pattern: *"Fix the bug in the auth module."* No file paths, no line numbers, no description of the bug. The worker must search the entire codebase from scratch.
+Антишаблон: * «Исправьте ошибку в модуле аутентификации». * Никаких путей к файлам, номеров строк и описания ошибки. Работник должен выполнить поиск по всей базе кода с нуля.
 
-Anti-pattern: *"Make the same change to all the other files."* Which files? What change? The coordinator knows; it should enumerate them.
+Антишаблон: *"Внесите такие же изменения во все остальные файлы."* Какие файлы? Какие изменения? Координатор знает; он должен их перечислить.
 
-Good pattern: *"In `src/auth/validate.ts` at line 42, the `userId` parameter can be null when called from `src/oauth/callback.ts:89`. Add a null check: if `userId` is null, return `{ error: 'unauthorized', status: 401 }`. Then update the test in `src/auth/__tests__/validate.test.ts` to cover the null case."*
+Хороший шаблон: *"В `src/auth/validate.ts` в строке 42 параметр `userId` может иметь значение null при вызове из `src/oauth/callback.ts:89`. Добавьте нулевую проверку: если `userId` имеет значение null, верните `{ error: 'unauthorized', status: 401 }`. Затем обновите тест в `src/auth/__tests__/validate.test.ts`, чтобы охватить нулевой случай."*
 
-The cost of writing a specific prompt is borne once, by the coordinator. The benefit -- a worker that executes correctly on the first try -- is enormous. Vague prompts create a false economy: the coordinator saves 30 seconds of prompt writing and the worker wastes 5 minutes of exploration.
+Расходы на написание конкретной prompt берет на себя один раз координатор. Выгода — работник, который выполняет правильно с первой попытки — огромна. Расплывчатые prompt создают ложную экономию: координатор экономит 30 секунд на написании prompts, а работник тратит 5 минут на исследование.
 
-### Worker Context
+### Рабочий контекст
 
-The coordinator injects information about available tools into its own context, so the model knows what workers can do:
+Координатор вводит информацию о доступных tool в свой собственный контекст, поэтому модель знает, что могут делать работники:
 
 ```typescript
 export function getCoordinatorUserContext(mcpClients, scratchpadDir?) {
@@ -363,13 +363,13 @@ export function getCoordinatorUserContext(mcpClients, scratchpadDir?) {
 }
 ```
 
-The scratchpad directory (gated by the `tengu_scratch` feature flag) is a shared filesystem location where workers can read and write without permission prompts. It enables durable cross-worker knowledge sharing -- one worker's research notes become another worker's input, mediated through the filesystem rather than through the coordinator's token window.
+Каталог блокнота (защищенный функциональным флагом `tengu_scratch`) представляет собой общую папку файловой системы, где работники могут читать и писать без запросов на разрешение. Это обеспечивает надежный обмен знаниями между сотрудниками: исследовательские заметки одного сотрудника становятся входными данными для другого, передаваемыми через файловую систему, а не через окно токенов координатора.
 
-This is significant because it solves a fundamental limitation of the coordinator pattern. Without a scratchpad, all information flows through the coordinator: Worker A produces findings, the coordinator reads them via TaskOutput, synthesizes them into Worker B's prompt. The coordinator's context window becomes the bottleneck -- it must hold all intermediate results long enough to synthesize them. With a scratchpad, Worker A writes findings to `/tmp/scratchpad/auth-analysis.md`, and the coordinator tells Worker B: "Read the auth analysis at `/tmp/scratchpad/auth-analysis.md` and apply the pattern to the OAuth module." The coordinator moves information by reference, not by value.
+Это важно, поскольку устраняет фундаментальное ограничение шаблона координатора. Без блокнота вся информация проходит через координатора: работник А выдает результаты, координатор считывает их через TaskOutput, синтезирует их в prompt работника Б. Контекстное окно координатора становится узким местом — оно должно хранить все промежуточные результаты достаточно долго, чтобы их синтезировать. С помощью блокнота работник А записывает результаты в `/tmp/scratchpad/auth-analysis.md`, а координатор говорит работнику Б: «Прочитайте анализ аутентификации в `/tmp/scratchpad/auth-analysis.md` и примените шаблон к модулю OAuth». Координатор перемещает информацию по ссылке, а не по значению.
 
-### Mutual Exclusion with Fork
+### Взаимное исключение с помощью форка
 
-Coordinator mode and fork-based subagents are mutually exclusive:
+Coordinator Mode и sub-agents на основе ответвлений являются взаимоисключающими.
 
 ```typescript
 export function isForkSubagentEnabled(): boolean {
@@ -380,17 +380,17 @@ export function isForkSubagentEnabled(): boolean {
 }
 ```
 
-The conflict is fundamental. Fork agents inherit the parent's entire conversation context -- they are cheap clones that share prompt cache. Coordinator workers are independent agents with fresh context and specific instructions. These are opposing philosophies of delegation, and the system enforces the choice at the feature flag level.
+Конфликт является фундаментальным. Agents форка наследуют весь контекст разговора родителя — это дешевые клоны, которые используют общий Prompt Cache. Работники-координаторы — независимые agents со свежим контекстом и конкретными инструкциями. Это противоположные подходы к делегированию, и система обеспечивает выбор на уровне флага функции.
 
 ---
 
-## The Swarm System
+## Роевая система
 
-Coordinator mode is hierarchical: one manager, many workers, top-down control. The swarm system is the peer-to-peer alternative -- multiple Claude Code instances working as a team, with a leader coordinating multiple teammates through message passing.
+Coordinator Mode иерархический: один менеджер, много работников, управление сверху вниз. Роевая система представляет собой одноранговую альтернативу: несколько экземпляров Claude Code работают в команде, при этом лидер координирует действия нескольких товарищей по команде посредством передачи сообщений.
 
-### Team Context
+### Контекст команды
 
-Teams are identified by a `teamName` and tracked in `AppState.teamContext`:
+Команды обозначаются `teamName` и отслеживаются по `AppState.teamContext`:
 
 ```typescript
 teamContext?: {
@@ -401,11 +401,11 @@ teamContext?: {
 }
 ```
 
-Each teammate gets a name (for addressing) and a color (for visual distinction in the UI). The team file is persisted on disk so that team membership survives process restarts.
+Каждый товарищ по команде получает имя (для обращения) и цвет (для визуального различия в пользовательском интерфейсе). Файл группы сохраняется на диске, поэтому членство в команде сохраняется при перезапуске процесса.
 
-### Agent Name Registry
+### Реестр имен agents
 
-Background agents can be given names at spawn time, which makes them addressable by human-readable identifiers instead of random task IDs:
+Фоновым agents могут быть присвоены имена во время появления, что позволяет обращаться к ним с помощью удобочитаемых идентификаторов, а не случайных идентификаторов Task:
 
 ```typescript
 if (name) {
@@ -417,18 +417,18 @@ if (name) {
 }
 ```
 
-The `agentNameRegistry` is a `Map<string, AgentId>`. When `SendMessage` resolves a `to` field, the registry is checked first:
+`agentNameRegistry` — это `Map<string, AgentId>`. Когда `SendMessage` разрешает поле `to`, сначала проверяется реестр:
 
 ```typescript
 const registered = appState.agentNameRegistry.get(input.to)
 const agentId = registered ?? toAgentId(input.to)
 ```
 
-This means you can send a message to `"researcher"` instead of `a7j3n9p2`. The indirection is simple but it enables the coordinator to think in terms of roles rather than IDs -- a significant improvement for the model's ability to reason about multi-agent workflows.
+Это означает, что вы можете отправить сообщение на `"researcher"` вместо `a7j3n9p2`. Косвенное обращение простое, но оно позволяет координатору мыслить с точки зрения ролей, а не идентификаторов, что является значительным улучшением способности модели рассуждать о multi-agent рабочих процессах.
 
-### In-Process Teammates
+### Коллеги в процессе
 
-In-process teammates run in the same Node.js process as the leader, isolated via `AsyncLocalStorage`. Their state extends the base with team-specific fields:
+Члены команды в процессе работают в том же процессе Node.js, что и лидер, изолируются через `AsyncLocalStorage`. Их State расширяет базу полями, специфичными для команды:
 
 ```typescript
 export type InProcessTeammateTaskState = TaskStateBase & {
@@ -446,17 +446,17 @@ export type InProcessTeammateTaskState = TaskStateBase & {
 }
 ```
 
-The `messages` cap at 50 entries deserves explanation. During development, analysis revealed that each in-process agent accumulates approximately 20MB of RSS at 500+ turns. Whale sessions -- power users running extended workflows -- were observed launching 292 agents in 2 minutes, driving RSS to 36.8GB. The 50-message cap for the UI representation is a memory safety valve. The agent's actual conversation continues with full history; only the UI-facing snapshot is truncated.
+Ограничение `messages` в 50 записей заслуживает объяснения. В ходе разработки анализ показал, что каждый работающий agent накапливает примерно 20 МБ RSS за более чем 500 оборотов. Было замечено, что сеансы «китов» — опытных пользователей, выполняющих расширенные рабочие процессы — запускают 292 agent за 2 минуты, увеличивая размер RSS до 36,8 ГБ. Ограничение в 50 сообщений для представления UI — это предохранительный клапан memory. Фактический разговор agent продолжается с полной историей; усекается только снимок UI.
 
-The `isIdle` flag enables a work-stealing pattern. An idle teammate is not consuming tokens or API calls -- it is simply waiting for the next message. The `onIdleCallbacks` array lets the system hook into the transition from active to idle, enabling orchestration patterns like "wait for all teammates to finish, then proceed."
+Флаг `isIdle` включает шаблон кражи работы. Бездействующий товарищ по команде не потребляет жетоны и не звонит API — он просто ждет следующего сообщения. Массив `onIdleCallbacks` позволяет системе подключиться к переходу из активного режима в режим ожидания, обеспечивая такие шаблоны оркестровки, как «дождитесь, пока все товарищи по команде закончат, а затем продолжайте».
 
-The `currentWorkAbortController` is distinct from the teammate's main abort controller. Aborting the current work controller cancels the teammate's ongoing turn but does not kill the teammate. This enables a "redirect" pattern: the leader sends a higher-priority message, the teammate's current work is aborted, and the teammate picks up the new message. The main abort controller, when aborted, kills the teammate entirely. Two levels of interruption for two levels of intent.
+`currentWorkAbortController` отличается от главного контроллера прерывания товарища по команде. Прерывание текущей работы контроллера отменяет текущий ход товарища по команде, но не убивает его. Это включает шаблон «перенаправления»: лидер отправляет сообщение с более высоким приоритетом, текущая работа товарища по команде прерывается, и товарищ по команде принимает новое сообщение. Главный контроллер прерывания при прерывании полностью убивает товарища по команде. Два уровня прерывания для двух уровней намерения.
 
-The `shutdownRequested` flag implements cooperative termination. When the leader sends a shutdown request, this flag is set. The teammate can check it at natural stopping points and wind down gracefully -- finishing its current file write, committing its changes, or sending a final status update. This is gentler than a hard kill, which might leave files in an inconsistent state.
+Флаг `shutdownRequested` реализует совместное завершение. Когда лидер отправляет запрос на выключение, этот флаг устанавливается. Товарищ по команде может проверить его в естественных точках остановки и плавно завершить работу — завершить запись текущего файла, зафиксировать изменения или отправить окончательное обновление статуса. Это более щадящий метод, чем жесткое удаление, которое может привести к тому, что файлы останутся в несогласованном State.
 
-### The Mailbox
+### Почтовый ящик
 
-Teammates communicate via a file-based mailbox system. When `SendMessage` targets a teammate, the message is written to the recipient's mailbox file on disk:
+Члены команды общаются через файловую систему почтовых ящиков. Когда `SendMessage` нацелен на товарища по команде, сообщение записывается в файл почтового ящика получателя на диске:
 
 ```typescript
 await writeToMailbox(recipientName, {
@@ -468,11 +468,11 @@ await writeToMailbox(recipientName, {
 }, teamName)
 ```
 
-Messages can be plain text, structured protocol messages (shutdown requests, plan approvals), or broadcasts (`to: "*"` sends to all team members excluding the sender). A poller hook processes incoming messages and routes them into the teammate's conversation.
+Сообщения могут быть обычным текстом, сообщениями структурированного протокола (запросы на отключение, утверждения плана) или широковещательными сообщениями (`to: "*"` отправляются всем членам команды, за исключением отправителя). Перехватчик опроса обрабатывает входящие сообщения и направляет их в разговор товарища по команде.
 
-The file-based approach is deliberately simple. There is no message broker, no event bus, no shared memory channel. Files are durable (surviving process crashes), inspectable (you can `cat` a mailbox), and cheap (no infrastructure dependencies). For a system where message volumes are measured in tens per session, not thousands per second, this is the right trade-off. A Redis-backed message queue would add operational complexity, a dependency, and failure modes -- all for a throughput requirement that a filesystem call handles trivially.
+Файловый подход намеренно прост. Здесь нет ни брокера сообщений, ни шины событий, ни канала общей memory. Файлы долговечны (выдерживают сбои процесса), доступны для проверки (вы можете `cat` почтовый ящик) и дешевы (нет зависимости от инфраструктуры). Для системы, где объемы сообщений измеряются десятками за сеанс, а не тысячами в секунду, это правильный компромисс. Очередь сообщений, поддерживаемая Redis, добавит операционную сложность, зависимость и режимы сбоя — и все это ради требований к пропускной способности, которые тривиально обрабатываются вызовом файловой системы.
 
-The broadcast mechanism deserves a note. When a message is sent to `"*"`, the sender iterates all team members from the team file, skips itself (case-insensitive comparison), and writes to each member's mailbox individually:
+Механизм вещания заслуживает внимания. Когда сообщение отправляется на `"*"`, отправитель перебирает всех членов команды из файла команды, пропускает себя (сравнение без учета регистра) и записывает в почтовый ящик каждого участника индивидуально:
 
 ```typescript
 for (const member of teamFile.members) {
@@ -484,11 +484,11 @@ for (const recipientName of recipients) {
 }
 ```
 
-There is no fan-out optimization -- each recipient gets a separate file write. Again, at the scale of agent teams (typically 3-8 members), this is perfectly adequate. If a team had 100 members, this would need rethinking. But the 50-message memory cap that prevents 36GB RSS scenarios also implicitly caps the effective team size.
+Оптимизация разветвления отсутствует — каждый получатель получает отдельную запись в файл. Опять же, в масштабе команды agents (обычно 3-8 человек) этого вполне достаточно. Если бы в команде было 100 человек, это нужно было бы переосмыслить. Но ограничение memory на 50 сообщений, которое предотвращает сценарии RSS размером 36 ГБ, также неявно ограничивает эффективный размер команды.
 
-### Permission Forwarding
+### Пересылка разрешений
 
-Swarm workers operate with restricted permissions but can escalate to the leader when they need approval for sensitive operations:
+Работники Swarm работают с ограниченными разрешениями, но могут перейти к лидеру, когда им нужно одобрение для конфиденциальных операций:
 
 ```typescript
 const request = createPermissionRequest({
@@ -498,15 +498,15 @@ registerPermissionCallback({ requestId, toolUseId, onAllow, onReject })
 void sendPermissionRequestViaMailbox(request)
 ```
 
-The flow is: worker hits a tool that requires permission, the bash classifier attempts auto-approval, and if that fails, the request is forwarded to the leader via the mailbox system. The leader sees the request in their UI and can approve or reject. The callback fires and the worker proceeds. This lets workers operate autonomously for safe operations while maintaining human oversight for dangerous ones.
+Схема такова: работник обращается к tool, требующему разрешения, классификатор bash пытается выполнить автоматическое одобрение, и если это не удается, запрос пересылается лидеру через систему почтовых ящиков. Лидер видит запрос в своем пользовательском интерфейсе и может одобрить или отклонить его. Обратный вызов срабатывает, и рабочий процесс продолжает работу. Это позволяет работникам работать автономно, обеспечивая безопасные операции, сохраняя при этом человеческий надзор за опасными.
 
 ---
 
-## Inter-Agent Communication: SendMessage
+## Inter-agent связь: SendMessage
 
-`SendMessageTool` is the universal communication primitive. It handles four distinct routing modes through a single tool interface, selected by the shape of the `to` field.
+`SendMessageTool` — универсальный коммуникационный примитив. Он поддерживает четыре различных режима маршрутизации через единый Tool interface, выбранный по форме поля `to`.
 
-### Input Schema
+### Схема ввода
 
 ```typescript
 inputSchema = z.object({
@@ -524,11 +524,11 @@ inputSchema = z.object({
 })
 ```
 
-The `message` field is a union of plain text and structured protocol messages. This means SendMessage serves double duty -- it is both the informal chat channel ("here are my findings") and the formal protocol layer ("I approve your plan" / "please shut down").
+Поле `message` представляет собой объединение обычного текста и структурированных протокольных сообщений. Это означает, что SendMessage выполняет двойную функцию — это одновременно неофициальный канал чата («вот мои выводы») и формальный уровень протокола («Я одобряю ваш план» / «пожалуйста, выключите»).
 
-### Routing Dispatch
+### Отправка маршрутизации
 
-The `call()` method follows a priority-ordered dispatch chain:
+Метод `call()` следует цепочке отправки в порядке приоритета:
 
 ```mermaid
 graph TD
@@ -551,30 +551,30 @@ graph TD
     style ERR fill:#f66
 ```
 
-**1. Bridge messages** (`bridge:<session-id>`). Cross-machine communication via Anthropic's Remote Control servers. This is the widest reach -- two Claude Code instances on different machines, potentially different continents, communicating through a relay. The system requires explicit user consent before sending bridge messages -- a safety check that prevents one agent from unilaterally establishing communication with a remote instance. Without this gate, a compromised or confused agent could exfiltrate information to a remote session. The consent check uses `postInterClaudeMessage()`, which handles serialization and transport over the Remote Control relay.
+**1. Сообщения моста** (`bridge:<session-id>`). Межмашинная связь через серверы удаленного управления Anthropic. Это самый широкий охват — два экземпляра Claude Code на разных машинах, потенциально на разных континентах, взаимодействующих через ретранслятор. Система требует явного согласия пользователя перед отправкой сообщений моста — проверка безопасности, которая не позволяет одному agent в одностороннем порядке установить связь с удаленным экземпляром. Без этого шлюза скомпрометированный или сбитый с толку agent может передать информацию в удаленный сеанс. Проверка согласия использует `postInterClaudeMessage()`, который управляет сериализацией и транспортировкой через реле удаленного управления.
 
-**2. UDS messages** (`uds:<socket-path>`). Local inter-process communication via Unix Domain Sockets. This is for Claude Code instances running on the same machine but in different processes -- for example, a VS Code extension hosting one instance and a terminal hosting another. UDS communication is fast (no network round-trip), secure (filesystem permissions control access), and reliable (the kernel handles delivery). The `sendToUdsSocket()` function serializes the message and writes it to the socket path specified in the `to` field. Peers discover each other via a `ListPeers` tool that scans for active UDS endpoints.
+**2. Сообщения UDS** (`uds:<socket-path>`). Локальное межпроцессное взаимодействие через сокеты домена Unix. Это касается экземпляров Claude Code, работающих на одном компьютере, но в разных процессах — например, расширение VS Code, на котором размещается один экземпляр, и терминал, на котором размещается другой. Связь UDS быстрая (без двустороннего обмена по сети), безопасная (права доступа к файловой системе контролируют доступ) и надежная (доставку осуществляет ядро). Функция `sendToUdsSocket()` сериализует сообщение и записывает его в путь к сокету, указанный в поле `to`. Пиры обнаруживают друг друга с помощью tool `ListPeers`, который сканирует активные конечные точки UDS.
 
-**3. In-process subagent routing** (plain name or agent ID). This is the most common path. The routing logic:
+**3. Внутрипроцессная маршрутизация sub-agent** (простое имя или идентификатор agent). Это самый распространенный путь. Логика маршрутизации:
 
-- Look up `input.to` in the `agentNameRegistry`
-- If found and running: `queuePendingMessage()` -- the message waits for the next tool-round boundary
-- If found but in a terminal state: `resumeAgentBackground()` -- the agent is transparently restarted
-- If not in `AppState`: attempt to resume from the disk transcript
+- Найдите `input.to` в `agentNameRegistry`.
+- Если найдено и запущено: `queuePendingMessage()` - сообщение ожидает следующей границы цикла tool.
+- Если найден, но в терминальном State: `resumeAgentBackground()` - agent прозрачно перезапускается.
+- Если не в `AppState`: попытайтесь возобновить работу с расшифровки диска.
 
-**4. Team mailbox** (fallback when team context is active). Named recipients get messages written to their mailbox files. The `"*"` wildcard triggers a broadcast to all team members.
+**4. Почтовый ящик группы** (резервный вариант, когда контекст группы активен). Именованные получатели получают сообщения, записанные в файлы их почтовых ящиков. Подстановочный знак `"*"` запускает широковещательную рассылку всем членам команды.
 
-### Structured Protocols
+### Структурированные протоколы
 
-Beyond plain text, SendMessage carries two formal protocols.
+Помимо обычного текста, SendMessage поддерживает два формальных протокола.
 
-**The shutdown protocol.** The leader sends `{ type: 'shutdown_request', reason: '...' }` to a teammate. The teammate responds with `{ type: 'shutdown_response', request_id, approve: true/false, reason }`. If approved, in-process teammates abort their controller; tmux-based teammates receive a `gracefulShutdown()` call. The protocol is cooperative -- a teammate can reject a shutdown request if it is in the middle of critical work, and the leader must handle that case.
+**Протокол отключения.** Лидер отправляет `{ type: 'shutdown_request', reason: '...' }` товарищу по команде. Товарищ по команде отвечает `{ type: 'shutdown_response', request_id, approve: true/false, reason }`. В случае одобрения члены команды в процессе прерывают работу своего контроллера; Товарищи по команде на основе tmux получают вызов `gracefulShutdown()`. Протокол является кооперативным: товарищ по команде может отклонить запрос на отключение, если он находится в процессе критической работы, и лидер должен разобраться с этим случаем.
 
-**The plan approval protocol.** Teammates operating in plan mode must get approval before executing. They submit a plan, and the leader responds with `{ type: 'plan_approval_response', request_id, approve, feedback }`. Only the team lead can issue approvals. This creates a review gate -- the leader can examine a worker's intended approach before any files are touched, catching misunderstandings early.
+**Протокол утверждения плана.** Товарищи по команде, работающие в режиме плана, должны получить одобрение перед выполнением. Они представляют план, и лидер отвечает `{ type: 'plan_approval_response', request_id, approve, feedback }`. Только руководитель группы может выдавать утверждения. Это создает возможность проверки — руководитель может изучить предполагаемый подход работника до того, как будут затронуты какие-либо файлы, что позволяет заранее выявить недоразумения.
 
-### The Auto-Resume Pattern
+### Шаблон автоматического возобновления
 
-The most elegant feature of the routing system is transparent agent resumption. When `SendMessage` targets a completed or killed agent, instead of returning an error, it resurrects the agent:
+Самая элегантная особенность системы маршрутизации — прозрачное возобновление работы agent. Когда `SendMessage` нацелен на завершенного или убитого agent, вместо возврата ошибки он воскрешает agent:
 
 ```typescript
 if (task.status !== 'running') {
@@ -593,26 +593,26 @@ if (task.status !== 'running') {
 }
 ```
 
-The `resumeAgentBackground()` function reconstructs the agent from its disk transcript:
+Функция `resumeAgentBackground()` восстанавливает agent по его дисковой расшифровке:
 
-1. Reads the sidechain JSONL transcript
-2. Reconstructs the message history, filtering orphaned thinking blocks and unresolved tool uses
-3. Rebuilds the content replacement state for prompt cache stability
-4. Resolves the original agent definition from stored metadata
-5. Re-registers as a background task with a fresh abort controller
-6. Calls `runAgent()` with the restored history plus the new message as prompt
+1. Считывает расшифровку JSONL боковой цепи.
+2. Реконструирует историю сообщений, фильтруя бесхозные блоки мышления и неразрешенное использование tools.
+3. Перестраивает State замены контента для стабильности Prompt Cache.
+4. Разрешает исходное определение agent из сохраненных метаданных.
+5. Перерегистрируется как фоновая Task с новым контроллером прерывания.
+6. Вызывает `runAgent()` с восстановленной историей и новым сообщением в качестве prompt.
 
-From the coordinator's perspective, sending a message to a dead agent and sending a message to a live agent are the same operation. The routing layer handles the complexity. This means coordinators do not need to track which agents are alive -- they simply send messages and the system figures it out.
+С точки зрения координатора, отправка сообщения мертвому agent и отправка сообщения живому agent — это одна и та же операция. Уровень маршрутизации справляется со всей сложностью. Это означает, что координаторам не нужно отслеживать, какие agents живы — они просто отправляют сообщения, а система это определяет.
 
-The implications are significant. Without auto-resume, the coordinator would need to maintain a mental model of agent liveness: "Is `researcher` still running? Let me check. It completed. I need to spawn a new agent. But wait, should I use the same name? Will it have the same context?" With auto-resume, all of that collapses to: "Send `researcher` a message." If it is alive, the message is queued. If it is dead, it is resurrected with its full history. The coordinator's prompt complexity drops dramatically.
+Последствия значительны. Без автоматического возобновления координатору пришлось бы поддерживать мысленную модель работоспособности agent: «`researcher` все еще работает? Позвольте мне проверить. Он завершен. Мне нужно создать нового agent. Но подождите, я должен использовать то же имя? Будет ли у него тот же контекст?» При автоматическом возобновлении все это сводится к следующему: «Отправить `researcher` сообщение». Если оно живо, сообщение ставится в очередь. Если он мертв, он воскресает со своей полной историей. Сложность оперативного реагирования координатора резко снижается.
 
-There is a cost, of course. Resuming from a disk transcript means re-reading potentially thousands of messages, reconstructing internal state, and making a new API call with a full context window. For a long-lived agent, this can be expensive in both latency and tokens. But the alternative -- requiring the coordinator to manually manage agent lifecycles -- is worse. The coordinator is an LLM. It is good at reasoning about problems and writing instructions. It is bad at bookkeeping. Auto-resume plays to the LLM's strengths by eliminating a category of bookkeeping entirely.
+Конечно, есть цена. Возобновление записи с диска означает перечитывание потенциально тысяч сообщений, восстановление внутреннего State и выполнение нового вызова API с полным контекстным окном. Для долгоживущего agent это может быть дорого как с точки зрения задержки, так и с точки зрения токенов. Но альтернатива, требующая от координатора ручного управления жизненными циклами agents, еще хуже. Координатор — LLM. Хорошо рассуждает о проблемах и пишет инструкции. С бухгалтерией дела обстоят плохо. Автоматическое возобновление играет на сильных сторонах LLM, полностью устраняя категорию бухгалтерского учета.
 
 ---
 
-## TaskStop: The Kill Switch
+## TaskStop: аварийный выключатель
 
-`TaskStopTool` is the complement to Agent and SendMessage -- it terminates running tasks:
+`TaskStopTool` является дополнением к Agent и SendMessage и завершает запущенные Task:
 
 ```typescript
 inputSchema = z.strictObject({
@@ -621,79 +621,79 @@ inputSchema = z.strictObject({
 })
 ```
 
-The implementation delegates to `stopTask()`, which dispatches based on task type:
+Реализация делегирует `stopTask()`, который выполняет диспетчеризацию в зависимости от типа Task:
 
-1. Look up the task in `AppState.tasks`
-2. Call `getTaskByType(task.type).kill(taskId, setAppState)`
-3. For agents: abort the controller, set status to `'killed'`, start the eviction timer
-4. For shells: kill the process group
+1. Найдите Task в `AppState.tasks`.
+2. Позвоните по номеру `getTaskByType(task.type).kill(taskId, setAppState)`.
+3. Для agents: прервать работу контроллера, установить статус `'killed'`, запустить таймер выселения.
+4. Для оболочек: убить группу процессов
 
-The tool has a legacy alias `"KillShell"` -- a reminder that the task system evolved from simpler origins where the only background operation was a shell command.
+Tool имеет устаревший псевдоним `"KillShell"` — напоминание о том, что система Task возникла из более простого источника, где единственной фоновой операцией была команда оболочки.
 
-The kill mechanism varies by task type, but the pattern is consistent. For agents, killing means aborting the abort controller (which causes the `query()` loop to exit at the next yield point), setting the status to `'killed'`, and starting an eviction timer so the task state is cleaned up after a grace period. For shells, killing means sending a signal to the process group -- `SIGTERM` first, then `SIGKILL` if the process does not exit within a timeout. For in-process teammates, killing also triggers a shutdown notification to the team so other members know the teammate is gone.
+Механизм уничтожения зависит от типа Task, но схема одинакова. Для agents уничтожение означает прерывание контроллера прерывания (что приводит к завершению цикла `query()` в следующей точке выхода), установку статуса на `'killed'` и запуск таймера вытеснения, чтобы State Task очищалось после льготного периода. Для оболочек уничтожение означает отправку сигнала группе процессов — сначала `SIGTERM`, затем `SIGKILL`, если процесс не завершается в течение таймаута. Для членов команды, находящихся в процессе, убийство также вызывает уведомление о завершении работы команды, чтобы другие участники знали, что товарищ по команде ушел.
 
-The eviction timer is worth noting. When an agent is killed, its state is not immediately purged. It lingers in `AppState.tasks` for a grace period (controlled by `evictAfter`) so that the UI can show the killed status, any final output can be read, and auto-resume via SendMessage remains possible. After the grace period, the state is garbage collected. This is the same pattern used for completed tasks -- the system distinguishes between "finished" (result available) and "forgotten" (state purged).
+Стоит обратить внимание на таймер выселения. Когда agent убит, его State не очищается немедленно. Он задерживается в `AppState.tasks` на льготный период (контролируемый `evictAfter`), чтобы UI мог отображать статус завершения, можно было прочитать любой окончательный вывод, а автоматическое возобновление через SendMessage оставалось возможным. По истечении льготного периода State очищается от мусора. Это тот же шаблон, который используется для завершенных Task — система различает «завершенные» (результат доступен) и «забытые» (State очищено).
 
 ---
 
-## Choosing Between Patterns
+## Выбор между шаблонами
 
-(A note on naming: the codebase also contains `TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate` tools that manage a structured todo list -- a completely separate system from the background task state machine described here. `TaskStop` operates on `AppState.tasks`; `TaskUpdate` operates on a project tracking data store. The naming overlap is historical and a recurring source of model confusion.)
+(Примечание по именованию: кодовая база также содержит tools `TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`, которые управляют структурированным списком Task - совершенно отдельная система от описанного здесь конечного автомата фоновой Task. `TaskStop` работает на `AppState.tasks`; `TaskUpdate` работает с хранилищем данных отслеживания проектов. Перекрытие имен является историческим и является постоянным источником путаницы в моделях.)
 
-With three orchestration patterns available -- background delegation, coordinator mode, and swarm teams -- the natural question is when to use each.
+Имея три доступных шаблона оркестровки — фоновое делегирование, Coordinator Mode и групповые команды — возникает естественный вопрос, когда использовать каждый из них.
 
-**Simple delegation** (Agent tool with `run_in_background: true`) is appropriate when the parent has one or two independent tasks to offload. Run the tests in the background while continuing to edit. Search the codebase while waiting for a build. The parent stays in control, checks results when ready, and never needs a complex communication protocol. The overhead is minimal -- one task state entry, one disk output file, one notification on completion.
+**Простое делегирование** (tool «Agent» с `run_in_background: true`) подходит, когда у родительского объекта есть одна или две независимые tasks, которые нужно разгрузить. Запустите тесты в фоновом режиме, продолжая редактировать. Выполните поиск в базе кода во время ожидания сборки. Родитель сохраняет контроль, проверяет результаты, когда они готовы, и ему никогда не нужен сложный протокол связи. Накладные расходы минимальны — одна запись о State Task, один выходной файл на диске, одно уведомление о завершении.
 
-**Coordinator mode** is appropriate when the problem decomposes into a research phase, a synthesis phase, and an implementation phase -- and when the coordinator needs to reason across the results of multiple workers before directing the next step. The coordinator cannot touch files, which forces clean separation of concerns: thinking happens in one context, doing happens in another. The 370-line system prompt is not ceremony -- it encodes patterns that prevent the most common failure mode of LLM delegation, which is delegating comprehension instead of delegating action.
+**Coordinator Mode** подходит, когда проблема распадается на этап исследования, этап синтеза и этап реализации, а также когда координатору необходимо проанализировать результаты нескольких работников, прежде чем направлять следующий шаг. Координатор не может прикасаться к файлам, что требует четкого разделения Task: мышление происходит в одном контексте, действие — в другом. Системное prompt из 370 строк не является церемониальным — оно кодирует шаблоны, которые предотвращают наиболее распространенный вариант отказа при делегировании LLM, который заключается в делегировании понимания вместо делегирования действий.
 
-**Swarm teams** are appropriate for long-running collaborative sessions where agents need peer-to-peer communication, where the work is ongoing rather than batch-oriented, and where agents may need to idle and resume based on incoming messages. The mailbox system supports asynchronous patterns that coordinator mode (which is synchronous spawn-wait-synthesize) does not. Plan approval gates add a review layer. Permission forwarding maintains security without requiring every agent to have full privileges.
+**Группы** подходят для длительных сеансов совместной работы, когда agents требуется одноранговая связь, когда работа продолжается, а не batchно, и когда agents может потребоваться приостановить работу и возобновить работу на основе входящих сообщений. Система почтовых ящиков поддерживает асинхронные шаблоны, которых нет в Coordinator Mode (синхронный запуск-ожидание-синтез). Шлюзы утверждения плана добавляют уровень проверки. Пересылка разрешений обеспечивает безопасность, не требуя от каждого agent полных привилегий.
 
-A practical decision table:
+Таблица практических решений:
 
-| Scenario | Pattern | Why |
+| Сценарий | Узор | Почему |
 |----------|---------|-----|
-| Run tests while editing | Simple delegation | One background task, no coordination needed |
-| Search codebase for all usages | Simple delegation | Fire-and-forget, read output when done |
-| Refactor 40 files across 3 modules | Coordinator | Research phase finds patterns, synthesis plans changes, workers execute in parallel per module |
-| Multi-day feature development with review gates | Swarm | Long-lived agents, plan approval protocol, peer communication |
-| Fix a bug with known location | Neither -- single agent | Orchestration overhead exceeds the benefit for focused, sequential work |
-| Migrate database schema + update API + update frontend | Coordinator | Three independent workstreams after a shared research/planning phase |
-| Pair programming with user oversight | Swarm with plan mode | Worker proposes, leader approves, worker executes |
+| Запуск тестов во время редактирования | Простое делегирование | Одна фоновая Task, координация не требуется |
+| Поиск по кодовой базе для всех вариантов использования | Простое делегирование | «Выстрелил и забыл», прочитай вывод по завершении |
+| Рефакторинг 40 файлов в 3 модулях | Координатор | На этапе исследования выявляются закономерности, планы синтеза меняются, рабочие выполняют параллельно каждый модуль |
+| Многодневная разработка функций с возможностью просмотра | Рой | Agents-долгожители, протокол утверждения плана, общение между коллегами |
+| Исправить ошибку с известным местоположением | Ни один - единственный agent | Накладные расходы на оркестровку превышают выгоду от целенаправленной и последовательной работы |
+| Перенести схему базы данных + обновить API + обновить интерфейс | Координатор | Три независимых рабочих потока после общего этапа исследования/планирования |
+| Парное программирование с контролем пользователя | Рой в режиме планирования | Рабочий предлагает, лидер одобряет, рабочий выполняет |
 
-The patterns are not mutually exclusive in principle, but they are in practice. Coordinator mode disables fork subagents. Swarm teams have their own communication protocol that does not mix with coordinator task notifications. The choice is made at session startup via environment variables and feature flags, and it shapes the entire interaction model.
+Эти закономерности не являются взаимоисключающими в принципе, но на практике они существуют. Coordinator Mode отключает подagents ответвления. У команд Swarm есть собственный протокол связи, который не смешивается с уведомлениями о Task координатора. Выбор осуществляется при запуске сеанса с помощью переменных среды и флагов функций и формирует всю модель взаимодействия.
 
-One final observation: the simplest pattern is almost always the right starting point. Most tasks do not need coordinator mode or swarm teams. A single agent with occasional background delegation handles the vast majority of development work. The sophisticated patterns exist for the 5% of cases where the problem is genuinely wide, genuinely parallel, or genuinely long-running. Reaching for coordinator mode on a single-file bug fix is like deploying Kubernetes for a static website -- technically possible, architecturally inappropriate.
-
----
-
-## The Cost of Orchestration
-
-Before examining what the orchestration layer reveals philosophically, it is worth acknowledging what it costs practically.
-
-Every background agent is a separate API conversation. It has its own context window, its own token budget, and its own prompt cache slot. A coordinator that spawns 5 research workers is making 6 concurrent API calls, each with its own system prompt, tool definitions, and CLAUDE.md injection. The token overhead is not trivial -- the system prompt alone can be thousands of tokens, and each worker re-reads files that other workers may have already read.
-
-The communication channels add latency. Disk output files require filesystem I/O. Task notifications are delivered at tool-round boundaries, not instantly. The command queue introduces a full round-trip delay -- the coordinator sends a message, the message waits for the worker to finish its current tool use, the worker processes the message, and the result is written to disk for the coordinator to read.
-
-The state management adds complexity. Seven task types, five statuses, and dozens of fields per task state. The eviction logic, the garbage collection timers, the memory caps -- all of this exists because unbounded state growth caused real production incidents (36.8GB RSS).
-
-None of this means orchestration is wrong. It means orchestration is a tool with a cost, and the cost should be weighed against the benefit. Running 5 parallel workers to search a codebase is worthwhile when the search would take 5 sequential minutes. Running a coordinator to fix a typo in one file is pure overhead.
+И последнее наблюдение: самый простой шаблон почти всегда является правильной отправной точкой. Для большинства Task не требуется Coordinator Mode или групповая команда. Подавляющую часть работы по разработке выполняет один agent, которому время от времени делегируются полномочия. Сложные модели существуют для 5% случаев, когда проблема действительно широка, действительно параллельна или действительно долгосрочна. Использование Coordinator Mode при исправлении ошибки в одном файле похоже на развертывание Kubernetes для статического веб-сайта — технически возможно, но архитектурно нецелесообразно.
 
 ---
 
-## What the Orchestration Layer Reveals
+## Стоимость оркестрации
 
-The most interesting aspect of this system is not any individual mechanism -- task states, mailboxes, and notification XML are all straightforward engineering. What is interesting is the *design philosophy* that emerges from how they fit together.
+Прежде чем исследовать, что именно раскрывает уровень оркестровки с философской точки зрения, стоит признать, чего это стоит на практике.
 
-The coordinator prompt's "never delegate understanding" is not just good advice for LLM orchestration. It is a statement about the fundamental limitation of context-window-based reasoning. A worker with a fresh context window cannot understand what the coordinator understood after reading 50 files and synthesizing three research reports. The only way to bridge that gap is for the coordinator to distill its understanding into a specific, actionable prompt. Vague delegation is not just inefficient -- it is information-theoretically lossy.
+Каждый фоновый agent представляет собой отдельный диалог API. У него есть собственное контекстное окно, собственный бюджет токенов и собственный слот Prompt Cache. Координатор, который порождает 5 исследователей, выполняет 6 одновременных вызовов API, каждый со своей собственной системной prompt, определениями tools и внедрением CLAUDE.md. Затраты на использование токенов нетривиальны: одно только System Prompt может содержать тысячи токенов, и каждый рабочий процесс перечитывает файлы, которые, возможно, уже прочитали другие рабочие процессы.
 
-The auto-resume pattern in SendMessage reveals a preference for *apparent simplicity over actual simplicity*. The implementation is complex -- reading disk transcripts, reconstructing content replacement state, re-resolving agent definitions. But the interface is trivial: send a message, and it works regardless of whether the recipient is alive or dead. The complexity is absorbed by the infrastructure so that the model (and the user) can reason in simpler terms.
+Каналы связи добавляют задержку. Выходные файлы на диске требуют ввода-вывода файловой системы. Уведомления о Task доставляются на границах цикла работы tool, а не мгновенно. Очередь команд вводит полную двустороннюю задержку: координатор отправляет сообщение, сообщение ждет, пока исполнитель завершит текущее использование tool, работник обрабатывает сообщение, а результат записывается на диск для чтения координатором.
 
-And the 50-message memory cap on in-process teammates is a reminder that orchestration systems operate under real physical constraints. 292 agents in 2 minutes reaching 36.8GB of RSS is not a theoretical concern -- it happened in production. The abstractions are elegant, but they run on hardware with finite memory, and the system must degrade gracefully when users push it to extremes.
+Управление State добавляет сложности. Семь типов Task, пять статусов и десятки полей для каждого State Task. Логика вытеснения, таймеры сбора мусора, ограничения memory — все это существует потому, что неограниченный рост State вызывает реальные производственные инциденты (36,8 ГБ RSS).
 
-There is also a lesson in the layered architecture itself. The task state machine is agnostic -- it does not know about coordinators or swarms. The communication channels are agnostic -- SendMessage does not know whether it is being called by a coordinator, a swarm leader, or a standalone agent. The coordinator prompt is layered on top, adding methodology without changing the underlying machinery. Each layer can be understood independently, tested independently, and evolved independently. When the team added the swarm system, they did not need to modify the task state machine. When they added the coordinator prompt, they did not need to modify SendMessage.
+Ничто из этого не означает, что оркестровка неправильная. Это означает, что оркестрация — это tool, требующий затрат, и стоимость следует сопоставлять с выгодой. Запускать 5 параллельных воркеров для поиска в базе кода имеет смысл, если поиск займет 5 минут подряд. Запускать координатор для исправления опечатки в одном файле — это чистые накладные расходы.
 
-This is the hallmark of well-factored orchestration: the primitives are general, and the patterns are composed from them. A coordinator is just an agent with restricted tools and a detailed system prompt. A swarm leader is just an agent with a team context and mailbox access. A background worker is just an agent with an independent abort controller and a disk output file. The seven task types, five statuses, and four routing modes combine to produce orchestration patterns that are greater than the sum of their parts.
+---
 
-The orchestration layer is where Claude Code stops being a single-threaded tool executor and becomes something closer to a development team. The task state machine provides the bookkeeping. The communication channels provide the information flow. The coordinator prompt provides the methodology. And the swarm system provides the peer-to-peer topology for problems that do not fit a strict hierarchy. Together, they make it possible for a language model to do what no single model invocation can: work on wide problems, in parallel, with coordination.
+## Что показывает уровень оркестрации
 
-The next chapter examines the permission system -- the safety layer that determines which of these agents can do what, and how dangerous operations are escalated from workers to humans. Orchestration without permission controls would be a force multiplier for mistakes. The permission system ensures that more agents means more capability, not more risk.
+Самым интересным аспектом этой системы является не какой-либо отдельный механизм: State Task, почтовые ящики и уведомления XML — все это простые инженерные решения. Что интересно, так это *философия дизайна*, которая возникает из того, как они сочетаются друг с другом.
+
+prompt координатора «никогда не делегируйте понимание» — это не просто хороший совет для оркестровки LLM. Это утверждение о фундаментальном ограничении рассуждений, основанных на контекстных окнах. Работник со свежим контекстным окном не может понять, что понял координатор после прочтения 50 файлов и синтеза трех исследовательских отчетов. Единственный способ восполнить этот пробел — для координатора превратить свое понимание в конкретную, действенную prompt. Расплывчатое делегирование не просто неэффективно — оно приводит к потерям информации с точки зрения теории.
+
+Шаблон автоматического возобновления в SendMessage показывает предпочтение *кажущейся простоты фактической простоте*. Реализация сложна: чтение транскриптов диска, восстановление State замены контента, повторное разрешение определений agent. Но интерфейс тривиален: отправляешь сообщение, и оно работает независимо от того, жив получатель или мертв. Сложность поглощается инфраструктурой, поэтому модель (и пользователь) могут рассуждать проще.
+
+А ограничение memory на 50 сообщений для участников команды является напоминанием о том, что системы оркестрации работают в условиях реальных физических ограничений. 292 agent за 2 минуты, достигающие 36,8 ГБ RSS, не являются теоретической проблемой — это произошло в производственных условиях. Абстракции элегантны, но они работают на оборудовании с ограниченным объемом memory, и система должна плавно ухудшаться, когда пользователи доводят ее до крайности.
+
+Есть также урок в самой многоуровневой архитектуре. Конечный автомат task является агностическим — он не знает ни координаторов, ни роев. Каналы связи независимы: SendMessage не знает, вызывается ли он координатором, лидером группы или автономным agent. prompt координатора располагается сверху, добавляя методологию без изменения основного механизма. Каждый уровень можно понимать независимо, тестировать независимо и развивать независимо. Когда команда добавила роевую систему, им не пришлось модифицировать конечный автомат Task. Когда они добавили prompt координатора, им не нужно было изменять SendMessage.
+
+Это отличительная черта хорошо продуманной оркестровки: примитивы являются общими, а шаблоны состоят из них. Координатор — это всего лишь agent с ограниченными tools и подробной системной prompt. Лидер роя — это просто agent с командным контекстом и доступом к почтовому ящику. Фоновый рабочий процесс — это просто agent с независимым контроллером прерывания и выходным файлом на диске. Семь типов Task, пять статусов и четыре режима маршрутизации в совокупности создают шаблоны оркестровки, которые превосходят сумму их частей.
+
+На уровне оркестровки Claude Code перестает быть однопоточным исполнителем tool и становится чем-то ближе к команде разработчиков. Конечный автомат Task обеспечивает ведение бухгалтерского учета. Каналы связи обеспечивают поток информации. prompt координатора предоставляет методологию. А роевая система обеспечивает одноранговую топологию для tasks, которые не укладываются в строгую иерархию. Вместе они позволяют языковой модели делать то, что не может сделать ни один отдельный вызов модели: работать над широкими tasks параллельно и с координацией.
+
+В следующей главе рассматривается Permission System — уровень безопасности, который определяет, кто из этих agents что может делать, и как опасные операции передаются от рабочих к людям. Оркестровка без контроля разрешений будет увеличивать вероятность ошибок. Permission System гарантирует, что больше agents означает больше возможностей, а не больше риска.

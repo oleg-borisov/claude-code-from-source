@@ -1,18 +1,18 @@
-# Chapter 2: Starting Fast -- The Bootstrap Pipeline
+# Глава 2: Начинаем быстро — конвейер начальной загрузки
 
-If Chapter 1 gave you the map of Claude Code's architecture, this chapter gives you the route it takes to reach a working state. Every component from the six abstractions -- the query loop, the tool system, the state layers, hooks, memory -- must be initialized before the user sees a cursor. The budget for all of it: 300 milliseconds.
+Если в главе 1 вам была представлена ​​карта архитектуры Claude Code, то в этой главе описан путь достижения рабочего State. Каждый компонент из шести абстракций — Query Loop, Tool System, уровни State, hooks, memory — должен быть инициализирован до того, как пользователь увидит курсор. Бюджет на все это: 300 миллисекунд.
 
-Three hundred milliseconds is the threshold where humans perceive a tool as instant. Cross it, and the CLI feels sluggish. Miss it by a lot, and developers stop using it. Everything in this chapter exists to stay under that line.
+Триста миллисекунд — это порог, при котором люди воспринимают tool как мгновенный. Пересеките его, и CLI станет вялым. Многие его пропускают, и разработчики перестают его использовать. Все в этой главе создано для того, чтобы оставаться в рамках этой линии.
 
-Bootstrap must accomplish four things: validate the environment, establish security boundaries, configure the communication layer, and render the UI. It must do all four in under 300ms. The architectural insight is that these four jobs can be partially overlapped, carefully ordered, and aggressively pruned to fit inside a budget that feels impossible for a system this complex.
+Bootstrap должен выполнить четыре Task: проверить среду, установить границы безопасности, настроить уровень связи и отобразить UI. Он должен сделать все четыре менее чем за 300 мс. Идея архитектуры заключается в том, что эти четыре работы можно частично перекрывать, тщательно упорядочивать и агрессивно сокращать, чтобы уложиться в бюджет, который кажется невозможным для такой сложной системы.
 
-A note on methodology: the timestamps in this chapter are approximate, derived from the codebase's own profiling checkpoints. They represent typical warm-start timings on modern hardware. Cold starts are slower. The absolute numbers matter less than the relative structure: which operations overlap, which block, and which are deferred.
+Примечание по методологии: временные метки в этой главе являются приблизительными и получены на основе собственных контрольных точек профилирования кодовой базы. Они представляют собой типичные значения времени горячего старта на современном оборудовании. Холодный запуск происходит медленнее. Абсолютные числа имеют меньшее значение, чем относительная структура: какие операции перекрываются, какой блок, а какие отложены.
 
 ---
 
-## The Shape of the Pipeline
+## Форма трубопровода
 
-The startup pipeline lives in five files, executed in sequence. Each file narrows the scope of what the system needs to do next:
+Конвейер запуска состоит из пяти файлов, которые выполняются последовательно. Каждый файл сужает круг того, что системе необходимо делать дальше:
 
 ```mermaid
 flowchart TD
@@ -26,23 +26,23 @@ flowchart TD
     style REPL fill:#9f9,stroke:#333
 ```
 
-Each file does the minimum work necessary before passing control to the next. `cli.tsx` tries to exit before importing anything heavy. `main.tsx` fires slow operations as side effects during import evaluation. `init.ts` resolves configuration and establishes the trust boundary. `setup.ts` registers capabilities. `replLauncher.ts` picks the right entry point and starts the UI.
+Каждый файл выполняет минимальную необходимую работу, прежде чем передать управление следующему. `cli.tsx` пытается выйти, прежде чем импортировать что-либо тяжелое. `main.tsx` запускает медленные операции как побочный эффект во время оценки импорта. `init.ts` разрешает конфигурацию и устанавливает границу доверия. `setup.ts` регистрирует возможности. `replLauncher.ts` выбирает правильную точку входа и запускает UI.
 
-Three parallelism strategies make this fast:
+Три стратегии параллелизма позволяют сделать это быстро:
 
-1. **Module-level subprocess dispatch.** Fire keychain and MDM reads as side effects *during import evaluation*. The subprocesses run while the remaining ~135ms of static imports load.
-2. **Promise parallelism in setup.** Socket binding, hook snapshotting, command loading, and agent definition loading all run concurrently.
-3. **Post-render deferred prefetches.** Everything the user does not need before typing their first message -- git status, model capabilities, AWS credentials -- runs after the prompt is visible.
+1. **Отправка подпроцесса на уровне модуля.** Связка ключей Fire и MDM читаются как побочные эффекты *во время оценки импорта*. Подпроцессы выполняются, пока загружаются оставшиеся ~135 мс статического импорта.
+2. **Обещайте параллелизм при установке.** Привязка сокетов, создание моментальных снимков hooks, загрузка команд и загрузка определений agent выполняются одновременно.
+3. **Отложенная предварительная выборка после рендеринга.** Все, что пользователю не нужно перед вводом первого сообщения — статус git, возможности модели, учетные данные AWS — запускается после того, как отображается prompt.
 
-A fourth strategy is less visible but equally important: **dynamic imports to defer module evaluation**. The codebase uses `await import('./module.js')` in at least a dozen places to avoid loading code until it is needed. OpenTelemetry (400KB + 700KB gRPC) loads only when telemetry initializes. React components load only when rendering. Each dynamic import trades cold-path latency (first use triggers module evaluation) for hot-path speed (startup does not pay for modules it might never use).
+Четвертая стратегия менее заметна, но не менее важна: **динамический импорт для отсрочки оценки модуля**. Кодовая база использует `await import('./module.js')` как минимум в десятке мест, чтобы избежать загрузки кода до тех пор, пока он не понадобится. OpenTelemetry (400 КБ + 700 КБ gRPC) загружается только при инициализации телеметрии. Компоненты React загружаются только при рендеринге. Каждый динамический импорт меняет задержку холодного пути (первое использование запускает оценку модуля) на скорость горячего пути (запуск не платит за модули, которые он может никогда не использовать).
 
 ---
 
-## Phase 0: Fast-Path Dispatch (cli.tsx)
+## Фаза 0: Ускоренная отправка (cli.tsx)
 
-The first file the process enters, `cli.tsx`, has one job: determine whether the full bootstrap pipeline is needed at all. Many invocations -- `claude --version`, `claude --help`, `claude mcp list` -- need a specific answer and nothing else. Loading React, initializing telemetry, reading the keychain, and setting up the tool system would be pure waste.
+Первый файл, который вводит процесс, `cli.tsx`, выполняет одну Task: определить, нужен ли вообще полный конвейер начальной загрузки. Многие вызовы — `claude --version`, `claude --help`, `claude mcp list` — требуют конкретного ответа и ничего больше. Загрузка React, инициализация телеметрии, чтение цепочки для ключей и настройка Tool System были бы пустой тратой времени.
 
-The pattern is: check `argv`, dynamically import only the handler you need, and exit before the rest of the system loads.
+Схема такая: проверьте `argv`, динамически импортируйте только тот обработчик, который вам нужен, и выйдите до загрузки остальной части системы.
 
 ```typescript
 // Pseudocode for the fast-path pattern
@@ -53,17 +53,17 @@ if (args.length === 1 && args[0] === '--version') {
 }
 ```
 
-There are roughly a dozen fast paths covering version, help, configuration, MCP server management, and update checks. The specifics do not matter -- the pattern does. Each path dynamically imports exactly one module, calls one function, and exits. The rest of the codebase never loads.
+Существует около дюжины быстрых способов, охватывающих версию, справку, настройку, управление сервером MCP и проверку обновлений. Детали не имеют значения, важен шаблон. Каждый путь динамически импортирует ровно один модуль, вызывает одну функцию и завершает работу. Остальная часть кодовой базы никогда не загружается.
 
-This is the first instance of a principle that recurs throughout bootstrap: **do less by knowing more about intent**. The argv array reveals the user's intent. If the intent is narrow, the execution path should be narrow too.
+Это первый пример принципа, который повторяется на протяжении всей начальной загрузки: **делайте меньше, зная больше о намерениях**. Массив argv раскрывает намерения пользователя. Если намерение узкое, путь выполнения тоже должен быть узким.
 
-If no fast path matches, `cli.tsx` falls through to the full `main.tsx` import, and the real startup begins.
+Если ни один быстрый путь не соответствует, `cli.tsx` переходит к полному импорту `main.tsx`, и начинается настоящий запуск.
 
 ---
 
-## Phase 1: Module-Level I/O (main.tsx)
+## Этап 1: ввод-вывод на уровне модуля (main.tsx)
 
-When `main.tsx` is imported, its module-level side effects fire during evaluation -- before any function in the file is called. This is the most performance-critical technique in the entire bootstrap:
+При импорте `main.tsx` его побочные эффекты на уровне модуля срабатывают во время оценки — до вызова какой-либо функции в файле. Это наиболее критичный к производительности метод во всей начальной загрузке:
 
 ```typescript
 // These run at import time, not at call time
@@ -71,23 +71,23 @@ const mdmPromise = startMDMSubprocess()
 const keychainPromise = readKeychainCredentials()
 ```
 
-While the JavaScript engine evaluates the rest of `main.tsx` and its transitive imports (~138ms of module evaluation), these two promises are already in flight. The MDM (Mobile Device Management) subprocess checks organizational security policies. The keychain read fetches stored credentials. Both are I/O-bound operations that would otherwise serialize on the critical path.
+Пока движок JavaScript оценивает остальную часть `main.tsx` и его транзитивный импорт (~138 мс оценки модуля), эти два обещания уже выполняются. Подпроцесс MDM (управление мобильными устройствами) проверяет политики безопасности организации. Чтение связки ключей извлекает сохраненные учетные данные. Обе операции связаны с вводом-выводом, которые в противном случае сериализовались бы на критическом пути.
 
-The insight: module evaluation is not idle time -- it is time you can overlap with I/O. By the time `main.tsx`'s exported functions are first called, these promises are often already resolved.
+Вывод: оценка модуля — это не простое время, пришло время перекрывать операции ввода-вывода. К моменту первого вызова экспортированных функций `main.tsx` эти обещания часто уже решены.
 
-This technique requires suppressing ESLint's top-level-await and side-effect-in-module-scope rules in the relevant files. The codebase has a custom ESLint rule specifically for `process.env` access patterns that allows controlled side effects at module scope while preventing uncontrolled ones elsewhere.
+Этот метод требует подавления правил ESLint верхнего уровня await и побочных эффектов в области модуля в соответствующих файлах. В базе кода имеется специальное правило ESLint специально для шаблонов доступа `process.env`, которое позволяет контролировать побочные эффекты в области модуля и предотвращает неконтролируемые в других местах.
 
 ---
 
-## Phase 2: Parse and Trust (init.ts)
+## Этап 2: Анализ и доверие (init.ts)
 
-The `init()` function is memoized -- calling it multiple times is safe and returns the same result. This is important because multiple entry points (the REPL, print mode, SDK mode) may each call `init()`, and the memoization guarantees it runs exactly once.
+Функция `init()` запоминается: вызов ее несколько раз безопасен и возвращает один и тот же результат. Это важно, поскольку каждая из нескольких точек входа (REPL, режим печати, режим SDK) может вызвать `init()`, и функция запоминания гарантирует, что она запустится ровно один раз.
 
-The function resolves command-line arguments via Commander, loads configuration from multiple sources (global settings, project settings, environment variables), and then hits the most important boundary in the pipeline.
+Функция разрешает аргументы командной строки через Commander, загружает конфигурацию из нескольких источников (глобальные настройки, настройки проекта, переменные среды), а затем достигает самой важной границы в конвейере.
 
-### The Trust Boundary
+### Граница доверия
 
-Before the trust boundary, the system operates in a restricted mode. After it, full capabilities are available. The boundary exists because Claude Code reads environment variables -- and environment variables can be poisoned.
+До границы доверия система работает в ограниченном режиме. После него доступны полные возможности. Граница существует, потому что Claude Code считывает переменные среды, а переменные среды могут быть отравлены.
 
 ```mermaid
 sequenceDiagram
@@ -112,13 +112,13 @@ sequenceDiagram
     S->>S: Reset feature flags
 ```
 
-The trust boundary is not about the user trusting Claude Code. It is about Claude Code trusting the *environment*. A malicious `.bashrc` could set `LD_PRELOAD` to inject code into every subprocess. The trust dialog ensures the user explicitly consents to operating in a directory that may have been configured by someone else.
+Граница доверия не связана с тем, что пользователь доверяет Claude Code. Речь идет о Claude Code доверии *окружению*. Вредоносный `.bashrc` может настроить `LD_PRELOAD` на внедрение кода в каждый подпроцесс. Диалог доверия гарантирует, что пользователь явно соглашается работать в каталоге, который мог быть настроен кем-то другим.
 
-The system has ten distinct trust-sensitive operations. Before the user accepts the trust dialog, only safe operations run: TLS certificate configuration, theme preferences, telemetry opt-out. After trust, the system reads potentially dangerous environment variables (PATH, LD_PRELOAD, NODE_OPTIONS), executes git commands, and applies the full environment configuration.
+Система имеет десять различных операций, чувствительных к доверию. Прежде чем пользователь примет диалоговое окно доверия, выполняются только безопасные операции: настройка сертификата TLS, настройки темы, отказ от телеметрии. После установления доверия система считывает потенциально опасные переменные среды (PATH, LD_PRELOAD, NODE_OPTIONS), выполняет команды git и применяет полную конфигурацию среды.
 
-### The preAction Hook
+### Hook preAction
 
-Commander's `preAction` hook is the architectural linchpin. Commander parses the command structure (flags, subcommands, positional arguments) *without* executing anything. The `preAction` hook fires after parsing but before the matched command handler runs:
+Крюк Commander `preAction` является стержнем архитектуры. Commander анализирует структуру команды (флаги, подкоманды, позиционные аргументы) *не* ничего не выполняя. Hook `preAction` срабатывает после анализа, но до запуска соответствующего обработчика команды:
 
 ```typescript
 program.hook('preAction', async (thisCommand) => {
@@ -126,13 +126,13 @@ program.hook('preAction', async (thisCommand) => {
 })
 ```
 
-This separation means fast-path commands (handled in `cli.tsx` before Commander loads) never pay the `init()` cost. Only commands that need the full environment trigger initialization.
+Такое разделение означает, что команды быстрого пути (обрабатываемые в `cli.tsx` до загрузки Commander) никогда не оплачивают стоимость `init()`. Инициализацию запускают только команды, которым требуется полная среда.
 
 ---
 
-## Phase 3: Setup (setup.ts)
+## Этап 3: Настройка (setup.ts)
 
-After `init()` completes, `setup()` registers all the capabilities the system needs:
+После завершения работы `init()` `setup()` регистрирует все возможности, необходимые системе:
 
 ```mermaid
 gantt
@@ -149,29 +149,29 @@ gantt
     MCP server connections :5, 25
 ```
 
-Commands, agents, hooks, and plugins all register in parallel where possible. The setup phase is where the system transitions from "I know my configuration" to "I have all my capabilities." After setup, every tool is registered, every hook is wired, and the system is ready to handle user input.
+Команды, agents, hooks и плагины регистрируются параллельно, где это возможно. На этапе настройки система переходит от «Я знаю свою конфигурацию» к «У меня есть все мои возможности». После настройки каждый tool зарегистрирован, каждый hook подключен, и система готова обрабатывать ввод данных пользователем.
 
-Setup also handles the security hook snapshot. The hook configuration is read from disk once, frozen into an immutable snapshot, and used for the rest of the session. Later modifications to the hooks configuration file on disk are ignored. This prevents an attacker from modifying hook rules after the session starts -- the frozen snapshot is the only source of truth for permission decisions.
-
----
-
-## Phase 4: Launch (replLauncher.ts)
-
-Seven different code paths converge on `replLauncher.ts`: interactive REPL, print mode (`--print`), SDK mode, resume (`--resume`), continue (`--continue`), pipe mode, and headless. The launcher inspects the configuration produced by `init()` and dispatches to the right entry point.
-
-Two examples illustrate the range:
-
-**Interactive REPL** -- the standard case. The launcher mounts the React/Ink component tree, starts the terminal renderer, and enters the event loop. The user sees a prompt and can start typing.
-
-**Print mode** (`--print`) -- a single prompt from argv. The launcher creates a headless query loop with no React tree, runs it to completion, streams the output to stdout, and exits. Same agent loop, different presentation.
-
-The important detail: all seven paths eventually call `query()` -- the same agent loop from Chapter 1. The launch path determines *how* the loop is presented (interactive terminal, single-shot, SDK protocol), not *what* it does. This convergence is what makes the architecture testable and predictable: regardless of how the user invokes Claude Code, the core behavior is identical.
+Программа установки также обрабатывает снимок hook безопасности. Конфигурация hook считывается с диска один раз, замораживается в неизменяемый снимок и используется до конца сеанса. Более поздние изменения файла конфигурации hooks на диске игнорируются. Это не позволяет злоумышленнику изменить правила hook после начала сеанса: замороженный снимок является единственным источником достоверной информации для принятия решений о разрешении.
 
 ---
 
-## The Startup Timeline
+## Этап 4: Запуск (replLauncher.ts)
 
-Here is what the full pipeline looks like in time:
+На `replLauncher.ts` сходятся семь различных путей кода: интерактивный REPL, режим печати (`--print`), режим SDK, возобновление (`--resume`), продолжение (`--continue`), конвейерный режим и безголовый режим. Средство запуска проверяет конфигурацию, созданную `init()`, и отправляет ее в нужную точку входа.
+
+Два примера иллюстрируют диапазон:
+
+**Интерактивный REPL** – стандартный корпус. Средство запуска монтирует дерево компонентов React/Ink, запускает средство рендеринга терминала и входит в цикл обработки событий. Пользователь видит prompt и может начать печатать.
+
+**Режим печати** (`--print`) – один запрос от argv. Средство запуска создает цикл запросов без заголовка без дерева React, выполняет его до завершения, передает выходные данные в stdout и завершает работу. Тот же agent loop, другое представление.
+
+Важная деталь: все семь путей в конечном итоге вызывают `query()` — тот же agent loop из главы 1. Путь запуска определяет, *как* представлен цикл (интерактивный терминал, одноразовый, протокол SDK), а не *что* он делает. Именно эта конвергенция делает архитектуру тестируемой и предсказуемой: независимо от того, как пользователь вызывает Claude Code, основное поведение остается идентичным.
+
+---
+
+## График запуска
+
+Вот как выглядит весь конвейер во времени:
 
 ```mermaid
 gantt
@@ -200,54 +200,54 @@ gantt
     First render             :215, 240
 ```
 
-The critical path runs through module evaluation (the single longest phase at ~138ms), then Commander parse, init, and setup. The parallel I/O operations (MDM, keychain) overlap with module evaluation and are typically resolved before they are needed.
+Критический путь проходит через оценку модуля (самая длинная фаза ~ 138 мс), затем анализ Commander, инициализацию и настройку. Параллельные операции ввода-вывода (MDM, связка ключей) перекрываются с оценкой модуля и обычно выполняются до того, как они потребуются.
 
-### The Performance Budget
+### Бюджет производительности
 
-| Phase | Time | What Happens |
+| Фаза | Время | Что происходит |
 |-------|------|-------------|
-| Fast-path check | ~5ms | Check argv, exit early if possible |
-| Module evaluation | ~138ms | Import tree, fire parallel I/O |
-| Commander parse | ~3ms | Parse flags and subcommands |
-| init() | ~14ms | Config resolution, trust boundary |
-| setup() | ~35ms | Commands, agents, hooks, plugins |
-| Launch + first render | ~25ms | Pick path, mount React, first paint |
-| **Total** | **~240ms** | Under 300ms budget |
+| Ускоренная проверка | ~5 мс | Проверьте argv, по возможности выйдите раньше |
+| Оценка модуля | ~138 мс | Дерево импорта, параллельный ввод-вывод |
+| Командирский разбор | ~3 мс | Разбор флагов и подкоманд |
+| init() | ~14 мс | Разрешение конфигурации, граница доверия |
+| setup() | ~35 мс | Команды, agents, hooks, плагины |
+| Запуск + первый рендер | ~25 мс | Выбор пути, крепление React, первая покраска |
+| **Всего** | **~240 мс** | Бюджет менее 300 мс |
 
-The total is approximately 240ms on a modern machine -- 60ms of headroom under the 300ms budget. Cold starts (first run after reboot, OS cache empty) can push module evaluation to 200ms+, bringing the total closer to the limit.
-
----
-
-## The Migration System
-
-A brief note on one subsystem that runs during init: schema migrations. Claude Code stores configuration and session data in local files and directories. When the format changes between versions, migrations run automatically at startup.
-
-Each migration is a function with a version number. The system checks the current schema version against the highest migration version, runs pending migrations in order, and updates the version. Migrations are idempotent and fast (operating on small local files, not databases). The entire migration pass typically completes in under 5ms. If a migration fails, it logs the error and continues -- availability beats strict consistency for local configuration.
+Общее время составляет примерно 240 мс на современной машине — 60 мс запаса при бюджете в 300 мс. Холодный запуск (первый запуск после перезагрузки, кэш ОС пуст) может увеличить время оценки модуля до 200 мс и более, приближая общее значение к пределу.
 
 ---
 
-## What Startup Teaches About System Design
+## Миграционная система
 
-The bootstrap pipeline is a study in narrowing scopes. Each phase reduces the space of possibilities:
+Краткое примечание об одной подсистеме, которая запускается во время инициализации: миграции схемы. Claude Code хранит данные конфигурации и сеанса в локальных файлах и каталогах. Когда формат меняется между версиями, миграция запускается автоматически при запуске.
 
-- Phase 0 narrows from "any CLI invocation" to "needs full bootstrap"
-- Phase 1 narrows from "everything must load" to "load in parallel with I/O"
-- Phase 2 narrows from "unknown environment" to "trusted, configured environment"
-- Phase 3 narrows from "no capabilities" to "fully registered"
-- Phase 4 narrows from "seven possible modes" to "one concrete launch path"
-
-By the time the REPL renders, every decision has been made. The query loop receives a fully configured environment with no ambiguity about what mode it is in, which tools are available, or what permissions apply. The 300ms budget is not just a performance target -- it is a forcing function that prevents bootstrap from becoming a lazy initialization system where decisions are deferred and scattered throughout the codebase.
+Каждая миграция представляет собой функцию с номером версии. Система сравнивает текущую версию схемы с последней версией миграции, выполняет ожидающие миграции по порядку и обновляет версию. Миграции идемпотентны и быстры (работают с небольшими локальными файлами, а не с базами данных). Весь этап миграции обычно занимает менее 5 мс. Если миграция не удалась, она регистрирует ошибку и продолжается — доступность превосходит строгую согласованность для локальной конфигурации.
 
 ---
 
-## Apply This
+## Чему стартап учит о проектировании системы
 
-**Overlap I/O with initialization.** Fire slow operations (subprocess spawns, credential reads, network checks) at module evaluation time, before they are needed. The JavaScript engine is doing synchronous work anyway -- use that time for parallel I/O. The pattern: `const promise = startSlowThing()` at the top of the file, `await promise` at the point of use.
+Конвейер начальной загрузки — это исследование сужения области применения. Каждый этап уменьшает пространство возможностей:
 
-**Narrow scope as early as possible.** The bootstrap pipeline's five files form a funnel: each phase eliminates work that subsequent phases do not need to do. Fast-path dispatch is the most dramatic example, but the principle applies everywhere. If you can determine at parse time that a code path is unnecessary, skip it.
+- Фаза 0 сужается от «любой вызов CLI» до «требуется полная начальная загрузка».
+- Фаза 1 сужается от «все должно загружаться» до «загрузка параллельно с вводом/выводом».
+- Фаза 2 сужается от «неизвестной среды» до «доверенной, настроенной среды».
+- Фаза 3 сужается от «нет возможностей» до «полностью зарегистрировано».
+- Фаза 4 сужается от «семи возможных режимов» до «одного конкретного пути запуска».
 
-**Establish trust boundaries explicitly.** If your application reads from an environment it does not control (environment variables, configuration files, shell settings), draw a clear line between "safe to read before the user consents" and "only read after consent." The trust boundary prevents a class of attacks where a malicious environment poisons the application before the user has a chance to evaluate it.
+К моменту рендеринга REPL все решения уже приняты. Query Loop получает полностью настроенную среду без каких-либо сомнений относительно того, в каком режиме она находится, какие tools доступны или какие разрешения применяются. Бюджет в 300 мс — это не просто целевой показатель производительности — это принудительная функция, которая не позволяет начальной загрузке превратиться в систему ленивой инициализации, в которой решения откладываются и разбрасываются по всей кодовой базе.
 
-**Memoize your init function.** Make initialization idempotent -- calling it twice produces the same result. This eliminates ordering bugs when multiple entry points may each trigger initialization. The memoization pattern is trivial but eliminates an entire class of double-initialization bugs.
+---
 
-**Capture early input before yielding.** In an event-driven system, user input that arrives during initialization can be lost. Claude Code captures the initial prompt from argv before any async work begins, ensuring that `claude "fix the bug"` does not drop the prompt if initialization takes longer than expected.
+## Примените это
+
+**Перекрытие ввода-вывода с инициализацией.** Запускайте медленные операции (запуск подпроцессов, чтение учетных данных, проверки сети) во время оценки модуля, прежде чем они потребуются. Механизм JavaScript в любом случае выполняет синхронную работу — используйте это время для параллельного ввода-вывода. Шаблон: `const promise = startSlowThing()` вверху файла, `await promise` в месте использования.
+
+**Ограничивайте область как можно раньше.** Пять файлов конвейера начальной загрузки образуют воронку: на каждом этапе исключается работа, которую не нужно выполнять на последующих этапах. Ускоренная диспетчеризация — наиболее яркий пример, но этот принцип применим везде. Если во время анализа вы можете определить, что путь кода не нужен, пропустите его.
+
+**Явно установите границы доверия.** Если ваше приложение читает из среды, которую оно не контролирует (переменные среды, файлы конфигурации, настройки оболочки), проведите четкую границу между «безопасно читать до согласия пользователя» и «читать только после согласия». Граница доверия предотвращает класс атак, при которых вредоносная среда отравляет приложение до того, как пользователь сможет его оценить.
+
+**Запомните функцию инициализации.** Сделайте инициализацию идемпотентной: ее вызов дважды приведет к одному и тому же результату. Это устраняет ошибки упорядочения, когда каждая из нескольких точек входа может вызвать инициализацию. Шаблон мемоизации тривиален, но устраняет целый класс ошибок двойной инициализации.
+
+**Захватывайте ранний ввод перед передачей.** В системе, управляемой событиями, пользовательский ввод, поступающий во время инициализации, может быть потерян. Claude Code захватывает начальное prompt от argv до начала какой-либо асинхронной работы, гарантируя, что `claude "fix the bug"` не отбросит prompt, если инициализация займет больше времени, чем ожидалось.

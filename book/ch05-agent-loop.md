@@ -1,47 +1,47 @@
-# Chapter 5: The Agent Loop
+# Глава 5: Цикл agent
 
-## The Beating Heart
+## Бьющееся сердце
 
-Chapter 4 showed how the API layer transforms configuration into streaming HTTP requests -- how the client is built, how system prompts are assembled, how responses arrive as server-sent events. That layer handles the *mechanics* of talking to the model. But a single API call is not an agent. An agent is a loop: call the model, execute tools, feed results back, call the model again, until the work is done.
+В главе 4 показано, как уровень API преобразует конфигурацию в потоковые запросы HTTP — как создается клиент, как собираются системные prompt, как ответы поступают в виде событий, отправленных сервером. Этот слой отвечает за *механику* общения с моделью. Но одиночный вызов API не является agent. Agent представляет собой цикл: вызывает модель, запускает tools, возвращает результаты, снова вызывает модель, пока работа не будет завершена.
 
-Every system has a center of gravity. In a database, it is the storage engine. In a compiler, it is the intermediate representation. In Claude Code, it is `query.ts` -- a single 1,730-line file containing the async generator that runs every interaction, from the first keystroke in the REPL to the last tool call of a headless `--print` invocation.
+У каждой системы есть центр тяжести. В базе данных это механизм хранения. В компиляторе это промежуточное представление. В Claude Code это `query.ts` — один файл из 1730 строк, содержащий асинхронный генератор, который запускает каждое взаимодействие, от первого нажатия клавиши в REPL до последнего tool call безголового вызова `--print`.
 
-This is not an exaggeration. There is exactly one code path that talks to the model, executes tools, manages context, recovers from errors, and decides when to stop. That code path is the `query()` function. The REPL calls it. The SDK calls it. Sub-agents call it. The headless runner calls it. If you are using Claude Code, you are inside `query()`.
+Это не преувеличение. Существует ровно один путь кода, который взаимодействует с моделью, запускает tools, управляет контекстом, восстанавливается после ошибок и решает, когда остановиться. Этот путь кода — функция `query()`. REPL называет это. SDK называет это. Это называют sub-agents. Безголовый бегун называет это. Если вы используете Claude Code, вы находитесь внутри `query()`.
 
-The file is dense, but it is not complex in the way that tangled inheritance hierarchies are complex. It is complex in the way that a submarine is complex: a single hull with many redundant systems, each one added because the ocean found a way in. Every `if` branch has a story. Every withheld error message represents a real bug where an SDK consumer disconnected mid-recovery. Every circuit breaker threshold was tuned against real sessions that burned thousands of API calls in infinite loops.
+Файл плотный, но не такой сложный, как сложные иерархии наследования. Она сложна так же, как сложна подводная лодка: единый корпус со множеством резервных систем, каждая из которых добавлена ​​потому, что океан нашел проход. У каждой ветки `if` есть история. Каждое скрытое сообщение об ошибке представляет собой реальную ошибку, из-за которой потребитель SDK отключился на этапе восстановления. Каждый порог автоматического выключателя был настроен с учетом реальных сеансов, которые сжигали тысячи вызовов API в бесконечных циклах.
 
-This chapter traces the entire loop, start to finish. By the end, you will understand not just what happens, but why each mechanism exists and what breaks without it.
+В этой главе прослеживается весь цикл, от начала до конца. К концу вы поймете не просто что происходит, но и почему каждый механизм существует и что без него ломается.
 
 ---
 
-## Why an Async Generator
+## Зачем нужен асинхронный генератор
 
-The first architectural question: why is the agent loop a generator and not a callback-based event emitter?
+Первый архитектурный вопрос: почему agent loop является генератором, а не генератором событий на основе обратного вызова?
 
 ```typescript
 // Simplified — shows the concept, not the exact types
 async function* agentLoop(params: LoopParams): AsyncGenerator<Message | Event, TerminalReason>
 ```
 
-The actual signature yields several message and event types and returns a discriminated union encoding why the loop stopped.
+Фактическая подпись дает несколько типов сообщений и событий и возвращает распознаваемую кодировку объединения, почему цикл остановился.
 
-Three reasons, in order of importance.
+Три причины в порядке важности.
 
-**Backpressure.** An event emitter fires whether the consumer is ready or not. A generator yields only when the consumer calls `.next()`. When the REPL's React renderer is busy painting the previous frame, the generator naturally pauses. When an SDK consumer is processing a tool result, the generator waits. No buffer overflow, no dropped messages, no "fast producer / slow consumer" problem.
+**Обратное давление.** Генератор событий срабатывает независимо от того, готов потребитель или нет. Генератор срабатывает только тогда, когда потребитель вызывает `.next()`. Когда рендерер React REPL занят рисованием предыдущего кадра, генератор естественным образом приостанавливается. Когда потребитель SDK обрабатывает результат tool, генератор ожидает. Ни переполнения буфера, ни потерянных сообщений, ни проблем «быстрый производитель/медленный потребитель».
 
-**Return value semantics.** The generator's return type is `Terminal` -- a discriminated union encoding exactly why the loop stopped. Was it a normal completion? A user abort? A token budget exhaustion? A stop hook intervention? A max-turns limit? An unrecoverable model error? There are 10 distinct terminal states. Callers do not need to subscribe to an "end" event and hope the payload contains the reason. They get it as a typed return value from `for await...of` or `yield*`.
+**Семантика возвращаемого значения.** Тип возвращаемого значения генератора — `Terminal` – дискриминируемое объединение, кодирующее именно причину остановки цикла. Это было нормальное завершение? Пользовательское прерывание? Символическое истощение бюджета? Вмешательство stop hook? Ограничение максимального количества оборотов? Неустранимая ошибка модели? Существует 10 различных терминальных State. Вызывающим объектам не нужно подписываться на событие «конец» и надеяться, что полезные данные содержат причину. Они получают его как типизированное возвращаемое значение от `for await...of` или `yield*`.
 
-**Composability via `yield*`.** The outer `query()` function delegates to `queryLoop()` with `yield*`, which transparently forwards every yielded value and the final return. Sub-generators like `handleStopHooks()` use the same pattern. This creates a clean chain of responsibility without callbacks, without promises wrapping promises, without event forwarding boilerplate.
+**Компонуемость посредством `yield*`.** Внешняя функция `query()` делегирует `queryLoop()` с `yield*`, который прозрачно пересылает каждое полученное значение и окончательный возврат. Подгенераторы, такие как `handleStopHooks()`, используют тот же шаблон. Это создает чистую цепочку ответственности без callbacks, без обёртывания обещаний, без шаблонного шаблона пересылки событий.
 
-The choice has a cost -- async generators in JavaScript cannot be "rewound" or forked. But the agent loop does not need either. It is a strictly forward-moving state machine.
+За выбор приходится платить — асинхронные генераторы в JavaScript нельзя «перемотать» или разветвить. Но agent loop тоже не нужен. Это строго движущаяся вперед государственная машина.
 
-One more subtlety: the `function*` syntax makes the function *lazy*. The body does not execute until the first `.next()` call. This means `query()` returns instantly -- all the heavy initialization (config snapshot, memory prefetch, budget tracker) happens only when the consumer starts pulling values. In the REPL, this means the React rendering pipeline is already set up before the first line of the loop runs.
+Еще одна тонкость: синтаксис `function*` делает функцию *ленивой*. Тело не выполняется до первого вызова `.next()`. Это означает, что `query()` возвращается мгновенно — вся тяжелая инициализация (снимок конфигурации, предварительная выборка memory, отслеживание бюджета) происходит только тогда, когда потребитель начинает извлекать значения. В REPL это означает, что конвейер рендеринга React уже настроен до запуска первой строки цикла.
 
 ---
 
-## What Callers Provide
+## Что предоставляют вызывающие абоненты
 
-Before tracing the loop, it helps to know what goes in:
+Прежде чем отслеживать цикл, полезно знать, что происходит:
 
 ```typescript
 // Simplified — illustrates the key fields
@@ -57,29 +57,29 @@ type LoopParams = {
 }
 ```
 
-The notable fields:
+Известные поля:
 
-- **`querySource`**: A string discriminant like `'repl_main_thread'`, `'sdk'`, `'agent:xyz'`, `'compact'`, or `'session_memory'`. Many conditionals branch on this. The compact agent uses `querySource: 'compact'` so the blocking limit guard does not deadlock (the compact agent needs to run to *reduce* the token count).
+- **`querySource`**: строковый дискриминант, например `'repl_main_thread'`, `'sdk'`, `'agent:xyz'`, `'compact'` или `'session_memory'`. Многие условные выражения разветвляются на этом. Компактный agent использует `querySource: 'compact'`, поэтому защита ограничения блокировки не блокируется (компактный agent должен запуститься, чтобы *уменьшить* количество токенов).
 
-- **`taskBudget`**: The API-level task budget (`output_config.task_budget`). Distinct from the `+500k` auto-continue token budget feature. `total` is the budget for the whole agentic turn; `remaining` is computed per iteration from cumulative API usage and adjusted across compaction boundaries.
+- **`taskBudget`**: бюджет task уровня API (`output_config.task_budget`). В отличие от функции автоматического продолжения бюджета токена `+500k`. `total` — бюджет всего agent turn; `remaining` вычисляется за итерацию на основе совокупного использования API и корректируется по границам уплотнения.
 
-- **`deps`**: Optional dependency injection. Defaults to `productionDeps()`. This is the seam where tests swap in fake model calls, fake compaction, and deterministic UUIDs.
+- **`deps`**: необязательное внедрение зависимостей. По умолчанию `productionDeps()`. Это место, где тесты заменяются фальшивыми вызовами моделей, фальшивым сжатием и детерминированными UUID.
 
-- **`canUseTool`**: A function that returns whether a given tool is allowed. This is the permission layer -- it checks trust settings, hook decisions, and the current permission mode.
-
----
-
-## The Two-Layer Entry Point
-
-The public API is a thin wrapper around the real loop:
-
-The outer function wraps the inner loop, tracking which queued commands were consumed during the turn. After the inner loop completes, consumed commands are marked as `'completed'`. If the loop throws or the generator is closed via `.return()`, the completion notifications never fire -- a failed turn should not mark commands as successfully processed. Commands queued during a turn (via `/` slash commands or task notifications) are marked `'started'` inside the loop and `'completed'` in the wrapper. If the loop throws or the generator is closed via `.return()`, the completion notifications never fire. This is intentional -- a failed turn should not mark commands as successfully processed.
+- **`canUseTool`**: функция, которая возвращает, разрешен ли данный tool. Это уровень разрешений — он проверяет настройки доверия, решения о hook и текущий permission mode.
 
 ---
 
-## The State Object
+## Двухуровневая точка входа
 
-The loop carries its state in a single typed object:
+Публичный API — это тонкая оболочка реального цикла:
+
+Внешняя функция оборачивает внутренний цикл, отслеживая, какие команды из очереди были использованы во время хода. После завершения внутреннего цикла использованные команды помечаются как `'completed'`. Если цикл выдает ошибку или генератор закрывается через `.return()`, уведомления о завершении никогда не срабатывают — неудачный ход не должен отмечать команды как успешно обработанные. Команды, поставленные в очередь во время хода (через косую черту `/` или уведомления о Task), помечаются `'started'` внутри цикла и `'completed'` в оболочке. Если цикл выдает ошибку или генератор закрывается через `.return()`, уведомления о завершении никогда не срабатывают. Это сделано намеренно — неудачный ход не должен отмечать команды как успешно обработанные.
+
+---
+
+## Объект State
+
+Цикл переносит свое State в один типизированный объект:
 
 ```typescript
 // Simplified — illustrates the key fields
@@ -92,24 +92,24 @@ type LoopState = {
 }
 ```
 
-Ten fields. Each one earns its place:
+Десять полей. Каждый занимает свое место:
 
-| Field | Why It Exists |
+| Поле | Почему это существует |
 |-------|---------------|
-| `messages` | The conversation history, grown each iteration |
-| `toolUseContext` | Mutable context: tools, abort controller, agent state, options |
-| `autoCompactTracking` | Tracks compaction state: turn counter, turn ID, consecutive failures, compacted flag |
-| `maxOutputTokensRecoveryCount` | How many multi-turn recovery attempts for output token limits (max 3) |
-| `hasAttemptedReactiveCompact` | One-shot guard against infinite reactive compaction loops |
-| `maxOutputTokensOverride` | Set to 64K during escalation, cleared after |
-| `pendingToolUseSummary` | A promise from the previous iteration's Haiku summary, resolved during current streaming |
-| `stopHookActive` | Prevents re-running stop hooks after a blocking retry |
-| `turnCount` | Monotonic counter, checked against `maxTurns` |
-| `transition` | Why the previous iteration continued -- `undefined` on first iteration |
+| `messages` | История разговоров, увеличивающаяся с каждой итерацией |
+| `toolUseContext` | Изменяемый контекст: tools, контроллер прерывания, State agent, параметры |
+| `autoCompactTracking` | Отслеживает State уплотнения: счетчик ходов, идентификатор хода, последовательные неудачи, флаг уплотнения |
+| `maxOutputTokensRecoveryCount` | Сколько попыток многооборотного восстановления для ограничения выходных токенов (максимум 3) |
+| `hasAttemptedReactiveCompact` | Одноразовая защита от бесконечных циклов реактивного уплотнения |
+| `maxOutputTokensOverride` | Устанавливается на 64 КБ во время эскалации, очищается после |
+| `pendingToolUseSummary` | Promise из сводки Haiku предыдущей итерации, решенное во время текущей трансляции |
+| `stopHookActive` | Предотвращает повторный запуск hooks остановки после повторной попытки блокировки |
+| `turnCount` | Монотонный счетчик, проверенный по `maxTurns` |
+| `transition` | Почему продолжалась предыдущая итерация — `undefined` на первой итерации |
 
-### Immutable Transitions in a Mutable Loop
+### Неизменяемые переходы в изменяемом цикле
 
-Here is the pattern that appears at every `continue` statement in the loop:
+Вот шаблон, который появляется в каждом операторе `continue` в цикле:
 
 ```typescript
 const next: State = {
@@ -127,13 +127,13 @@ const next: State = {
 state = next
 ```
 
-Every continue site constructs a complete new `State` object. Not `state.messages = newMessages`. Not `state.turnCount++`. A full reconstruction. The benefit is that every transition is self-documenting. You can read any `continue` site and see exactly which fields change and which are preserved. The `transition` field on the new state records *why* the loop is continuing -- tests assert on this to verify that the correct recovery path fired.
+Каждый сайт продолжения создает совершенно новый объект `State`. Не `state.messages = newMessages`. Не `state.turnCount++`. Полная реконструкция. Преимущество состоит в том, что каждый переход самодокументируется. Вы можете прочитать любой сайт `continue` и посмотреть, какие именно поля изменяются, а какие сохраняются. Поле `transition` в новом State записывает *почему* цикл продолжается — тесты подтверждают это, чтобы убедиться, что запущен правильный путь восстановления.
 
 ---
 
-## The Loop Body
+## Тело цикла
 
-Here is the full execution flow of a single iteration, compressed to its skeleton:
+Вот полный поток выполнения одной итерации, сжатый до ее скелета:
 
 ```mermaid
 stateDiagram-v2
@@ -181,13 +181,13 @@ stateDiagram-v2
     end note
 ```
 
-That is the entire loop. Every feature in Claude Code -- from memory to sub-agents to error recovery -- feeds into or consumes from this single iteration structure.
+Вот и весь цикл. Каждая функция в Claude Code — от memory до sub-agents и устранения ошибок — входит в эту единую структуру итерации или потребляет ее.
 
 ---
 
-## Context Management: Four Compression Layers
+## Управление контекстом: четыре уровня сжатия
 
-Before each API call, the message history passes through up to four context management stages. They run in a specific order, and that order matters.
+Перед каждым вызовом API история сообщений проходит до четырех этапов управления контекстом. Они выполняются в определенном порядке, и этот порядок имеет значение.
 
 ```mermaid
 graph TD
@@ -205,29 +205,29 @@ graph TD
     F -.- F1[Full conversation summarization]
 ```
 
-### Layer 0: Tool Result Budget
+### Уровень 0: Бюджет результатов tool
 
-Before any compression, `applyToolResultBudget()` enforces per-message size limits on tool results. Tools without a finite `maxResultSizeChars` are exempted.
+Перед любым сжатием `applyToolResultBudget()` устанавливает ограничения на размер каждого сообщения в результатах tool. Tools без конечного номера `maxResultSizeChars` освобождаются от налога.
 
-### Layer 1: Snip Compact
+### Слой 1: Сжатие фрагментов
 
-The lightest operation. Snip physically removes old messages from the array, yielding a boundary message to signal the removal to the UI. It reports how many tokens were freed, and that number is plumbed into auto-compact's threshold check.
+Самая легкая операция. Snip физически удаляет старые сообщения из массива, создавая граничное сообщение, сигнализирующее об удалении UI. Он сообщает, сколько токенов было освобождено, и это число учитывается при проверке порога auto-compact.
 
-### Layer 2: Microcompact
+### Слой 2: Микрокомпакт
 
-Microcompact removes tool results that are no longer needed, identified by `tool_use_id`. For cached microcompact (which edits the API cache), the boundary message is deferred until after the API response. The reason: client-side token estimates are unreliable. The actual `cache_deleted_input_tokens` from the API response tells you what was really freed.
+Microcompact удаляет tool results, которые больше не нужны и обозначены `tool_use_id`. Для кэшированного микрокомпакта (который редактирует кэш API) граничное сообщение откладывается до тех пор, пока не будет получен ответ API. Причина: оценки токенов на стороне клиента ненадежны. Фактический `cache_deleted_input_tokens` из ответа API говорит вам, что на самом деле было освобождено.
 
-### Layer 3: Context Collapse
+### Уровень 3: Схлопывание контекста
 
-Context collapse replaces spans of conversation with summaries. It runs before auto-compact, and the ordering is deliberate: if collapse reduces the context below the auto-compact threshold, auto-compact becomes a no-op. This preserves granular context instead of replacing everything with a single monolithic summary.
+Схлопывание контекста заменяет промежутки разговора резюме. Он запускается перед автосжатием, и порядок упорядочивается намеренно: если свертывание уменьшает контекст ниже порога автосжатия, автосжатие становится неактивным. Это сохраняет детализированный контекст вместо замены всего одним монолитным резюме.
 
-### Layer 4: Auto-Compact
+### Слой 4: Автосжатие
 
-The heaviest operation: it forks an entire Claude conversation to summarize the history. The implementation has a circuit breaker -- after 3 consecutive failures, it stops trying. This prevents the nightmare scenario observed in production: sessions stuck over the context limit burning 250K API calls per day in an infinite compact-fail-retry loop.
+Самая тяжелая операция: она разветвляет весь разговор Клода, чтобы подвести итог истории. Реализация имеет автоматический выключатель — после 3-х последовательных неудач попытки прекращаются. Это предотвращает кошмарный сценарий, наблюдаемый в производственной среде: сеансы зависают при превышении лимита контекста, записывая 250 тысяч вызовов API в день в бесконечном цикле компактных неудачных попыток.
 
-### Auto-Compact Thresholds
+### Пороги автоматического сжатия
 
-The thresholds are derived from the model's context window:
+Пороги извлекаются из контекстного окна модели:
 
 ```
 effectiveContextWindow = contextWindow - min(modelMaxOutput, 20000)
@@ -237,25 +237,25 @@ Thresholds (relative to effectiveContextWindow):
   Blocking limit (hard):   effectiveWindow - 3,000
 ```
 
-| Constant | Value | Purpose |
+| Константа | Значение | Цель |
 |----------|-------|---------|
-| `AUTOCOMPACT_BUFFER_TOKENS` | 13,000 | Headroom below effective window for auto-compact trigger |
-| `MANUAL_COMPACT_BUFFER_TOKENS` | 3,000 | Reserves space so `/compact` still works |
-| `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES` | 3 | Circuit breaker threshold |
+| `AUTOCOMPACT_BUFFER_TOKENS` | 13 000 | Запас ниже эффективного окна для автоматического компактного триггера |
+| `MANUAL_COMPACT_BUFFER_TOKENS` | 3000 | Резервирует место, чтобы `/compact` продолжал работать |
+| `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES` | 3 | Порог автоматического выключателя |
 
-The 13,000-token buffer means auto-compact fires well before the hard limit. The gap between the auto-compact threshold and the blocking limit is where reactive compact operates -- if the proactive auto-compact fails or is disabled, reactive compact catches the 413 error and compacts on demand.
+Буфер в 13 000 токенов означает, что автоматическое сжатие срабатывает задолго до достижения жесткого предела. Разрыв между порогом автоматического сжатия и пределом блокировки — это то, где действует реактивное сжатие: если упреждающее автоматическое сжатие дает сбой или отключено, реактивное сжатие улавливает ошибку 413 и сжимает по требованию.
 
-### Token Counting
+### Подсчет токенов
 
-The canonical function `tokenCountWithEstimation` combines authoritative API-reported token counts (from the most recent response) with a rough estimate for messages added after that response. The approximation is conservative -- it errs toward higher counts, which means auto-compact fires slightly early rather than slightly late.
+Каноническая функция `tokenCountWithEstimation` объединяет достоверное количество токенов, сообщаемое API (из самого последнего ответа), с приблизительной оценкой количества сообщений, добавленных после этого ответа. Приближение консервативно — оно дает ошибку в сторону более высоких значений, что означает, что автокомпакт срабатывает немного раньше, а не немного позже.
 
 ---
 
-## Model Streaming
+## Потоковая передача модели
 
-### The callModel() Loop
+### Цикл callModel()
 
-The API call happens inside a `while(attemptWithFallback)` loop that enables model fallback:
+Вызов API происходит внутри цикла `while(attemptWithFallback)`, который позволяет откатить модель:
 
 ```typescript
 let attemptWithFallback = true
@@ -276,11 +276,11 @@ while (attemptWithFallback) {
 }
 ```
 
-When enabled, a `StreamingToolExecutor` starts executing tools as soon as their `tool_use` blocks arrive during streaming -- not after the full response completes. How tools are orchestrated into concurrent batches is the subject of Chapter 7.
+Если этот параметр включен, `StreamingToolExecutor` начинает выполнение tools, как только их блоки `tool_use` поступают во время streaming, а не после завершения полного ответа. То, как tools объединяются в параллельные batches, является предметом главы 7.
 
-### The Withholding Pattern
+### Модель удержания
 
-This is one of the most important patterns in the file. Recoverable errors are suppressed from the yield stream:
+Это один из самых важных шаблонов в файле. Устранимые ошибки подавляются из потока доходности:
 
 ```typescript
 let withheld = false
@@ -290,17 +290,17 @@ if (isWithheldMaxOutputTokens(message)) withheld = true
 if (!withheld) yield yieldMessage
 ```
 
-Why withhold? Because SDK consumers -- Cowork, the desktop app -- terminate the session on any message with an `error` field. If you yield a prompt-too-long error and then successfully recover via reactive compaction, the consumer has already disconnected. The recovery loop keeps running, but nobody is listening. So the error is withheld, pushed to `assistantMessages` so downstream recovery checks can find it. If all recovery paths fail, the withheld message is finally surfaced.
+Зачем сдерживать? Потому что потребители SDK — настольное приложение Cowork — завершают сеанс для любого сообщения с полем `error`. Если вы выдаете ошибку «слишком длинная prompt», а затем успешно восстанавливаетесь с помощью реактивного сжатия, потребитель уже отключился. Цикл восстановления продолжает работать, но никто не слушает. Таким образом, ошибка скрыта и помещена в `assistantMessages`, чтобы последующие проверки восстановления могли ее обнаружить. Если все пути восстановления терпят неудачу, скрытое сообщение наконец появляется.
 
-### Model Fallback
+### Резервная модель
 
-When a `FallbackTriggeredError` is caught (high demand on the primary model), the loop switches models and retries. But thinking signatures are model-bound -- replaying a protected-thinking block from one model to a different fallback model causes a 400 error. The code strips signature blocks before retry. All orphaned assistant messages from the failed attempt are tombstoned so the UI removes them.
+При обнаружении `FallbackTriggeredError` (высокий спрос на основную модель) цикл переключает модели и повторяет попытку. Но сигнатуры мышления привязаны к модели: воспроизведение блока защищенного мышления из одной модели в другую резервную модель приводит к ошибке 400. Код удаляет блоки подписи перед повторной попыткой. Все потерянные сообщения помощника после неудачной попытки удаляются, поэтому UI удаляет их.
 
 ---
 
-## Error Recovery: The Escalation Ladder
+## Исправление ошибок: лестница эскалации
 
-Error recovery in query.ts is not a single strategy. It is a ladder of increasingly aggressive interventions, each triggered when the previous one fails.
+Восстановление ошибок в query.ts — это не единая стратегия. Это лестница все более агрессивных вмешательств, каждое из которых срабатывает, когда предыдущее терпит неудачу.
 
 ```mermaid
 graph TD
@@ -326,154 +326,154 @@ graph TD
     style S3 fill:#f66
 ```
 
-### The Death Spiral Guard
+### Страж Спирали Смерти
 
-The most dangerous failure mode is an infinite loop. The code has multiple guards:
+Самый опасный режим отказа — бесконечный цикл. Код имеет несколько охранников:
 
-1. **`hasAttemptedReactiveCompact`**: One-shot flag. Reactive compact fires once per error type.
-2. **`MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3`**: Hard cap on multi-turn recovery attempts.
-3. **Circuit breaker on auto-compact**: After 3 consecutive failures, auto-compact stops trying entirely.
-4. **No stop hooks on error responses**: The code explicitly returns before reaching stop hooks when the last message is an API error. The comment explains: "error -> hook blocking -> retry -> error -> ... (the hook injects more tokens each cycle)."
-5. **Preserved `hasAttemptedReactiveCompact` across stop hook retries**: When a stop hook returns blocking errors and forces a retry, the reactive compact guard is preserved. The comment documents the bug: "Resetting to false here caused an infinite loop burning thousands of API calls."
+1. **`hasAttemptedReactiveCompact`**: флаг одноразового действия. Реактивный компакт срабатывает один раз для каждого типа ошибки.
+2. **`MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3`**: жесткое ограничение на многоходовые попытки восстановления.
+3. **Автоматический выключатель на автокомпакте**: после 3 последовательных сбоев автокомпакт полностью прекращает попытки.
+4. **Нет hooks остановки при ответах об ошибках**: код явно возвращается до достижения hooks остановки, если последнее сообщение представляет собой ошибку API. В комментарии поясняется: «ошибка -> блокировка hook -> повтор -> ошибка -> ... (hook вводит больше токенов каждый цикл)».
+5. **Сохраняется `hasAttemptedReactiveCompact` при повторных попытках остановки ловушки**: когда стоп-ловушка возвращает ошибки блокировки и вызывает повторную попытку, реактивная компактная защита сохраняется. Комментарий документирует ошибку: «Сброс на false здесь вызвал бесконечный цикл, сжигающий тысячи вызовов API».
 
-Each of these guards was added because someone hit the failure mode in production.
-
----
-
-## Worked Example: "Fix the Bug in auth.ts"
-
-To make the loop concrete, let us trace a real interaction through three iterations.
-
-**The user types:** `Fix the null pointer bug in src/auth/validate.ts`
-
-**Iteration 1: The model reads the file.**
-
-The loop enters. Context management runs (no compression needed -- the conversation is short). The model streams a response: "Let me look at the file." It emits a single `tool_use` block: `Read({ file_path: "src/auth/validate.ts" })`. The streaming executor sees a concurrency-safe tool and starts it immediately. By the time the model finishes its response text, the file contents are already in memory.
-
-Post-stream processing: the model used a tool, so we enter the tool-use path. The Read result (file contents with line numbers) is pushed to `toolResults`. A Haiku summary promise is kicked off in the background. State is reconstructed with the new messages, `transition: { reason: 'next_turn' }`, and the loop continues.
-
-**Iteration 2: The model edits the file.**
-
-Context management runs again (still under the threshold). The model streams: "I see the bug on line 42 -- `userId` can be null." It emits `Edit({ file_path: "src/auth/validate.ts", old_string: "const user = getUser(userId)", new_string: "if (!userId) return { error: 'unauthorized' }\nconst user = getUser(userId)" })`.
-
-Edit is not concurrency-safe, so the streaming executor queues it until the response completes. Then the 14-step execution pipeline fires: Zod validation passes, input backfill expands the path, the PreToolUse hook checks permissions (the user approves), and the edit is applied. The pending Haiku summary from iteration 1 resolves during streaming -- its result is yielded as a `ToolUseSummaryMessage`. State is reconstructed, loop continues.
-
-**Iteration 3: The model declares completion.**
-
-The model streams: "I've fixed the null pointer bug by adding a guard clause." No `tool_use` blocks. We enter the "done" path. Prompt-too-long recovery? Not needed. Max output tokens? No. Stop hooks run -- no blocking errors. Token budget check passes. The loop returns `{ reason: 'completed' }`.
-
-Total: three API calls, two tool executions, one user permission prompt. The loop handled streaming tool execution, Haiku summarization overlapping with the API call, and the full permission pipeline -- all through the same `while(true)` structure.
+Каждый из этих охранников был добавлен, потому что кто-то попал в режим сбоя в производстве.
 
 ---
 
-## Token Budgets
+## Рабочий пример: «Исправить ошибку в auth.ts»
 
-Users can request a token budget for a turn (e.g., `+500k`). The budget system decides whether to continue or stop after the model completes a response.
+Чтобы конкретизировать цикл, давайте проследим реальное взаимодействие через три итерации.
 
-`checkTokenBudget` makes a binary continue/stop decision with three rules:
+**Тип пользователя:** `Fix the null pointer bug in src/auth/validate.ts`
 
-1. **Subagents always stop.** Budget is a top-level concept only.
-2. **Completion threshold at 90%.** If `turnTokens < budget * 0.9`, continue.
-3. **Diminishing returns detection.** After 3+ continuations, if both the current and previous delta are below 500 tokens, stop early. The model is producing less and less output per continuation.
+**Итерация 1: Модель читает файл.**
 
-When the decision is "continue," a nudge message is injected telling the model how much budget remains.
+Петля входит. Запускается управление контекстом (сжатие не требуется — разговор короткий). Модель передает ответ: «Дайте мне посмотреть файл». Он генерирует один блок `tool_use`: `Read({ file_path: "src/auth/validate.ts" })`. Исполнитель streaming видит tool, безопасный для параллелизма, и немедленно запускает его. К тому времени, когда модель заканчивает текст ответа, содержимое файла уже находится в memory.
+
+Постпотоковая обработка: модель использовала tool, поэтому мы вводим путь использования tool. Результат чтения (содержимое файла с номерами строк) сохраняется в `toolResults`. В фоновом режиме запускается краткое Promise Haiku. State восстанавливается с помощью новых сообщений `transition: { reason: 'next_turn' }`, и цикл продолжается.
+
+**Итерация 2: Модель редактирует файл.**
+
+Управление контекстом запускается снова (все еще ниже порогового значения). Модель передает: «Я вижу ошибку в строке 42 — `userId` может быть нулевым». Он излучает `Edit({ file_path: "src/auth/validate.ts", old_string: "const user = getUser(userId)", new_string: "if (!userId) return { error: 'unauthorized' }\nconst user = getUser(userId)" })`.
+
+Редактирование не является безопасным для параллелизма, поэтому исполнитель streaming ставит его в очередь до тех пор, пока не завершится ответ. Затем запускается 14-шаговый конвейер выполнения: проходит проверка Zod, заполнение входных данных расширяет путь, hook PreToolUse проверяет разрешения (пользователь одобряет) и редактирование применяется. Ожидаемая сводка Haiku из итерации 1 разрешается во время streaming — ее результат выдается в виде `ToolUseSummaryMessage`. State реконструировано, цикл продолжается.
+
+**Итерация 3: Модель объявляет о завершении.**
+
+В модели говорится: «Я исправил ошибку с нулевым указателем, добавив защитное предложение». Никаких блоков `tool_use`. Входим в путь «Готово». Быстрое и слишком долгое восстановление? Не нужно. Максимальное количество выходных токенов? Нет. Остановить запуск hooks — никаких ошибок блокировки. Проверка бюджета токена пройдена. Цикл возвращает `{ reason: 'completed' }`.
+
+Итого: три вызова API, два выполнения tool, один запрос на разрешение пользователя. Цикл обрабатывал tool execution streaming, суммирование Haiku, перекрывающееся с вызовом API, и полный конвейер разрешений — и все это через одну и ту же структуру `while(true)`.
 
 ---
 
-## Stop Hooks: Forcing the Model to Keep Working
+## Бюджеты токенов
 
-Stop hooks run when the model finishes without requesting any tool use -- it thinks it is done. The hooks evaluate whether it actually *is* done.
+Пользователи могут запросить бюджет токена за ход (e.g., `+500k`). Бюджетная система решает, продолжать или остановиться после того, как модель завершит ответ.
 
-The pipeline runs template job classification, fires background tasks (prompt suggestion, memory extraction), and then executes stop hooks proper. When a stop hook returns blocking errors -- "you said you were done, but the linter found 3 errors" -- the errors are appended to the message history and the loop continues with `stopHookActive: true`. This flag prevents re-running the same hooks on the retry.
+`checkTokenBudget` принимает двоичное решение о продолжении/остановке по трем правилам:
 
-When a stop hook signals `preventContinuation`, the loop exits immediately with `{ reason: 'stop_hook_prevented' }`.
+1. **Sub-agents всегда останавливаются.** Бюджет — это концепция только верхнего уровня.
+2. **Порог завершения — 90%.** Если `turnTokens < budget * 0.9`, продолжайте.
+3. **Обнаружение убывающей доходности.** После 3+ продолжений, если текущая и предыдущая дельта ниже 500 токенов, остановитесь раньше. Модель производит все меньше и меньше продукции за продолжение.
+
+Когда принимается решение «продолжить», вводится подталкивающее сообщение, сообщающее модели, какой бюджет остался.
 
 ---
 
-## State Transitions: The Complete Catalog
+## Остановить hooks: заставить модель продолжать работать
 
-Every exit from the loop is one of two types: a `Terminal` (the loop returns) or a `Continue` (the loop iterates).
+Остановочные hooks запускаются, когда модель завершает работу без запроса использования какого-либо tool — она думает, что все готово. Hooks оценивают, действительно ли это *выполнено*.
 
-### Terminal States (10 reasons)
+Конвейер запускает классификацию заданий шаблона, запускает фоновые Task (предложение, извлечение memory), а затем выполняет собственно hooks остановки. Когда hook остановки возвращает блокирующие ошибки — «вы сказали, что закончили, но линтер обнаружил 3 ошибки» — ошибки добавляются в историю сообщений, и цикл продолжается с `stopHookActive: true`. Этот флаг предотвращает повторный запуск тех же hooks при повторной попытке.
 
-| Reason | Trigger |
+Когда крюк остановки сигнализирует `preventContinuation`, цикл немедленно завершается с помощью `{ reason: 'stop_hook_prevented' }`.
+
+---
+
+## Переходы между состояниями: полный каталог
+
+Каждый выход из цикла может быть одного из двух типов: `Terminal` (цикл возвращается) или `Continue` (цикл повторяется).
+
+### Терминальные State (10 причин)
+
+| Причина | Триггер |
 |--------|---------|
-| `blocking_limit` | Token count at hard limit, auto-compact OFF |
-| `image_error` | ImageSizeError, ImageResizeError, or unrecoverable media error |
-| `model_error` | Unrecoverable API/model exception |
-| `aborted_streaming` | User abort during model streaming |
-| `prompt_too_long` | Withheld 413 after all recovery exhausted |
-| `completed` | Normal completion (no tool use, or budget exhausted, or API error) |
-| `stop_hook_prevented` | Stop hook explicitly blocked continuation |
-| `aborted_tools` | User abort during tool execution |
-| `hook_stopped` | PreToolUse hook stopped continuation |
-| `max_turns` | Hit the `maxTurns` limit |
+| `blocking_limit` | Количество токенов при жестком пределе, автоматическое сжатие ВЫКЛ |
+| `image_error` | ImageSizeError, ImageResizeError или неисправимая ошибка носителя |
+| `model_error` | Неустранимое исключение API/модель |
+| `aborted_streaming` | Пользовательское прерывание во время streaming модели |
+| `prompt_too_long` | Удержан 413 после того, как все средства восстановления исчерпаны |
+| `completed` | Нормальное завершение (tool не используется, бюджет исчерпан или ошибка API) |
+| `stop_hook_prevented` | Стоп-hook явно заблокирован, продолжение |
+| `aborted_tools` | Пользовательское прерывание во время выполнения tool |
+| `hook_stopped` | Hook PreToolUse остановлен, продолжение |
+| `max_turns` | Достигните лимита `maxTurns` |
 
-### Continue States (7 reasons)
+### Продолжить State (7 причин)
 
-| Reason | Trigger |
+| Причина | Триггер |
 |--------|---------|
-| `collapse_drain_retry` | Context collapse drained staged collapses on 413 |
-| `reactive_compact_retry` | Reactive compact succeeded after 413 or media error |
-| `max_output_tokens_escalate` | 8K cap hit, escalating to 64K |
-| `max_output_tokens_recovery` | 64K still hit, multi-turn recovery (up to 3 attempts) |
-| `stop_hook_blocking` | Stop hook returned blocking errors, must retry |
-| `token_budget_continuation` | Token budget not exhausted, nudge message injected |
-| `next_turn` | Normal tool-use continuation |
+| `collapse_drain_retry` | Контекстный коллапс слили инсценировали коллапс на 413 |
+| `reactive_compact_retry` | Реактивное компактирование удалось после 413 или ошибки носителя |
+| `max_output_tokens_escalate` | Достигнуто ограничение на 8K, увеличивающееся до 64K |
+| `max_output_tokens_recovery` | 64К все-таки попал, многооборотное восстановление (до 3-х попыток) |
+| `stop_hook_blocking` | Остановить hook вернул ошибки блокировки, необходимо повторить попытку |
+| `token_budget_continuation` | Бюджет токена не исчерпан, введено подталкивающее сообщение |
+| `next_turn` | Продолжение обычного использования tool |
 
 ---
 
-## Orphaned Tool Results: The Protocol Safety Net
+## Результаты потерянных tools: сеть безопасности протокола
 
-The API protocol requires that every `tool_use` block is followed by a `tool_result`. The function `yieldMissingToolResultBlocks` creates error `tool_result` messages for every `tool_use` block that the model emitted but that never got a corresponding result. Without this safety net, a crash during streaming would leave orphaned `tool_use` blocks that would cause a protocol error on the next API call.
+Протокол API требует, чтобы за каждым блоком `tool_use` следовал `tool_result`. Функция `yieldMissingToolResultBlocks` создает сообщения об ошибках `tool_result` для каждого блока `tool_use`, который создала модель, но который так и не получил соответствующего результата. Без этой системы безопасности сбой во время streaming оставил бы потерянные блоки `tool_use`, что привело бы к ошибке протокола при следующем вызове API.
 
-It fires in three places: the outer error handler (model crash), the fallback handler (model switch mid-stream), and the abort handler (user interruption). Each path has a different error message, but the mechanism is identical.
-
----
-
-## Abort Handling: Two Paths
-
-Aborts can happen at two points: during streaming and during tool execution. Each has distinct behavior.
-
-**Abort during streaming**: The streaming executor (if active) drains remaining results, generating synthetic `tool_results` for queued tools. Without the executor, `yieldMissingToolResultBlocks` fills the gap. The `signal.reason` check distinguishes between a hard abort (Ctrl+C) and a submit-interrupt (user typed a new message) -- submit-interrupts skip the interruption message because the queued user message already provides context.
-
-**Abort during tool execution**: Similar logic, with a `toolUse: true` parameter on the interruption message signaling to the UI that tools were in progress.
+Он срабатывает в трех местах: обработчик внешней ошибки (сбой модели), обработчик резервного варианта (переключение модели в середине потока) и обработчик прерывания (прерывание пользователя). Каждый путь имеет разное сообщение об ошибке, но механизм идентичен.
 
 ---
 
-## The Thinking Rules
+## Обработка прерывания: два пути
 
-Claude's thinking/redacted_thinking blocks have three inviolable rules:
+Прерывание может произойти в двух моментах: во время streaming и во время выполнения tool. У каждого свое поведение.
 
-1. A message containing a thinking block must be part of a query whose `max_thinking_length > 0`
-2. A thinking block may not be the last block in a message
-3. Thinking blocks must be preserved for the duration of an assistant trajectory
+**Прерывание во время streaming**: исполнитель streaming (если активен) удаляет оставшиеся результаты, генерируя синтетический `tool_results` для tools, находящихся в очереди. Без исполнителя `yieldMissingToolResultBlocks` заполняет пробел. Проверка `signal.reason` различает жесткое прерывание (Ctrl+C) и прерывание отправки (пользователь ввел новое сообщение) — прерывания отправки пропускают сообщение о прерывании, поскольку сообщение пользователя в очереди уже предоставляет контекст.
 
-Violating any of these produces opaque API errors. The code handles them in several places: the fallback handler strips signature blocks (which are model-bound), the compaction pipeline preserves the protected tail, and the microcompact layer never touches thinking blocks.
+**Прерывание во время выполнения tool**: аналогичная логика, с параметром `toolUse: true` в сообщении о прерывании, сигнализирующим UI о том, что tools находятся в работе.
 
 ---
 
-## Dependency Injection
+## Правила мышления
 
-The `QueryDeps` type is intentionally narrow -- four dependencies, not forty:
+Блоки мышления/редактированного_мышления Клода имеют три нерушимых правила:
 
-Four injected dependencies: the model caller, the compactor, the microcompactor, and a UUID generator. Tests pass `deps` into the loop params to inject fakes directly. Using `typeof fn` for the type definitions keeps the signatures in sync automatically. Alongside the mutable `State` and the injectable `QueryDeps`, an immutable `QueryConfig` is snapshotted once at `query()` entry -- feature flags, session state, and environment variables captured once and never re-read. The three-way separation (mutable state, immutable config, injectable deps) makes the loop testable and makes the eventual refactor to a pure `step(state, event, config)` reducer straightforward.
+1. Сообщение, содержащее мыслительный блок, должно быть частью запроса, `max_thinking_length > 0` которого
+2. Блок мышления не может быть последним блоком в сообщении.
+3. Мыслительные блоки должны сохраняться на время прохождения ассистентской траектории.
+
+Нарушение любого из этих условий приводит к непрозрачным ошибкам API. Код обрабатывает их в нескольких местах: резервный обработчик удаляет блоки сигнатур (которые привязаны к модели), конвейер уплотнения сохраняет защищенный хвост, а слой микрокомпактности никогда не касается блоков мышления.
 
 ---
 
-## Apply This: Building Your Own Agent Loop
+## Внедрение зависимостей
 
-**Use a generator, not callbacks.** The backpressure is free. The return value semantics are free. The composability via `yield*` is free. Agent loops are strictly forward-moving -- you never need to rewind or fork.
+Тип `QueryDeps` намеренно узок — четыре зависимости, а не сорок:
 
-**Make state transitions explicit.** Reconstruct the full state object at every `continue` site. The verbosity is the feature -- it prevents partial-update bugs and makes each transition self-documenting.
+Четыре внедренные зависимости: вызывающая модель, компактор, микрокомпактор и генератор UUID. Тесты передают `deps` в параметры цикла для прямого внедрения подделок. Использование `typeof fn` для определений типов обеспечивает автоматическую синхронизацию подписей. Наряду с изменяемым `State` и внедряемым `QueryDeps`, неизменяемый `QueryConfig` создается один раз при записи `query()` — флаги функций, State сеанса и переменные среды сохраняются один раз и никогда не перечитываются. Трехстороннее разделение (изменяемое State, неизменяемая конфигурация, вводимые deps) делает цикл тестируемым и упрощает конечный рефакторинг до чистого редьюсера `step(state, event, config)`.
 
-**Withhold recoverable errors.** If your consumers disconnect on errors, do not yield errors until you know recovery has failed. Push them to an internal buffer, attempt recovery, and surface only on exhaustion.
+---
 
-**Layer your context management.** Light operations first (removal), heavy operations last (summarization). This preserves granular context when possible and falls back to monolithic summaries only when necessary.
+## Примените это: создайте собственный agent loop
 
-**Add circuit breakers for every retry.** Every recovery mechanism in `query.ts` has an explicit limit: 3 auto-compact failures, 3 max-output recovery attempts, 1 reactive compact attempt. Without these limits, the first production session that triggers a retry-on-failure loop will burn your API budget overnight.
+**Используйте генератор, а не callbacks.** Противодавление бесплатное. Семантика возвращаемого значения бесплатна. Возможность компоновки через `yield*` бесплатна. Циклы agents движутся строго вперед — вам никогда не придется перематывать или разветвлять циклы.
 
-The minimal agent loop skeleton, if you are starting from scratch:
+**Сделайте переходы между состояниями явными.** Восстановите полный объект State на каждом сайте `continue`. Особенностью является многословие: оно предотвращает ошибки частичного обновления и делает каждый переход самодокументируемым.
+
+**Не допускайте исправимых ошибок.** Если ваши потребители отключаются из-за ошибок, не выдавайте ошибки, пока не узнаете, что восстановление не удалось. Поместите их во внутренний буфер, попытайтесь восстановиться и всплывите на поверхность только после истощения.
+
+**Управляйте контекстом на уровне уровней.** Сначала легкие операции (удаление), затем тяжелые операции (суммирование). Это сохраняет детализированный контекст, когда это возможно, и возвращается к монолитным сводкам только при необходимости.
+
+**Добавляйте автоматические выключатели для каждой повторной попытки.** Каждый механизм восстановления в `query.ts` имеет явное ограничение: 3 сбоя автоматического сжатия, 3 попытки восстановления с максимальной выходной мощностью, 1 попытка реактивного сжатия. Без этих ограничений первый производственный сеанс, который запускает цикл повторных попыток в случае сбоя, в одночасье сожжет ваш бюджет API.
+
+Минимальный скелет agent loop, если вы начинаете с нуля:
 
 ```
 async function* agentLoop(params) {
@@ -492,14 +492,14 @@ async function* agentLoop(params) {
 }
 ```
 
-Every feature in Claude Code's loop is an elaboration of one of these steps. The four compression layers elaborate step 3 (compress). The withholding pattern elaborates the model call. The escalation ladder elaborates error recovery. Stop hooks elaborate the "no tool use" exit. Start with this skeleton. Add each elaboration only when you hit the problem it solves.
+Каждая функция в цикле Claude Code является разработкой одного из этих шагов. Четыре уровня сжатия реализуют этап 3 (сжатие). Модель удержания уточняет вызов модели. Лестница эскалации обеспечивает устранение ошибок. Стоп-hooks уточняют выход «без использования tools». Начните с этого скелета. Добавляйте каждую разработку только тогда, когда вы столкнетесь с проблемой, которую она решает.
 
 ---
 
-## Summary
+## Краткое содержание
 
-The agent loop is 1,730 lines of a single `while(true)` that does everything. It streams model responses, executes tools concurrently, compresses context through four layers, recovers from five categories of errors, tracks token budgets with diminishing returns detection, runs stop hooks that can force the model back to work, manages prefetch pipelines for memory and skills, and produces a typed discriminated union of exactly why it stopped.
+Цикл agent — это 1730 строк одного `while(true)`, который делает все. Он передает ответы модели, одновременно выполняет tools, сжимает контекст на четырех уровнях, восстанавливает пять категорий ошибок, отслеживает бюджеты токенов с обнаружением убывающей отдачи, запускает hooks остановки, которые могут заставить модель вернуться к работе, управляет конвейерами предварительной выборки для memory и skills и создает типизированное дискриминируемое объединение, объясняющее, почему именно она остановилась.
 
-It is the most important file in the system because it is the only file that touches every other subsystem. The context pipeline feeds into it. The tool system feeds out of it. The error recovery wraps around it. The hooks intercept it. The state layer persists through it. The UI renders from it.
+Это самый важный файл в системе, поскольку это единственный файл, который касается всех остальных подсистем. Контекстный конвейер подключается к нему. Tool System питается от него. Восстановление ошибок связано с этим. Hooks hook его. Уровень State сохраняется через него. Пользовательский интерфейс визуализируется из него.
 
-If you understand `query()`, you understand Claude Code. Everything else is a peripheral.
+Если вы понимаете `query()`, вы понимаете Claude Code. Все остальное — периферия.

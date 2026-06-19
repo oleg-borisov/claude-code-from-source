@@ -1,18 +1,18 @@
-# Chapter 15: MCP -- The Universal Tool Protocol
+# Глава 15: MCP — Универсальный протокол tools
 
-## Why MCP Matters Beyond Claude Code
+## Почему MCP важнее Claude Code
 
-Every other chapter in this book is about Claude Code's internals. This one is different. The Model Context Protocol is an open specification that any agent can implement, and Claude Code's MCP subsystem is one of the most complete production clients in existence. If you are building an agent that needs to call external tools -- any agent, in any language, on any model -- the patterns in this chapter transfer directly.
+Каждая вторая глава в этой книге посвящена внутреннему устройству Claude Code. Этот другой. Протокол контекста модели — это открытая спецификация, которую может реализовать любой agent, а подсистема MCP MCP — один из наиболее полных существующих производственных клиентов. Если вы создаете agent, которому необходимо вызывать внешние tools — любой agent, на любом языке, в любой модели — шаблоны, описанные в этой главе, передаются напрямую.
 
-The core proposition is straightforward: MCP defines a JSON-RPC 2.0 protocol for tool discovery and invocation between a client (the agent) and a server (the tool provider). The client sends `tools/list` to discover what a server offers, then `tools/call` to execute. The server describes each tool with a name, description, and JSON Schema for its inputs. That is the entire contract. Everything else -- transport selection, authentication, config loading, tool name normalization -- is the implementation work that turns a clean spec into something that survives contact with the real world.
+Основное предложение простое: MCP определяет протокол JSON-RPC 2.0 для обнаружения и tool call между клиентом (agent) и сервером (provider tool). Клиент отправляет `tools/list`, чтобы узнать, что предлагает сервер, а затем `tools/call` для выполнения. Сервер описывает каждый tool с именем, описанием и JSON Schema для его входных данных. Вот и весь контракт. Все остальное — выбор транспорта, аутентификация, загрузка конфигурации, нормализация имен tools — это работа по реализации, которая превращает чистую спецификацию во что-то, что выдерживает контакт с реальным миром.
 
-Claude Code's MCP implementation spans four core files: `types.ts`, `client.ts`, `auth.ts`, and `InProcessTransport.ts`. Together they support eight transport types, seven configuration scopes, OAuth discovery across two RFCs, and a tool wrapping layer that makes MCP tools indistinguishable from built-in ones -- the same `Tool` interface covered in Chapter 6. This chapter walks through each layer.
+Реализация MCP Claude Code охватывает четыре основных файла: `types.ts`, `client.ts`, `auth.ts` и `InProcessTransport.ts`. Вместе они поддерживают восемь типов транспорта, семь областей конфигурации, обнаружение OAuth в двух RFC и уровень упаковки tools, который делает tools MCP неотличимыми от встроенных — тот же интерфейс `Tool`, описанный в главе 6. В этой главе рассматривается каждый уровень.
 
 ---
 
-## Eight Transport Types
+## Восемь видов транспорта
 
-The first design decision in any MCP integration is how the client talks to the server. Claude Code supports eight transport configurations:
+Первое дизайнерское решение в любой интеграции MCP — это то, как клиент общается с сервером. Claude Code поддерживает восемь транспортных конфигураций:
 
 ```mermaid
 flowchart TD
@@ -47,51 +47,51 @@ flowchart TD
     style HTTP fill:#bbdefb
 ```
 
-Three design choices are worth noting. First, `stdio` is the default -- when `type` is omitted, the system assumes a local subprocess. This is backwards-compatible with the earliest MCP configs. Second, the fetch wrappers stack: timeout wrapping outside step-up detection, outside the base fetch. Each wrapper handles one concern. Third, the `ws-ide` branch has a Bun/Node runtime split -- Bun's `WebSocket` accepts proxy and TLS options natively, while Node requires the `ws` package.
+Стоит отметить три варианта дизайна. Во-первых, `stdio` используется по умолчанию — если `type` опущен, система предполагает локальный подпроцесс. Это обратно совместимо с самыми ранними конфигурациями MCP. Во-вторых, стек оберток выборки: упаковка тайм-аута вне обнаружения повышения, вне базовой выборки. Каждая оболочка решает одну Task. В-третьих, ветка `ws-ide` имеет разделение времени выполнения Bun/Node: `WebSocket` Bun изначально принимает параметры прокси и TLS, в то время как Node требуется batch `ws`.
 
-**When to use which.** For local tools (filesystem, database, custom scripts), `stdio` -- no network, no auth, just pipes. For remote services, `http` (Streamable HTTP) is the current spec recommendation. `sse` is legacy but widely deployed. The `sdk`, IDE, and `claudeai-proxy` types are internal to their respective ecosystems.
+**Когда и что использовать.** Для локальных tools (файловая система, база данных, пользовательские сценарии) `stdio` — без сети, без аутентификации, только каналы. Для удаленных служб текущей рекомендацией по спецификации является `http` (Streamable HTTP). `sse` — устаревший, но широко распространенный вариант. Типы `sdk`, IDE и `claudeai-proxy` являются внутренними для соответствующих экосистем.
 
 ---
 
-## Configuration Loading and Scoping
+## Загрузка конфигурации и определение области действия
 
-MCP server configs load from seven scopes, merged and deduplicated:
+Конфигурации сервера MCP загружаются из семи областей, объединенных и дедуплицированных:
 
-| Scope | Source | Trust |
+| Область применения | Источник | Доверие |
 |-------|--------|-------|
-| `local` | `.mcp.json` in working directory | Requires user approval |
-| `user` | `~/.claude.json` mcpServers field | User-managed |
-| `project` | Project-level config | Shared project settings |
-| `enterprise` | Managed enterprise config | Pre-approved by org |
-| `managed` | Plugin-provided servers | Auto-discovered |
-| `claudeai` | Claude.ai web interface | Pre-authorized via web |
-| `dynamic` | Runtime injection (SDK) | Programmatically added |
+| `local` | `.mcp.json` в рабочем каталоге | Требуется одобрение пользователя |
+| `user` | `~/.claude.json` поле mcpServers | Управляемый пользователем |
+| `project` | Конфигурация уровня проекта | Общие настройки проекта |
+| `enterprise` | Управляемая конфигурация предприятия | Предварительно одобрено организацией |
+| `managed` | Серверы с плагинами | Автоматически обнаружено |
+| `claudeai` | Claude.ai веб-интерфейс | Предварительная авторизация через Интернет |
+| `dynamic` | Внедрение во время выполнения (SDK) | Программно добавлено |
 
-**Deduplication is content-based, not name-based.** Two servers with different names but the same command or URL are recognized as the same server. The `getMcpServerSignature()` function computes a canonical key: `stdio:["command","arg1"]` for local servers, `url:https://example.com/mcp` for remote ones. Plugin-provided servers whose signature matches a manual config are suppressed.
-
----
-
-## Tool Wrapping: From MCP to Claude Code
-
-When a connection succeeds, the client calls `tools/list`. Each tool definition is transformed into Claude Code's internal `Tool` interface -- the same interface used by built-in tools. After wrapping, the model cannot distinguish between a built-in tool and an MCP tool.
-
-The wrapping process has four stages:
-
-**1. Name normalization.** `normalizeNameForMCP()` replaces invalid characters with underscores. The fully qualified name follows `mcp__{serverName}__{toolName}`.
-
-**2. Description truncation.** Capped at 2,048 characters. OpenAPI-generated servers have been observed dumping 15-60KB into `tool.description` -- roughly 15,000 tokens per turn for a single tool.
-
-**3. Schema passthrough.** The tool's `inputSchema` passes directly to the API. No transformation, no validation at wrapping time. Schema errors surface at call time, not registration time.
-
-**4. Annotation mapping.** MCP annotations map to behavior flags: `readOnlyHint` marks tools safe for concurrent execution (as discussed in Chapter 7's streaming executor), `destructiveHint` triggers extra permission scrutiny. These annotations come from the MCP server -- a malicious server could mark a destructive tool as read-only. This is an accepted trust boundary, but one worth understanding: the user opted into the server, and a malicious server marking destructive tools as read-only is a real attack vector. The system accepts this tradeoff because the alternative -- ignoring annotations entirely -- would prevent legitimate servers from improving the user experience.
+**Дедупликация осуществляется на основе содержимого, а не имени.** Два сервера с разными именами, но с одинаковой командой или URL-адресом распознаются как один и тот же сервер. Функция `getMcpServerSignature()` вычисляет канонический ключ: `stdio:["command","arg1"]` для локальных серверов, `url:https://example.com/mcp` для удаленных. Серверы с подключаемыми модулями, подпись которых соответствует конфигурации, указанной вручную, подавляются.
 
 ---
 
-## OAuth for MCP Servers
+## Упаковка tools: от MCP до Claude Code
 
-Remote MCP servers often require authentication. Claude Code implements the full OAuth 2.0 + PKCE flow with RFC-based discovery, Cross-App Access, and error body normalization.
+При успешном соединении клиент вызывает `tools/list`. Каждое определение tool преобразуется во внутренний интерфейс `Tool` Claude Code — тот же интерфейс, который используется встроенными tools. После упаковки модель не может отличить встроенный tool от tool MCP.
 
-### Discovery Chain
+Процесс упаковки состоит из четырех этапов:
+
+**1. Нормализация имени.** `normalizeNameForMCP()` заменяет недопустимые символы символами подчеркивания. Полное имя следует за `mcp__{serverName}__{toolName}`.
+
+**2. Усечение описания.** Не более 2048 символов. Было замечено, что серверы, сгенерированные OpenAPI, сбрасывают 15–60 КБ в `tool.description` — примерно 15 000 токенов за ход для одного tool.
+
+**3. Сквозная передача схемы.** `inputSchema` tool передается непосредственно в API. Никакого преобразования, никакой проверки во время упаковки. Ошибки схемы возникают во время вызова, а не во время регистрации.
+
+**4. Отображение аннотаций.** Аннотации MCP сопоставляются с флагами поведения: `readOnlyHint` отмечает tools, безопасные для одновременного выполнения (как обсуждалось в потоковом исполнителе главы 7), `destructiveHint` запускает дополнительную проверку разрешений. Эти аннотации исходят от сервера MCP — вредоносный сервер может пометить деструктивный tool как доступный только для чтения. Это общепринятая граница доверия, но ее стоит понимать: пользователь выбрал сервер, а вредоносный сервер, помечающий деструктивные tools как доступные только для чтения, является реальным вектором атаки. Система принимает этот компромисс, потому что альтернатива — полное игнорирование аннотаций — помешает законным серверам улучшить взаимодействие с пользователем.
+
+---
+
+## OAuth для серверов MCP
+
+Удаленные серверы MCP часто требуют аутентификации. Claude Code реализует полный поток OAuth 2.0 + PKCE с обнаружением на основе RFC, межприложенным доступом и нормализацией тела ошибки.
+
+### Цепочка открытий
 
 ```mermaid
 flowchart TD
@@ -111,21 +111,21 @@ flowchart TD
     style I fill:#ffcdd2
 ```
 
-The `authServerMetadataUrl` escape hatch exists because some OAuth servers implement neither RFC.
+Аварийный выход `authServerMetadataUrl` существует, поскольку некоторые серверы OAuth не реализуют ни один RFC.
 
-### Cross-App Access (XAA)
+### Доступ между приложениями (XAA)
 
-When an MCP server config has `oauth.xaa: true`, the system performs federated token exchange through an Identity Provider -- one IdP login unlocks multiple MCP servers.
+Если в конфигурации сервера MCP имеется `oauth.xaa: true`, система выполняет федеративный обмен токенами через provider удостоверений — один вход в систему IdP разблокирует несколько серверов MCP.
 
-### Error Body Normalization
+### Нормализация тела ошибки
 
-The `normalizeOAuthErrorBody()` function handles OAuth servers that violate the spec. Slack returns HTTP 200 for error responses with the error buried in the JSON body. The function peeks at 2xx POST response bodies, and when the body matches `OAuthErrorResponseSchema` but not `OAuthTokensSchema`, rewrites the response to HTTP 400. It also normalizes Slack-specific error codes (`invalid_refresh_token`, `expired_refresh_token`, `token_expired`) to the standard `invalid_grant`.
+Функция `normalizeOAuthErrorBody()` обрабатывает серверы OAuth, нарушающие спецификацию. Slack возвращает HTTP 200 для ответов об ошибках, причем ошибка скрыта в теле JSON. Функция просматривает 2xx тела ответа POST, и когда тело соответствует `OAuthErrorResponseSchema`, но не `OAuthTokensSchema`, перезаписывает ответ на HTTP 400. Она также нормализует коды ошибок, специфичные для Slack (`invalid_refresh_token`, `expired_refresh_token`, `token_expired`) к стандарту `invalid_grant`.
 
 ---
 
-## In-Process Transport
+## Внутрипроизводственный транспорт
 
-Not every MCP server needs to be a separate process. The `InProcessTransport` class enables running an MCP server and client in the same process:
+Не каждый сервер MCP должен быть отдельным процессом. Класс `InProcessTransport` позволяет запускать сервер и клиент MCP в одном процессе:
 
 ```typescript
 class InProcessTransport implements Transport {
@@ -145,19 +145,19 @@ class InProcessTransport implements Transport {
 }
 ```
 
-The entire file is 63 lines. Two design decisions deserve attention. First, `send()` delivers via `queueMicrotask()` to prevent stack depth issues in synchronous request/response cycles. Second, `close()` cascades to the peer, preventing half-open states. The Chrome MCP server and Computer Use MCP server both use this pattern.
+Весь файл состоит из 63 строк. Заслуживают внимания два дизайнерских решения. Во-первых, `send()` доставляет данные через `queueMicrotask()`, чтобы предотвратить проблемы с глубиной стека в синхронных циклах запроса/ответа. Во-вторых, `close()` каскадируется к узлу, предотвращая полуоткрытые State. Сервер Chrome MCP и сервер Computer Use MCP используют этот шаблон.
 
 ---
 
-## Connection Management
+## Управление соединениями
 
-### Connection States
+### State соединения
 
-Each MCP server connection exists in one of five states: `connected`, `failed`, `needs-auth` (with a 15-minute TTL cache to prevent 30 servers from independently discovering the same expired token), `pending`, or `disabled`.
+Каждое соединение с сервером MCP существует в одном из пяти State: `connected`, `failed`, `needs-auth` (с 15-минутным TTL-кешем, чтобы предотвратить независимое обнаружение 30 серверами одного и того же токена с истекшим сроком действия), `pending` или `disabled`.
 
-### Session Expiry Detection
+### Обнаружение окончания сеанса
 
-MCP's Streamable HTTP transport uses session IDs. When a server restarts, requests return HTTP 404 with JSON-RPC error code -32001. The `isMcpSessionExpiredError()` function checks both signals -- note that it uses string inclusion on the error message to detect the error code, which is pragmatic but fragile:
+Транспорт Streamable HTTP MCP использует идентификаторы сеансов. При перезапуске сервера запросы возвращают HTTP 404 с кодом ошибки JSON-RPC -32001. Функция `isMcpSessionExpiredError()` проверяет оба сигнала — обратите внимание, что она использует включение строки в сообщение об ошибке для обнаружения кода ошибки, что прагматично, но хрупко:
 
 ```typescript
 export function isMcpSessionExpiredError(error: Error): boolean {
@@ -168,49 +168,49 @@ export function isMcpSessionExpiredError(error: Error): boolean {
 }
 ```
 
-On detection, the connection cache clears and the call retries once.
+При обнаружении кэш соединения очищается, и вызов повторяется один раз.
 
-### Batched Connections
+### Пакетные соединения
 
-Local servers connect in batches of 3 (spawning processes can exhaust file descriptors), remote servers in batches of 20. The React context provider `MCPConnectionManager.tsx` manages the lifecycle, diffing current connections against new configs.
-
----
-
-## Claude.ai Proxy Transport
-
-The `claudeai-proxy` transport illustrates a common agent integration pattern: connecting through an intermediary. Claude.ai subscribers configure MCP "connectors" through the web interface, and the CLI routes through Claude.ai's infrastructure which handles vendor-side OAuth.
-
-The `createClaudeAiProxyFetch()` function captures the `sentToken` at request time, not re-read after a 401. Under concurrent 401s from multiple connectors, another connector's retry might have already refreshed the token. The function also checks for concurrent refreshes even when the refresh handler returns false -- the "ELOCKED contention" case where another connector won the lockfile race.
+Локальные серверы подключаются группами по 3 (процессы создания могут исчерпать файловые дескрипторы), удаленные серверы - группами по 20. Provider контекста React `MCPConnectionManager.tsx` управляет жизненным циклом, сравнивая текущие соединения с новыми конфигурациями.
 
 ---
 
-## Timeout Architecture
+## Claude.ai Прокси-транспорт
 
-MCP timeouts are layered, each protecting against a different failure mode:
+Транспорт `claudeai-proxy` иллюстрирует общий шаблон интеграции agents: подключение через посредника. Подписчики Claude.ai настраивают «соединители» MCP через веб-интерфейс, а CLI маршрутизируется через инфраструктуру Claude.ai, которая обрабатывает OAuth на стороне provider.
 
-| Layer | Duration | Protects Against |
+Функция `createClaudeAiProxyFetch()` захватывает `sentToken` во время запроса, а не перечитывает его после ошибки 401. При одновременных сообщениях 401 от нескольких соединителей повторная попытка другого соединителя могла уже обновить токен. Функция также проверяет наличие одновременных обновлений, даже если обработчик обновления возвращает false — случай «ELOCKED-конкуренции», когда другой соединитель выиграл гонку файлов блокировки.
+
+---
+
+## Архитектура тайм-аута
+
+Тайм-ауты MCP являются многоуровневыми, каждый из которых защищает от разных режимов сбоя:
+
+| Слой | Продолжительность | Защищает от |
 |-------|----------|------------------|
-| Connection | 30s | Unreachable or slow-starting servers |
-| Per-request | 60s (fresh per request) | Stale timeout signal bug |
-| Tool call | ~27.8 hours | Legitimately long operations |
-| Auth | 30s per OAuth request | Unreachable OAuth servers |
+| Подключение | 30-е годы | Недоступные или медленно запускающиеся серверы |
+| По запросу | 60-е (свежие по запросу) | Ошибка сигнала устаревшего тайм-аута |
+| Вызов tool | ~27,8 часов | Законно длительные операции |
+| Авторизация | 30 секунд на запрос OAuth | Недоступные серверы OAuth |
 
-The per-request timeout deserves emphasis. Early implementations created a single `AbortSignal.timeout(60000)` at connection time. After 60 seconds of idle time, the next request would abort immediately -- the signal was already expired. The fix: `wrapFetchWithTimeout()` creates a fresh timeout signal for every request. It also normalizes the `Accept` header as a last-step defense against runtimes and proxies that drop it.
+Тайм-аут каждого запроса заслуживает особого внимания. Ранние реализации создавали один `AbortSignal.timeout(60000)` во время соединения. После 60 секунд простоя следующий запрос немедленно прерывается — срок действия сигнала уже истек. Исправление: `wrapFetchWithTimeout()` создает новый сигнал тайм-аута для каждого запроса. Он также нормализует frontmatter `Accept` в качестве последнего шага защиты от сред выполнения и прокси, которые его удаляют.
 
 ---
 
-## Apply This: Integrating MCP Into Your Own Agent
+## Примените это: интеграция MCP в ваш собственный agent
 
-**Start with stdio, add complexity later.** `StdioClientTransport` handles everything: spawn, pipe, kill. One line of config, one transport class, and you have MCP tools.
+**Начните со stdio, усложните позже.** `StdioClientTransport` обрабатывает все: создание, конвейер, уничтожение. Одна строка конфига, один транспортный класс и у вас есть tools MCP.
 
-**Normalize names and truncate descriptions.** Names must match `^[a-zA-Z0-9_-]{1,64}$`. Prefix with `mcp__{serverName}__` to avoid collisions. Cap descriptions at 2,048 characters -- OpenAPI-generated servers will waste context tokens otherwise.
+**Нормализовать имена и сократить описания.** Имена должны соответствовать `^[a-zA-Z0-9_-]{1,64}$`. Префикс `mcp__{serverName}__`, чтобы избежать коллизий. Ограничьте описания длиной 2048 символов. В противном случае серверы, созданные OpenAPI, будут тратить токены контекста.
 
-**Handle auth lazily.** Do not attempt OAuth until a server returns 401. Most stdio servers need no auth.
+**Лениво обрабатывайте аутентификацию.** Не пытайтесь выполнить OAuth, пока сервер не вернет код 401. Большинству серверов stdio аутентификация не требуется.
 
-**Use in-process transport for built-in servers.** `createLinkedTransportPair()` eliminates subprocess overhead for servers you control.
+**Используйте внутрипроцессный транспорт для встроенных серверов.** `createLinkedTransportPair()` устраняет накладные расходы на подпроцессы для серверов, которыми вы управляете.
 
-**Respect tool annotations and sanitize output.** `readOnlyHint` enables concurrent execution. Sanitize responses against malicious Unicode (bidirectional overrides, zero-width joiners) that could mislead the model.
+**Соблюдайте аннотации tools и очищайте выходные данные.** `readOnlyHint` обеспечивает параллельное выполнение. Очистите ответы от вредоносного Unicode (двунаправленные переопределения, соединения нулевой ширины), которые могут ввести модель в заблуждение.
 
-The MCP protocol is deliberately minimal -- two JSON-RPC methods. Everything between those methods and a production deployment is engineering: eight transports, seven config scopes, two OAuth RFCs, and timeout layering. Claude Code's implementation shows what that engineering looks like at scale.
+Протокол MCP намеренно минимален — два метода JSON-RPC. Все, что находится между этими методами и производственным развертыванием, является инженерным: восемь транспортов, семь областей конфигурации, два RFC OAuth и распределение тайм-аутов. Реализация Claude Code показывает, как эта инженерия выглядит в масштабе.
 
-The next chapter examines what happens when the agent reaches beyond localhost: the remote execution protocols that let Claude Code run in cloud containers, accept instructions from web browsers, and tunnel API traffic through credential-injecting proxies.
+В следующей главе рассматривается, что происходит, когда agent выходит за пределы локального хоста: протоколы удаленного выполнения, которые позволяют Claude Code работать в облачных контейнерах, принимать инструкции от веб-браузеров и туннелировать трафик API через прокси-серверы, вводящие учетные данные.

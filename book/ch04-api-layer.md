@@ -1,10 +1,10 @@
-# Chapter 4: Talking to Claude -- The API Layer
+# Глава 4: Разговор с Клодом — слой API
 
-Chapter 3 established where state lives and how the two tiers communicate. Now we follow what happens when that state is put to use: the system needs to talk to a language model. Everything in Claude Code -- the bootstrap sequence, the state system, the permission framework -- exists to serve this moment.
+В главе 3 установлено, где живет state и как взаимодействуют два уровня. Теперь мы проследим, что происходит, когда это State используется: системе необходимо взаимодействовать с языковой моделью. Все в Claude Code — последовательность начальной загрузки, система State, структура разрешений — существует для того, чтобы служить этому моменту.
 
-This layer handles more failure modes than any other part of the system. It must route through four cloud providers via a single transparent interface. It must construct system prompts with byte-level awareness of how the server's prompt cache works, because a single misplaced section can bust a cache worth 50,000+ tokens. It must stream responses with active failure detection, because TCP connections die silently. And it must maintain session-stable invariants so that mid-conversation changes to feature flags do not cause invisible performance cliffs.
+Этот уровень обрабатывает больше режимов сбоя, чем любая другая часть системы. Он должен проходить через четырех облачных провайдеров через единый прозрачный интерфейс. Он должен создавать системные prompt с пониманием на уровне байтов того, как работает Prompt Cache сервера, поскольку один неуместный раздел может привести к разрушению кэша, содержащего более 50 000 токенов. Он должен передавать ответы с активным обнаружением сбоев, поскольку соединения TCP прекращаются молча. И он должен поддерживать стабильные для сеанса инварианты, чтобы изменения флагов функций в середине диалога не вызывали невидимых скачков производительности.
 
-Let us trace a single API call from start to finish.
+Давайте проследим один вызов API от начала до конца.
 
 ```mermaid
 sequenceDiagram
@@ -42,9 +42,9 @@ sequenceDiagram
 
 ---
 
-## The Multi-Provider Client Factory
+## Фабрика клиентов с несколькими provider
 
-The `getAnthropicClient()` function is the single factory for all model communication. It returns an Anthropic SDK client configured for whichever provider the deployment targets:
+Функция `getAnthropicClient()` — это единая фабрика для связи всей модели. Он возвращает клиент Anthropic SDK, настроенный для любого provider, на который нацелено развертывание:
 
 ```mermaid
 graph LR
@@ -56,25 +56,25 @@ graph LR
     SDK --> CL["callModel()"]
 ```
 
-The dispatch is entirely environment-variable driven, evaluated in a fixed priority order. All four provider-specific SDK classes are cast to `Anthropic` via `as unknown as Anthropic`. The comment in the source is refreshingly honest: "we have always been lying about the return type." This deliberate type erasure means every consumer sees a uniform interface. The rest of the codebase never branches on provider.
+Отправка полностью управляется переменными среды и оценивается в фиксированном порядке приоритетов. Все четыре класса SDK, специфичные для provider, преобразуются в `Anthropic` через `as unknown as Anthropic`. Комментарий в источнике предельно честен: «мы всегда лгали о типе возвращаемого значения». Такое намеренное стирание типов означает, что каждый потребитель видит единый интерфейс. Остальная часть кодовой базы никогда не разветвляется на провайдера.
 
-Each provider SDK is dynamically imported -- `AnthropicBedrock`, `AnthropicFoundry`, `AnthropicVertex` are heavy modules with their own dependency trees. The dynamic import ensures unused providers never load.
+Каждый provider SDK импортируется динамически. `AnthropicBedrock`, `AnthropicFoundry`, `AnthropicVertex` — это тяжелые модули со своими собственными деревьями зависимостей. Динамический импорт гарантирует, что неиспользуемые providers никогда не загружаются.
 
-Provider selection is determined at startup and stored in bootstrap `STATE`. The query loop never checks which provider is active. Switching from Direct API to Bedrock is a configuration change, not a code change.
+Выбор provider определяется при запуске и сохраняется в загрузочном файле `STATE`. Query Loop никогда не проверяет, какой provider активен. Переход с Direct API на Bedrock — это изменение конфигурации, а не кода.
 
-### The buildFetch Wrapper
+### Оболочка buildFetch
 
-Every outbound fetch gets wrapped to inject an `x-client-request-id` header -- a UUID generated per request. When a request times out, the server never assigns a request ID to the response. Without the client-side ID, the API team cannot correlate the timeout with server-side logs. This header bridges that gap. It is only sent to first-party Anthropic endpoints -- third-party providers might reject unknown headers.
+Каждая исходящая выборка оборачивается для внедрения заголовка `x-client-request-id` — UUID, создаваемого для каждого запроса. Когда время запроса истекает, сервер никогда не присваивает идентификатор запроса ответу. Без идентификатора на стороне клиента команда API не может сопоставить время ожидания с журналами на стороне сервера. Этот frontmatter устраняет этот пробел. Он отправляется только на собственные конечные точки Anthropic — сторонние providers могут отклонять неизвестные заголовки.
 
 ---
 
-## System Prompt Construction
+## prompt создания системы
 
-The system prompt is the most cache-sensitive artifact in the entire system. Claude's API provides server-side prompt caching: identical prompt prefixes across requests can be cached, saving both latency and cost. A 200K-token conversation might have 50-70K tokens that are identical to the previous turn. Busting that cache forces the server to re-process all of it.
+Системное prompt является наиболее чувствительным к кэшу артефактом во всей системе. API Клода обеспечивает кэширование prompts на стороне сервера: можно кэшировать одинаковые префиксы prompts для всех запросов, что позволяет сэкономить как задержку, так и затраты. Разговор с 200 000 токенов может содержать 50-70 000 токенов, идентичных предыдущему ходу. Освобождение этого кеша заставляет сервер заново его обработать.
 
-### The Dynamic Boundary Marker
+### Динамический маркер границы
 
-The prompt is built as an array of string sections with a critical dividing line:
+prompt построено как массив строковых разделов с критической разделительной линией:
 
 ```mermaid
 flowchart TD
@@ -108,108 +108,108 @@ flowchart TD
     style Dynamic fill:#ddf,stroke:#333
 ```
 
-Everything before the boundary is identical across sessions, users, and organizations -- it gets the highest tier of server-side caching. Everything after contains user-specific content and drops to per-session caching.
+Все, что находится до границы, идентично для всех сеансов, пользователей и организаций — оно получает самый высокий уровень кэширования на стороне сервера. Все, что происходит после, содержит пользовательский контент и переходит в кэширование для каждого сеанса.
 
-The naming convention for sections is deliberately loud. Adding a new section requires choosing between `systemPromptSection` (safe, cached) and `DANGEROUS_uncachedSystemPromptSection` (cache-breaking, requires a reason string). The `_reason` parameter is unused at runtime but serves as mandatory documentation -- every cache-breaking section carries its justification in the source code.
+Соглашение об именах разделов намеренно громкое. Для добавления нового раздела необходимо выбрать между `systemPromptSection` (безопасный, cached) и `DANGEROUS_uncachedSystemPromptSection` (взлом кэша, требуется строка причины). Параметр `_reason` не используется во время выполнения, но служит обязательной документацией — каждый раздел взлома кэша имеет свое обоснование в исходном коде.
 
-### The 2^N Problem
+### Проблема 2^N
 
-A comment in `prompts.ts` explains why conditional sections must go after the boundary:
+Комментарий в `prompts.ts` объясняет, почему условные разделы должны идти после границы:
 
-> Each conditional here is a runtime bit that would otherwise multiply the Blake2b prefix hash variants (2^N).
+> Каждое условие здесь представляет собой бит времени выполнения, который в противном случае умножил бы варианты хэша префикса Blake2b (2^N).
 
-Every boolean condition before the boundary doubles the number of unique global cache entries. Three conditionals create 8 variants; five create 32. The static sections are deliberately unconditional. Compile-time feature flags (resolved by the bundler) are acceptable before the boundary. Runtime checks (is this Haiku? does the user have auto mode?) must go after.
+Каждое логическое условие перед границей удваивает количество уникальных записей глобального кэша. Три условных предложения создают 8 вариантов; пять создают 32. Статические разделы намеренно безусловны. Флаги функций времени компиляции (разрешенные bundler) приемлемы до границы. После этого должны пройти проверки во время выполнения (это Haiku? Есть ли у пользователя автоматический режим?).
 
-This is the kind of constraint that is invisible until you violate it. A well-intentioned engineer adding a user-setting-gated section before the boundary could silently fragment the global cache and double the fleet's prompt processing costs.
-
----
-
-## Streaming
-
-### Raw SSE Over SDK Abstractions
-
-The streaming implementation uses the raw `Stream<BetaRawMessageStreamEvent>` rather than the SDK's higher-level `BetaMessageStream`. The reason: `BetaMessageStream` calls `partialParse()` on every `input_json_delta` event. For tool calls with large JSON inputs (file edits with hundreds of lines), this re-parses the growing JSON string from scratch on every chunk -- O(n^2) behavior. Claude Code handles tool input accumulation itself, so the partial parsing is pure waste.
-
-### The Idle Watchdog
-
-TCP connections can die without notification. The server may crash, a load balancer may silently drop the connection, or a corporate proxy may time out. The SDK's request timeout only covers the initial fetch -- once HTTP 200 arrives, the timeout is satisfied. If the streaming body stops, nothing catches it.
-
-The watchdog: a `setTimeout` that resets on every received chunk. If no chunks arrive for 90 seconds, the stream is aborted and the system falls back to a non-streaming retry. A warning fires at the 45-second mark. When the watchdog fires, it logs the event with the client request ID for correlation.
-
-### Non-Streaming Fallback
-
-When streaming fails mid-response (network error, stall, truncation), the system falls back to a synchronous `messages.create()` call. This handles proxy failures where the proxy returns HTTP 200 with a non-SSE body, or truncates the SSE stream partway through.
-
-The fallback can be disabled when streaming tool execution is active, since a fallback would re-execute the entire request and potentially run tools twice.
+Это тот тип ограничения, который невидим, пока вы его не нарушите. Инженер из лучших побуждений, добавляющий перед границей раздел, закрытый пользователем, может незаметно фрагментировать глобальный кэш и удвоить затраты на быструю обработку данных.
 
 ---
 
-## Prompt Cache System
+## Стриминг
 
-### Three Tiers
+### Необработанный SSE поверх абстракций SDK
 
-Prompt caching operates at three levels:
+Реализация streaming использует необработанный `Stream<BetaRawMessageStreamEvent>`, а не `BetaMessageStream` более высокого уровня SDK. Причина: `BetaMessageStream` вызывает `partialParse()` при каждом событии `input_json_delta`. Для tool calls с большими входными данными JSON (редактирование файлов с сотнями строк) это повторно анализирует растущую строку JSON с нуля на каждом фрагменте - поведение O(n^2). Claude Code сам обрабатывает накопление входных данных tool, поэтому частичный анализ является чистой тратой.
 
-**Ephemeral cache** (default): Per-session caching with a server-defined TTL (~5 minutes). All users get this.
+### Праздный сторожевой пес
 
-**1-hour TTL**: Eligible users get extended caching. Eligibility is determined by subscription status and latched in bootstrap state -- the `promptCache1hEligible` sticky latch from Chapter 3 ensures a mid-session overage flip does not change the TTL.
+Соединения TCP могут прерываться без уведомления. Сервер может выйти из строя, балансировщик нагрузки может автоматически разорвать соединение или время ожидания корпоративного прокси-сервера может истечь. Тайм-аут запроса SDK охватывает только первоначальную выборку — как только приходит HTTP 200, тайм-аут удовлетворяется. Если струящееся тело остановится, его ничто не уловит.
 
-**Global scope**: System prompt cache entries get cross-session, cross-organization sharing. The static portions of the prompt are identical for all Claude Code users, so a single cached copy serves everyone. Global scope is disabled when MCP tools are present, because MCP tool definitions are user-specific and would fragment the cache into millions of unique prefixes.
+Сторожевой таймер: `setTimeout`, который сбрасывается при каждом полученном фрагменте. Если в течение 90 секунд не поступает ни одного фрагмента, поток прерывается, и система возвращается к повторной попытке без streaming. Предупреждение срабатывает на отметке 45 секунд. Когда сторожевой таймер срабатывает, он регистрирует событие с идентификатором запроса клиента для корреляции.
 
-### The Sticky Latches in Action
+### Резервный вариант без streaming
 
-The five sticky latches from Chapter 3 are evaluated here, during request construction. Each latch starts as `null` and, once set to `true`, remains `true` for the session. The comment above the latch block is precise: "Sticky-on latches for dynamic beta headers. Each header, once first sent, keeps being sent for the rest of the session so mid-session toggles don't change the server-side cache key and bust ~50-70K tokens."
+Если streaming завершается сбоем в середине ответа (ошибка сети, зависание, усечение), система возвращается к синхронному вызову `messages.create()`. Это обрабатывает сбои прокси-сервера, когда прокси-сервер возвращает HTTP 200 с телом, отличным от SSE, или обрезает поток SSE на полпути.
 
-See Chapter 3, Section 3.1 for the full explanation of the latch pattern, the five specific latches, and why always-send-all-headers is not the right solution.
-
----
-
-## The queryModel Generator
-
-The `queryModel()` function is an async generator (~700 lines) that orchestrates the entire API call lifecycle. It yields `StreamEvent`, `AssistantMessage`, and `SystemAPIErrorMessage` objects.
-
-The request assembly follows a carefully ordered sequence:
-
-1. **Kill switch check** -- safety valve for the most expensive model tier
-2. **Beta header assembly** -- model-specific, with sticky latches applied
-3. **Tool schema building** -- parallel via `Promise.all()`, deferred tools excluded until discovered
-4. **Message normalization** -- repair orphaned tool_use/tool_result mismatches, strip excess media, remove stale blocks
-5. **System prompt block construction** -- split at the dynamic boundary, assign cache scopes
-6. **Retry-wrapped streaming** -- handles 529 (overloaded), model fallback, thinking downgrade, OAuth refresh
-
-### Output Token Cap
-
-The default output cap is 8,000 tokens, not the typical 32K or 64K. Production data showed that p99 output is 4,911 tokens -- standard limits over-reserve by 8-16x. When a response hits the cap (<1% of requests), it gets one clean retry at 64K. This saves significant cost at fleet scale.
-
-### Error Handling and Retry
-
-The `withRetry()` function is itself an async generator that yields `SystemAPIErrorMessage` events so the UI can display retry status. Retry strategies:
-
-- **529 (overloaded)**: Wait and retry, optionally downgrading fast mode
-- **Model fallback**: Primary model fails, try a fallback (e.g., Opus to Sonnet)
-- **Thinking downgrade**: Context window overflow triggers reduced thinking budget
-- **OAuth 401**: Refresh token and retry once
-
-The generator pattern means retry progress ("Server overloaded, retrying in 5s...") appears as a natural part of the event stream, not as a side-channel notification.
+Резервный вариант можно отключить, когда активно tool execution streaming, поскольку при возврате будет повторно выполняться весь запрос и потенциально запускаться tools дважды.
 
 ---
 
-## Apply This
+## Система кэширования prompts
 
-**Treat prompt caching as an architectural constraint, not a feature toggle.** Most LLM applications "turn on" caching. Claude Code treats it as a design constraint that shapes prompt ordering, section memoization, header latching, and configuration management. The difference between a well-structured prompt (cache hit on 50K tokens) and a poorly-structured one (full reprocessing every turn) is the single largest cost lever in the system.
+### Три уровня
 
-**Use the DANGEROUS naming convention for costly escape hatches.** When a codebase has an invariant that is easy to violate accidentally, naming the escape hatch with a loud prefix does three things: makes violations visible in code review, forces documentation (the required reason parameter), and creates psychological friction toward the safe default. This generalizes beyond caching to any operation with invisible cost.
+Оперативное кэширование работает на трех уровнях:
 
-**Build streaming with a watchdog, not just a timeout.** The SDK's request timeout satisfies on HTTP 200, but the response body can stop arriving at any point. A `setTimeout` that resets on every chunk catches this. The non-streaming fallback handles proxy failure modes (HTTP 200 with non-SSE body, mid-stream truncation) that are more common than you expect in corporate environments.
+**Эфемерный кеш** (по умолчанию): кэширование для каждого сеанса с определяемым сервером сроком жизни (~5 минут). Все пользователи это понимают.
 
-**Make retry strategies yield-based, not exception-based.** By making the retry wrapper an async generator that yields status events, the caller displays retry progress as a natural part of the event stream. The model fallback pattern (Opus fails, try Sonnet) is particularly useful for production resilience.
+**1 час TTL**: пользователи, соответствующие критериям, получают расширенное кэширование. Право на участие определяется статусом подписки и фиксируется в State начальной загрузки — липкая защелка `promptCache1hEligible` из главы 3 гарантирует, что переворот в середине сеанса не приведет к изменению TTL.
 
-**Separate the fast path from the full pipeline.** Not every API call needs tool search, advisor integration, thinking budgets, and streaming infrastructure. Claude Code's `queryHaiku()` function provides a streamlined path for internal operations (compaction, classification) that skips all agentic concerns. A separate function with a simplified interface prevents accidental complexity leakage.
+**Глобальная область**. Записи системного Prompt Cache доступны для общего доступа между сеансами и между организациями. Статические части prompt одинаковы для всех пользователей Claude Code, поэтому всем служит одна кэшированная копия. Глобальная область отключена, когда присутствуют tools MCP, поскольку определения tools MCP зависят от пользователя и фрагментируют кэш на миллионы уникальных префиксов.
+
+### Липкие защелки в действии
+
+Здесь во время построения запроса оцениваются пять липких защелок из главы 3. Каждая блокировка начинается с `null` и, если она установлена ​​на `true`, остается `true` для сеанса. Комментарий над блоком защелки точен: «Прикрепленные защелки для динамических бета-заголовков. Каждый frontmatter, однажды отправленный впервые, продолжает отправляться до конца сеанса, поэтому переключатели в середине сеанса не изменяют ключ кэша на стороне сервера и не уничтожают ~ 50-70 тысяч токенов».
+
+См. главу 3, раздел 3.1 для полного объяснения шаблона блокировки, пяти конкретных блокировок и того, почему всегда отправлять все заголовки не является правильным решением.
 
 ---
 
-## Looking Ahead
+## Генератор модели запроса
 
-The API layer sits at the foundation of everything that follows. Chapter 5 will show how the query loop uses the streaming response to drive tool execution -- including how tools begin executing before the model finishes its response. Chapter 6 will explain how the compaction system preserves cache efficiency when conversations approach the context limit. Chapter 7 will show how each agent thread gets its own message array and request chain.
+Функция `queryModel()` — это асинхронный генератор (около 700 строк), который управляет всем жизненным циклом вызова API. Он дает объекты `StreamEvent`, `AssistantMessage` и `SystemAPIErrorMessage`.
 
-All of those systems inherit the constraints established here: cache stability as an architectural invariant, provider transparency through the client factory, and session-stable configuration through the latch system. The API layer does not just send requests -- it defines the rules by which every other system operates.
+Сборка запроса следует тщательно упорядоченной последовательности:
+
+1. **Проверка аварийного выключателя** – предохранительный клапан для самых дорогих моделей.
+2. **Бета-разъем** в зависимости от модели, с прикрепленными липкими защелками.
+3. **Построение схемы tools** — параллельно через `Promise.all()`, отложенные tools исключаются до тех пор, пока не будут обнаружены.
+4. **Нормализация сообщений** — исправление потерянных несоответствийtool_use/tool_result, удаление лишнего носителя, удаление устаревших блоков.
+5. **Создание блока системных prompts** – разделение по динамической границе, назначение областей кэша.
+6. **Потоковая передача с повторной попыткой** — обрабатывает 529 (перегрузку), возврат модели, понижение версии, обновление OAuth.
+
+### Ограничение выходного токена
+
+Ограничение вывода по умолчанию составляет 8000 токенов, а не типичные 32 КБ или 64 КБ. Производственные данные показали, что выход p99 составляет 4911 токенов — стандартные ограничения превышения резерва в 8-16 раз. Когда ответ достигает ограничения (<1% запросов), он получает одну чистую повторную попытку с размером 64 КБ. Это позволяет существенно сэкономить на масштабах автопарка.
+
+### Обработка ошибок и повторная попытка
+
+Функция `withRetry()` сама по себе является асинхронным генератором, который генерирует события `SystemAPIErrorMessage`, чтобы UI мог отображать статус повтора. Стратегии повторной попытки:
+
+- **529 (перегружено)**: подождите и повторите попытку, при необходимости понизив быстрый режим.
+- **Резервная модель**: основная модель не работает, попробуйте резервную (e.g., Opus to Sonnet).
+- **Понижение уровня мышления**: переполнение контекстного окна приводит к сокращению бюджета на мышление.
+- **OAuth 401**: обновите токен и повторите попытку.
+
+Шаблон генератора означает, что ход повторной попытки («Сервер перегружен, повторная попытка через 5 секунд...») отображается как естественная часть потока событий, а не как уведомление по побочному каналу.
+
+---
+
+## Примените это
+
+**Считайте оперативное кэширование архитектурным ограничением, а не переключением функций.** Большинство приложений LLM «включают» кэширование. Claude Code рассматривает это как ограничение дизайна, которое определяет порядок prompts, запоминание разделов, фиксацию заголовка и управление конфигурацией. Разница между хорошо структурированным prompt (попадание в кэш на 50 000 токенов) и плохо структурированным (полная повторная обработка каждый ход) — это самый крупный рычаг затрат в системе.
+
+**Используйте ОПАСНОЕ соглашение об именовании для дорогостоящих аварийных люков.** Если в кодовой базе есть инвариант, который легко случайно нарушить, присвоение аварийному люку громкого префикса дает три преимущества: делает нарушения видимыми при проверке кода, требует документирования (обязательный параметр причины) и создает психологические препятствия на пути к безопасному умолчанию. Это распространяется не только на кэширование, но и на любую операцию с невидимыми затратами.
+
+**Создавайте потоковую передачу с помощью сторожевого таймера, а не просто тайм-аута.** Тайм-аут запроса SDK удовлетворяет требованиям HTTP 200, но тело ответа может прекратить поступление в любой момент. `setTimeout`, который сбрасывается на каждом фрагменте, улавливает это. Резервный вариант без streaming обрабатывает режимы сбоя прокси-сервера (HTTP 200 с телом, отличным от SSE, усечение в середине потока), которые встречаются чаще, чем вы ожидаете в корпоративных средах.
+
+**Сделайте стратегии повтора основанными на доходности, а не на исключениях.** Превратив оболочку повтора в асинхронный генератор, который генерирует события State, вызывающая сторона отображает ход повторной попытки как естественную часть потока событий. Шаблон отката модели (Opus не работает, попробуйте Sonnet) особенно полезен для обеспечения устойчивости производства.
+
+**Отделите быстрый путь от полного конвейера.** Не для каждого вызова API требуется поиск tools, интеграция советников, планирование бюджетов и инфраструктура streaming. Функция `queryHaiku()` Claude Code обеспечивает упрощенный путь для внутренних операций (сжатие, классификация), который позволяет избежать всех agentic проблем. Отдельная функция с упрощенным интерфейсом предотвращает случайную утечку сложности.
+
+---
+
+## Заглядывая в будущее
+
+Слой API лежит в основе всего последующего. В главе 5 будет показано, как Query Loop использует потоковый ответ для запуска выполнения tools, включая то, как tools начинают выполняться до того, как модель завершает свой ответ. В главе 6 объясняется, как система сжатия сохраняет эффективность кэша, когда диалоги приближаются к пределу контекста. В главе 7 будет показано, как каждый поток agent получает свой собственный массив сообщений и цепочку запросов.
+
+Все эти системы наследуют ограничения, установленные здесь: стабильность кэша как архитектурный инвариант, прозрачность провайдера через клиентскую фабрику и стабильную сеансовую конфигурацию через систему защелок. Уровень API не просто отправляет запросы — он определяет правила, по которым работает любая другая система.

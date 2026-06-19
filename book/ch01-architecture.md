@@ -1,20 +1,20 @@
-# Chapter 1: The Architecture of an AI Agent
+# Глава 1: Архитектура AI Agent
 
-## What You're Looking At
+## Что вы смотрите
 
-A traditional CLI is a function. It takes arguments, does work, and exits. `grep` does not decide to also run `sed`. `curl` does not open a file and patch it based on what it downloaded. The contract is simple: one command, one action, deterministic output.
+Традиционный CLI — это функция. Он принимает аргументы, работает и завершает работу. `grep` не решает также запустить `sed`. `curl` не открывает файл и не исправляет его на основе того, что он скачал. Контракт прост: одна команда, одно действие, детерминированный результат.
 
-An agentic CLI breaks every part of that contract. It takes a natural language prompt, decides what tools to use, executes them in whatever order the situation demands, evaluates the results, and loops until the task is done or the user stops it. The "program" is not a fixed sequence of instructions -- it is a loop around a language model that generates its own instruction sequence at runtime. The tool calls are the side effects. The model's reasoning is the control flow.
+agentic CLI нарушает все части этого контракта. Он принимает prompt на естественном языке, решает, какие tools использовать, выполняет их в том порядке, в котором того требует ситуация, оценивает результаты и выполняет цикл до тех пор, пока task не будет выполнена или пользователь не остановит ее. «Программа» не является фиксированной последовательностью инструкций — это цикл вокруг языковой модели, который генерирует свою собственную последовательность инструкций во время выполнения. Вызовы tools являются побочными эффектами. Reasoning модели — это control flow.
 
-Claude Code is Anthropic's production implementation of this idea: a TypeScript monolith of nearly two thousand files that turns a terminal into a full development environment powered by Claude. It shipped to hundreds of thousands of developers, which means every architectural decision carries real-world consequences. This chapter gives you the mental model. Six abstractions define the entire system. A single data flow connects them. Once you internalize the golden path from keystroke to final output, every subsequent chapter is a zoom into one segment of that path.
+Claude Code — это производственная реализация этой идеи в Anthropic: монолит TypeScript из почти двух тысяч файлов, который превращает терминал в полноценную среду разработки на базе Claude. Он был отправлен сотням тысяч разработчиков, а это означает, что каждое архитектурное решение влечет за собой реальные последствия. В этой главе представлена ​​ментальная модель. Шесть абстракций определяют всю систему. Их соединяет единый поток данных. Как только вы усвоите золотой путь от нажатия клавиши до конечного результата, каждая последующая глава станет увеличением одного сегмента этого пути.
 
-What follows is a retrospective decomposition -- these six abstractions were not designed upfront on a whiteboard. They emerged from the pressures of shipping a production agent to a large user base. Understanding them as they are, not as they were planned, sets the right expectations for the rest of the book.
+Далее следует ретроспективная декомпозиция: эти шесть абстракций не были разработаны заранее на доске. Они возникли из-за необходимости доставки производственного agent большой базе пользователей. Понимание их такими, какие они есть, а не такими, какими они были запланированы, формирует правильные ожидания от остальной части книги.
 
 ---
 
-## The Six Key Abstractions
+## Шесть ключевых абстракций
 
-Claude Code is built on six core abstractions. Everything else -- the 400+ utility files, the forked terminal renderer, the vim emulation, the cost tracker -- exists to support these six.
+Claude Code построен на шести основных абстракциях. Все остальное — более 400 служебных файлов, разветвленный модуль рендеринга терминала, эмуляция vim, средство отслеживания затрат — существует для поддержки этих шести.
 
 ```mermaid
 graph TD
@@ -30,25 +30,25 @@ graph TD
     Memory["Memory<br/>CLAUDE.md, MEMORY.md<br/>LLM-powered relevance"] -->|injected into system prompt| QL
 ```
 
-Here is what each one does and why it exists.
+Вот чем занимается каждый из них и почему он существует.
 
-**1. The Query Loop** (`query.ts`, ~1,700 lines). An async generator that is the heartbeat of the entire system. It streams a model response, collects tool calls, executes them, appends results to the message history, and loops. Every interaction -- REPL, SDK, sub-agent, headless `--print` -- flows through this single function. It yields `Message` objects that the UI consumes. Its return type is a discriminated union called `Terminal` that encodes exactly why the loop stopped: normal completion, user abort, token budget exhaustion, stop hook intervention, max turns, or unrecoverable error. The generator pattern -- rather than callbacks or event emitters -- gives natural backpressure, clean cancellation, and typed terminal states. Chapter 5 covers the loop's internals in full.
+**1. Query Loop** (`query.ts`, ~1700 строк). Асинхронный генератор, который является сердцем всей системы. Он передает поток ответа модели, собирает tool calls, выполняет их, добавляет результаты в историю сообщений и выполняет цикл. Каждое взаимодействие — REPL, SDK, sub-agent, headless `--print` — проходит через эту единственную функцию. Он дает объекты `Message`, которые использует UI. Его тип возвращаемого значения — это распознаваемое объединение под названием `Terminal`, которое точно кодирует причину остановки цикла: нормальное завершение, прерывание пользователя, исчерпание бюджета токена, вмешательство stop hook, максимальное количество оборотов или неисправимую ошибку. Шаблон генератора, а не callbacks или event emitters, обеспечивает естественное backpressure, чистую отмену и типизированные State терминала. Глава 5 полностью описывает внутреннюю структуру цикла.
 
-**2. The Tool System** (`Tool.ts`, `tools.ts`, `services/tools/`). A tool is anything the agent can do in the world: read a file, run a shell command, edit code, search the web. That simplicity of purpose hides significant machinery. Each tool implements a rich interface covering identity, schema, execution, permissions, and rendering. Tools are not just functions -- they carry their own permission logic, concurrency declarations, progress reporting, and UI rendering. The system partitions tool calls into concurrent and serial batches, and a streaming executor starts concurrency-safe tools before the model even finishes its response. Chapter 6 covers the full tool interface and execution pipeline.
+**2. Tool System** (`Tool.ts`, `tools.ts`, `services/tools/`). Tool — это все, что agent может делать в мире: читать файл, запускать команды оболочки, редактировать код, выполнять поиск в Интернете. За этой простотой цели скрываются важные механизмы. Каждый tool реализует богатый интерфейс, охватывающий идентификацию, схему, выполнение, разрешения и рендеринг. Tools — это не просто функции: они несут собственную логику разрешений, объявления параллелизма, отчеты о ходе выполнения и рендеринг UI. Tool системного разделения вызывает параллельные и последовательные batches, а исполнитель streaming запускает tools, безопасные для параллелизма, еще до того, как модель завершит свой ответ. Глава 6 описывает полный Tool interface и конвейер выполнения.
 
-**3. Tasks** (`Task.ts`, `tasks/`). Tasks are background work units -- primarily sub-agents. They follow a state machine: `pending -> running -> completed | failed | killed`. The `AgentTool` spawns a new `query()` generator with its own message history, tool set, and permission mode. Tasks give Claude Code its recursive capability: an agent can delegate to sub-agents, which can delegate further.
+**3. Task** (`Task.ts`, `tasks/`). Task — это фоновые рабочие единицы, в основном sub-agents. Они следуют за конечным автоматом: `pending -> running -> completed | failed | killed`. `AgentTool` порождает новый генератор `query()` с собственной историей сообщений, набором tools и режимом разрешений. Task наделяют Claude Code рекурсивной способностью: agent может делегировать полномочия sub-agents, которые могут делегировать дальше.
 
-**4. State** (two layers). The system maintains state at two levels. A mutable singleton (`STATE`) holds ~80 fields of session-level infrastructure: working directory, model configuration, cost tracking, telemetry counters, session ID. It is set once at startup and mutated directly -- no reactivity. A minimal reactive store (34 lines, Zustand-shaped) drives the UI: messages, input mode, tool approvals, progress indicators. The separation is intentional: infrastructure state changes rarely and does not need to trigger re-renders; UI state changes constantly and must. Chapter 3 covers the two-tier architecture in depth.
+**4. State** (два слоя). Система поддерживает State на двух уровнях. Изменяемый синглтон (`STATE`) содержит около 80 полей инфраструктуры уровня сеанса: рабочий каталог, конфигурация модели, отслеживание затрат, счетчики телеметрии, идентификатор сеанса. Он устанавливается один раз при запуске и мутируется напрямую — никакой реакции. Минимальный Reactive Store (34 строки в форме Zustand) управляет UI: сообщениями, режимом ввода, одобрениями tools, индикаторами прогресса. Разделение является намеренным: State инфраструктуры меняется редко и не требует повторного рендеринга; State UI постоянно меняется и должно. В главе 3 подробно рассматривается двухуровневая архитектура.
 
-**5. Memory** (`memdir/`). The agent's persistent context across sessions. Three tiers: project-level (`CLAUDE.md` files in the repo), user-level (`~/.claude/MEMORY.md`), and team-level (shared via symlinks). At session start, the system scans for all memory files, parses frontmatter, and an LLM selects which memories are relevant to the current conversation. Memory is how Claude Code "remembers" your codebase conventions, architectural decisions, and debugging history.
+**5. Memory** (`memdir/`). Постоянный контекст agent между сеансами. Три уровня: уровень проекта (файлы `CLAUDE.md` в репозитории), уровень пользователя (`~/.claude/MEMORY.md`) и уровень команды (общий через символические ссылки). В начале сеанса система сканирует все файлы memory, анализирует frontmatter, а LLM выбирает, какие воспоминания имеют отношение к текущему разговору. Memory — это то, как Claude Code «запоминает» ваши соглашения о кодовой базе, архитектурные решения и историю отладки.
 
-**6. Hooks** (`hooks/`, `utils/hooks/`). User-defined lifecycle interceptors that fire at 27 distinct events across 4 execution types: shell commands, single-shot LLM prompts, multi-turn agent conversations, and HTTP webhooks. Hooks can block tool execution, modify inputs, inject additional context, or short-circuit the entire query loop. The permission system itself is partially implemented through hooks -- `PreToolUse` hooks can deny tool calls before the interactive permission prompt ever fires.
+**6. Hooks** (`hooks/`, `utils/hooks/`). Определяемые пользователем hooks жизненного цикла, которые вызывают 27 различных событий в 4 типах выполнения: команды оболочки, одноразовые запросы LLM, многоходовые диалоги agents и веб-hooks HTTP. Hooks могут блокировать tool execution, изменять входные данные, вводить дополнительный контекст или сокращать весь Query Loop. Сама Permission System частично реализована с помощью hooks — hooks `PreToolUse` могут запрещать tool calls до того, как сработает интерактивный запрос разрешения.
 
 ---
 
-## The Golden Path: From Keystroke to Output
+## Золотой путь: от нажатия клавиши до вывода
 
-Trace a single request through the system. The user types "add error handling to the login function" and presses Enter.
+Отслеживайте одиночный запрос через систему. Пользователь вводит «добавить обработку ошибок в функцию входа» и нажимает Enter.
 
 ```mermaid
 sequenceDiagram
@@ -75,33 +75,33 @@ sequenceDiagram
     Q->>Q: Stop check: more tool calls? Continue loop
 ```
 
-Three things to notice about this flow.
+Три вещи, на которые следует обратить внимание в этом потоке.
 
-First, the query loop is a generator, not a callback chain. The REPL pulls messages from it via `for await`, which means backpressure is natural -- if the UI cannot keep up, the generator pauses. This is a deliberate choice over event emitters or observable streams.
+Во-первых, Query Loop — это генератор, а не цепочка callbacks. REPL извлекает сообщения из него через `for await`, что означает, что backpressure является естественным — если UI не успевает за ним, генератор приостанавливается. Это осознанный выбор между генераторами событий или наблюдаемыми потоками.
 
-Second, tool execution overlaps with model streaming. The `StreamingToolExecutor` does not wait for the model to finish before starting concurrency-safe tools. A `Read` call can complete and return its results while the model is still generating the rest of its response. This is speculative execution -- if the model's final output invalidates the tool call (rare but possible), the result is discarded.
+Во-вторых, tool execution частично совпадает с потоковой передачей модели. `StreamingToolExecutor` не ждет завершения модели перед запуском tools, безопасных для параллелизма. Вызов `Read` может завершиться и вернуть результаты, пока модель еще генерирует остальную часть своего ответа. Это спекулятивное выполнение: если конечный результат модели делает tool call недействительным (редко, но возможно), результат отбрасывается.
 
-Third, the entire loop is re-entrant. When the model makes tool calls, the results are appended to the message history, and the loop calls the model again with the updated context. There is no separate "tool result handling" phase -- it is all one loop. The model decides when it is done by simply not making any more tool calls.
+В-третьих, весь цикл является повторным. Когда модель выполняет tool calls, результаты добавляются в историю сообщений, и цикл снова вызывает модель с обновленным контекстом. Отдельной фазы «обработки результатов tool» не существует — все это один цикл. Модель решает, когда это будет сделано, просто не вызывая больше tool calls.
 
 ---
 
-## The Permission System
+## Permission System
 
-Claude Code runs arbitrary shell commands on your machine. It edits your files. It can spawn sub-processes, make network requests, and modify your git history. Without a permission system, this is a security catastrophe.
+Claude Code запускает произвольные команды оболочки на вашем компьютере. Он редактирует ваши файлы. Он может создавать подпроцессы, выполнять сетевые запросы и изменять вашу историю git. Без Permission System это катастрофа безопасности.
 
-The system defines seven permission modes, ordered from most to least permissive:
+Система определяет семь режимов разрешений, упорядоченных от наиболее к наименее разрешающим:
 
-| Mode | Behavior |
+| Режим | Поведение |
 |------|----------|
-| `bypassPermissions` | Everything allowed. No checks. Internal/testing only. |
-| `dontAsk` | All allowed, but still logged. No user prompts. |
-| `auto` | Transcript classifier (LLM) decides allow/deny. |
-| `acceptEdits` | File edits auto-approved; all other mutations prompt. |
-| `default` | Standard interactive mode. User approves each action. |
-| `plan` | Read-only. All mutations blocked. |
-| `bubble` | Escalate decision to parent agent (sub-agent mode). |
+| `bypassPermissions` | Все разрешено. Никаких проверок. Только внутреннее/тестирование. |
+| `dontAsk` | Все разрешено, но все равно зарегистрировано. Никаких запросов пользователя. |
+| `auto` | Классификатор транскриптов (LLM) решает разрешить/запретить. |
+| `acceptEdits` | Изменения файлов одобряются автоматически; все остальные мутации подсказывают. |
+| `default` | Стандартный интерактивный режим. Пользователь одобряет каждое действие. |
+| `plan` | Только для чтения. Все мутации заблокированы. |
+| `bubble` | Эскалация решения parent agent (режим sub-agent). |
 
-When a tool call needs permission, the resolution follows a strict chain:
+Когда tool call требуется разрешение, разрешение следует строгой цепочке:
 
 ```mermaid
 flowchart TD
@@ -121,15 +121,15 @@ flowchart TD
     J --> M["User: allow once/session/always or deny"]
 ```
 
-The `auto` mode deserves special attention. It runs a separate, lightweight LLM call that classifies the tool invocation against the conversation transcript. The classifier sees a compact representation of the tool input and decides whether the action is consistent with what the user asked for. This is the mode that lets Claude Code work semi-autonomously -- approving routine operations while flagging anything that looks like it deviates from the user's intent.
+Отдельного внимания заслуживает режим `auto`. Он запускает отдельный упрощенный вызов LLM, который классифицирует tool call по расшифровке разговора. Классификатор видит компактное представление входных данных tool и решает, соответствует ли действие тому, что запросил пользователь. Это режим, который позволяет Claude Code работать полуавтономно — одобряя рутинные операции и отмечая все, что выглядит так, как будто оно отклоняется от намерений пользователя.
 
-Sub-agents default to `bubble` mode, which means they cannot approve their own dangerous actions. Permission requests propagate up to the parent agent or ultimately to the user. This prevents a sub-agent from silently running destructive commands that the user never saw.
+По умолчанию sub-agents переходят в режим `bubble`, что означает, что они не могут одобрять свои собственные опасные действия. Запросы разрешений распространяются до parent agent или, в конечном итоге, до пользователя. Это не позволяет sub-agent незаметно выполнять деструктивные команды, которые пользователь никогда не видел.
 
 ---
 
-## Multi-Provider Architecture
+## Многопровайдерная архитектура
 
-Claude Code talks to Claude through four different infrastructure paths, all transparent to the rest of the system.
+Claude Code общается с Клодом по четырем различным инфраструктурным путям, прозрачным для остальной части системы.
 
 ```mermaid
 graph LR
@@ -144,15 +144,15 @@ graph LR
     SDK --> CL["callModel() in query loop"]
 ```
 
-The key insight is that the Anthropic SDK provides wrapper classes for each cloud provider that present the same interface as the direct API client. The `getAnthropicClient()` factory reads environment variables and configuration to determine which provider to use, constructs the appropriate client, and returns it. From that point forward, `callModel()` and every other consumer treats it as a generic Anthropic client.
+Основная идея заключается в том, что Anthropic SDK предоставляет классы-оболочки для каждого provider облачных услуг, которые предоставляют тот же интерфейс, что и прямой клиент API. Фабрика `getAnthropicClient()` считывает переменные среды и конфигурацию, чтобы определить, какой provider использовать, создает соответствующего клиента и возвращает его. С этого момента `callModel()` и все остальные потребители рассматривают его как обычный клиент Anthropic.
 
-Provider selection is determined at startup and stored in `STATE`. The query loop never checks which provider is active. This means switching from Direct API to Bedrock is a configuration change, not a code change -- the agent loop, tool system, and permission model are entirely provider-agnostic.
+Выбор provider определяется при запуске и сохраняется в `STATE`. Query Loop никогда не проверяет, какой provider активен. Это означает, что переход с Direct API на Bedrock — это изменение конфигурации, а не кода: agent loop, Tool System и permission model полностью не зависят от provider.
 
 ---
 
-## The Build System
+## Система сборки
 
-Claude Code ships as both an internal Anthropic tool and a public npm package. The same codebase serves both, with compile-time feature flags controlling what gets included.
+Claude Code поставляется как внутренний tool Anthropic, так и общедоступный npm package. Одна и та же база кода обслуживает оба варианта, а флаги функций времени компиляции контролируют, что включается.
 
 ```typescript
 // Conditional imports guarded by feature flags
@@ -161,17 +161,17 @@ const reactiveCompact = feature('REACTIVE_COMPACT')
   : null
 ```
 
-The `feature()` function comes from `bun:bundle`, Bun's built-in bundler API. At build time, each feature flag resolves to a boolean literal. The bundler's dead code elimination then strips the `require()` call entirely when the flag is false -- the module is never loaded, never included in the bundle, and never shipped.
+Функция `feature()` взята из `bun:bundle`, встроенного bundler Bun API. Во время сборки каждый флаг функции преобразуется в логический литерал. Устранение мертвого кода bundler затем полностью удаляет вызов `require()`, когда флаг имеет значение false — модуль никогда не загружается, никогда не включается в bundle и никогда не отправляется.
 
-The pattern is consistent: a top-level `feature()` guard wrapping a `require()` call. The `require()` is used instead of `import` specifically because dynamic `require()` can be fully eliminated by the bundler when the guard is false, while dynamic `import()` cannot (it returns a Promise that the bundler must preserve).
+Схема последовательна: защита `feature()` верхнего уровня завершает вызов `require()`. `require()` используется вместо `import` именно потому, что динамический `require()` может быть полностью устранен bundler, когда защита ложна, а динамический `import()` не может (он возвращает Promise, которое bundler должен сохранить).
 
-There is an irony worth noting. The source maps published with early npm releases contained `sourcesContent` -- the full original TypeScript source, including the internal-only code paths. The feature flags successfully stripped the runtime code but left the source in the maps. This is how the Claude Code source became publicly readable.
+Стоит отметить иронию. Карты исходного кода, опубликованные в ранних выпусках npm, содержали `sourcesContent` — полный оригинальный source code TypeScript, включая пути кода только для внутреннего использования. Флаги функций успешно удалили код времени выполнения, но оставили источник на картах. Так source code Claude Code стал общедоступным.
 
 ---
 
-## How the Pieces Connect
+## Как части соединяются
 
-The six abstractions form a dependency graph:
+Шесть абстракций образуют граф зависимостей:
 
 ```mermaid
 graph TD
@@ -191,24 +191,24 @@ graph TD
     State -->|AppState: reactive store| REPL
 ```
 
-Memory feeds into the query loop as part of the system prompt. The query loop drives tool execution. Tool results feed back into the query loop as messages. Tasks are recursive query loops with isolated message histories. Hooks intercept the query loop at defined points. State is read and written by everything, with the reactive store bridging to the UI.
+Memory передается в Query Loop как часть System Prompt. Query Loop управляет tool execution. Tool results возвращаются в Query Loop в виде сообщений. Tasks представляют собой рекурсивные циклы запросов с изолированной историей сообщений. Hooks hook Query Loop в определенных точках. State читается и записывается всем, при этом реактивное хранилище подключается к UI.
 
-The circular dependency between the query loop and the tool system is the system's defining characteristic. The model generates tool calls. Tools execute and produce results. Results are appended to the message history. The model sees the results and decides what to do next. This cycle continues until the model stops generating tool calls or an external constraint (token budget, max turns, user abort) terminates it.
+Круговая зависимость между циклом запроса и Tool System является определяющей характеристикой системы. Модель генерирует tool calls. Tools работают и дают результаты. Результаты добавляются в историю сообщений. Модель видит результаты и решает, что делать дальше. Этот цикл продолжается до тех пор, пока модель не перестанет генерировать tool calls или пока внешнее ограничение (бюджет токена, максимальное количество оборотов, пользовательское прерывание) не прекратит его.
 
-Here is how they connect to the chapters that follow: the golden path from input to output is the thread that runs through the entire book. Chapter 2 traces how the system boots to the point where this path can execute. Chapter 3 explains the two-tier state architecture that the path reads and writes. Chapter 4 covers the API layer that the query loop calls. Each subsequent chapter zooms into one segment of the path you have just seen end-to-end.
+Вот как они связаны с последующими главами: золотой путь от ввода к выводу — это нить, проходящая через всю книгу. В главе 2 показано, как система загружается до момента, когда этот путь может быть выполнен. В главе 3 объясняется двухуровневая архитектура State, в которой путь читает и записывает. В главе 4 рассматривается уровень API, который вызывает Query Loop. Каждая последующая глава приближается к одному сегменту пути, который вы только что видели, от начала до конца.
 
 ---
 
-## Apply This
+## Примените это
 
-If you are building an agentic system -- any system where an LLM decides what actions to take at runtime -- here are the patterns from Claude Code's architecture that transfer.
+Если вы создаете agentic system — любую систему, в которой LLM решает, какие действия предпринять во время выполнения, — вот шаблоны из архитектуры Claude Code, которые можно перенести.
 
-**The generator loop pattern.** Use an async generator as your agent loop, not callbacks or event emitters. The generator gives you natural backpressure (consumers pull at their own pace), clean cancellation (`.return()` on the generator), and a typed return value for terminal states. The problem it solves: in callback-based agent loops, it is difficult to know when the loop is "done" and why. Generators make termination a first-class part of the type system.
+**Шаблон цикла генератора.** В качестве agent loop используйте асинхронный генератор, а не callbacks или event emitters. Генератор обеспечивает естественное backpressure (потребители тянут в своем темпе), чистую отмену (`.return()` на генераторе) и типизированное возвращаемое значение для State терминала. Проблема, которую он решает: в agent loops, основанных на обратных вызовах, трудно определить, когда цикл «завершен» и почему. Генераторы делают завершение первоклассной частью системы типов.
 
-**The self-describing tool interface.** Every tool should declare its own concurrency safety, permission requirements, and rendering behavior. Do not put this logic in a central orchestrator that "knows about" each tool. The problem it solves: a central orchestrator becomes a god object that must be updated every time a tool is added. Self-describing tools scale linearly -- adding tool N+1 requires zero changes to existing code.
+**Tool interface с самоописанием.** Каждый tool должен заявить о своей безопасности параллелизма, требованиях к разрешениям и поведении рендеринга. Не помещайте эту логику в центральный оркестратор, который «знает» о каждом tool. Проблема, которую он решает: центральный оркестратор становится божественным объектом, который необходимо обновлять каждый раз при добавлении tool. Tools с самоописанием масштабируются линейно: добавление tool N+1 не требует внесения изменений в существующий код.
 
-**Separate infrastructure state from reactive state.** Not all state needs to trigger UI updates. Session configuration, cost tracking, and telemetry belong in a plain mutable object. Message history, progress indicators, and approval queues belong in a reactive store. The problem it solves: making everything reactive adds subscription overhead and complexity to state that changes once at startup and is read a thousand times. Two tiers match two access patterns.
+**Отдельное State инфраструктуры от реактивного State.** Не все State должны запускать обновления UI. Конфигурация сеанса, отслеживание затрат и телеметрия принадлежат простому изменяемому объекту. История сообщений, индикаторы выполнения и очереди утверждения принадлежат реактивному хранилищу. Проблема, которую он решает: если сделать все реактивным, это приведет к дополнительным затратам на подписку и усложнит констатацию, которая меняется один раз при запуске и считывается тысячу раз. Два уровня соответствуют двум шаблонам доступа.
 
-**Permission modes, not permission checks.** Define a small set of named modes (plan, default, auto, bypass) and resolve every permission decision through the mode. Do not scatter `if (isAllowed)` checks through tool implementations. The problem it solves: inconsistent permission enforcement. When every tool goes through the same mode-based resolution chain, you can reason about the system's security posture by knowing which mode is active.
+**Режимы разрешений, а не проверки разрешений.** Определите небольшой набор именованных режимов (план, по умолчанию, автоматический, обходной) и принимайте каждое решение о разрешении через этот режим. Не разбрасывайте проверки `if (isAllowed)` по реализациям tool. Проблема, которую он решает: непоследовательное соблюдение разрешений. Когда каждый tool проходит одну и ту же цепочку разрешения на основе режимов, вы можете оценить State безопасности системы, зная, какой режим активен.
 
-**Recursive agent architecture via tasks.** Sub-agents should be new instances of the same agent loop with their own message history, not special-cased code paths. Permission escalation flows upward via `bubble` mode. The problem it solves: sub-agent logic that diverges from the main agent loop, leading to subtle differences in behavior and error handling. If the sub-agent is the same loop, it inherits all the same guarantees.
+**Рекурсивная архитектура agent через Task.** Sub-agents должны быть новыми экземплярами одного и того же agent loop со своей собственной историей сообщений, а не путями кода особого случая. Повышение разрешений осуществляется вверх через режим `bubble`. Проблема, которую он решает: логика sub-agent, которая отличается от основного agent loop, что приводит к тонким различиям в поведении и обработке ошибок. Если sub-agent представляет собой тот же цикл, он наследует все те же гарантии.

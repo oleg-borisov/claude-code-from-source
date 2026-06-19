@@ -1,34 +1,34 @@
-# Chapter 13: The Terminal UI
+# Глава 13: Пользовательский интерфейс терминала
 
-## Why Build a Custom Renderer?
+## Зачем создавать собственный рендерер?
 
-The terminal is not a browser. There is no DOM, no CSS engine, no compositor, no retained-mode graphics pipeline. There is a stream of bytes going to stdout and a stream of bytes coming from stdin. Everything between those two streams -- layout, styling, diffing, hit-testing, scrolling, selection -- has to be invented from scratch.
+Терминал не является браузером. Нет ни DOM, ни CSS-движка, ни композитора, ни графического конвейера с сохраненным режимом. Существует поток байтов, идущий к stdout, и поток байтов, исходящий от stdin. Все, что находится между этими двумя потоками — макет, стилизация, сравнение, проверка попадания, прокрутка, выбор — должно быть изобретено с нуля.
 
-Claude Code needs a reactive UI. It has a prompt input, streaming markdown output, permission dialogs, progress spinners, scrollable message lists, search highlighting, and a vim-mode editor. React is the obvious choice for declaring this kind of component tree. But React needs a host environment to render into, and terminals do not provide one.
+Claude Code нужен реактивный UI. Он имеет быстрый ввод, потоковый вывод Markdown, диалоговые окна разрешений, индикаторы выполнения, прокручиваемые списки сообщений, подсветку поиска и редактор в режиме vim. React — очевидный выбор для объявления такого типа дерева компонентов. Но React требуется хост-среда для рендеринга, а терминалы ее не предоставляют.
 
-Ink is the standard answer: a React renderer for terminals, built on Yoga for flexbox layout. Claude Code started with Ink, then forked it beyond recognition. The stock version allocates one JavaScript object per cell per frame -- on a 200x120 terminal, that is 24,000 objects created and garbage-collected every 16ms. It diffs at the string level, comparing entire rows of ANSI-encoded text. It has no concept of blit optimization, no double buffering, no cell-level dirty tracking. For a simple CLI dashboard refreshing once per second, this is fine. For an LLM agent streaming tokens at 60fps while the user scrolls through a conversation with hundreds of messages, it is a non-starter.
+Стандартный ответ — Ink: средство рендеринга React для терминалов, созданное на основе Yoga для макетирования флексбоксов. Claude Code начал с Ink, а затем развил его до неузнаваемости. Стандартная версия выделяет один объект JavaScript на ячейку на кадр — на терминале 200x120, то есть 24 000 объектов создаются и удаляются со сборкой мусора каждые 16 мс. Он различается на уровне строки, сравнивая целые строки текста в кодировке ANSI. В нем нет ни концепции блит-оптимизации, ни двойной буферизации, ни отслеживания загрязнений на уровне ячеек. Для простой приборной панели CLI, обновляющейся раз в секунду, это нормально. Для agent LLM, передающего токены со скоростью 60 кадров в секунду, в то время как пользователь прокручивает разговор с сотнями сообщений, это не самое главное.
 
-What remains in Claude Code is a custom rendering engine that shares Ink's conceptual DNA -- React reconciler, Yoga layout, ANSI output -- but reimplements the critical path: packed typed arrays instead of object-per-cell, pool-based string interning instead of string-per-frame, double-buffered rendering with cell-level diffing, and an optimizer that merges adjacent terminal writes into minimal escape sequences.
+В Claude Code остается специальный движок рендеринга, который разделяет концептуальную ДНК Ink (примиритель React, макет Yoga, вывод ANSI), но переопределяет критический путь: упакованные типизированные массивы вместо пообъектной записи, интернирование строк на основе пула вместо построчной обработки, рендеринг с двойной буферизацией с различием на уровне ячеек и оптимизатор, объединяющий записи соседних терминалов в минимальные. escape-последовательности.
 
-The result runs at 60fps on a 200-column terminal while streaming tokens from Claude. To understand how, we need to examine four layers: the custom DOM that React reconciles against, the rendering pipeline that converts that DOM into terminal output, the pool-based memory management that keeps the system alive for hours-long sessions without drowning in garbage collection, and the component architecture that ties it all together.
+Результат выполняется со скоростью 60 кадров в секунду на терминале с 200 столбцами при потоковой передаче токенов от Клода. Чтобы понять, как это сделать, нам нужно изучить четыре уровня: пользовательский DOM, с которым согласовывается React, конвейер рендеринга, который преобразует этот DOM в выходные данные терминала, управление memoryю на основе пула, которое поддерживает работу системы в течение многочасовых сеансов, не утопая в сборке мусора, и архитектуру компонентов, которая связывает все это вместе.
 
 ---
 
-## The Custom DOM
+## Пользовательский DOM
 
-React's reconciler needs something to reconcile against. In the browser, that's the DOM. In Claude Code's terminal, it is a custom in-memory tree with seven element types and one text node type.
+Примирителю React нужно что-то, с чем можно примириться. В браузере это DOM. В терминале Claude Code это настраиваемое дерево в memory с семью типами элементов и одним типом текстового узла.
 
-The element types map directly to terminal rendering concepts:
+Типы элементов напрямую соответствуют концепциям рендеринга терминала:
 
-- **`ink-root`** -- the document root, one per Ink instance
-- **`ink-box`** -- a flexbox container, the terminal equivalent of a `<div>`
-- **`ink-text`** -- a text node with a Yoga measure function for word wrapping
-- **`ink-virtual-text`** -- nested styled text inside another text node (automatically promoted from `ink-text` when inside a text context)
-- **`ink-link`** -- a hyperlink, rendered via OSC 8 escape sequences
-- **`ink-progress`** -- a progress indicator
-- **`ink-raw-ansi`** -- pre-rendered ANSI content with known dimensions, used for syntax-highlighted code blocks
+- **`ink-root`** – корень документа, по одному на каждый экземпляр Ink.
+- **`ink-box`** – гибкий контейнер, терминальный эквивалент `<div>`.
+- **`ink-text`** — текстовый узел с функцией измерения Yoga для переноса слов.
+- **`ink-virtual-text`** — вложенный текст внутри другого текстового узла (автоматически повышается с `ink-text` внутри текстового контекста)
+- **`ink-link`** — гиперссылка, отображаемая с помощью escape-последовательностей OSC 8.
+- **`ink-progress`** -- индикатор прогресса.
+- **`ink-raw-ansi`** — предварительно обработанное содержимое ANSI с известными размерами, используемое для блоков кода с подсветкой синтаксиса.
 
-Each `DOMElement` carries the state that the rendering pipeline needs:
+Каждый `DOMElement` содержит State, необходимое конвейеру рендеринга:
 
 ```typescript
 // Illustrative — actual interface extends this significantly
@@ -46,46 +46,46 @@ interface DOMElement {
 }
 ```
 
-The separation of `_eventHandlers` from `attributes` is deliberate. In React, handler identity changes on every render (unless manually memoized). If handlers were stored as attributes, every render would mark the node dirty and trigger a full repaint. By storing them separately, the reconciler's `commitUpdate` can update handlers without dirtying the node.
+Отделение `_eventHandlers` от `attributes` сделано намеренно. В React идентификатор обработчика меняется при каждом рендеринге (если не запоминается вручную). Если бы обработчики хранились как атрибуты, каждый рендеринг помечал бы узел как «грязный» и вызывал бы полную перерисовку. Сохраняя их отдельно, `commitUpdate` средства согласования может обновлять обработчики, не загрязняя узел.
 
-The `markDirty()` function is the bridge between DOM mutations and the rendering pipeline. When any node's content changes, `markDirty()` walks up through every ancestor, setting `dirty = true` on each element and calling `yogaNode.markDirty()` on leaf text nodes. This is how a single character change in a deeply nested text node schedules a re-render of the entire path to the root -- but only that path. Sibling subtrees remain clean and can be blitted from the previous frame.
+Функция `markDirty()` — это мост между мутациями DOM и конвейером рендеринга. Когда содержимое любого узла изменяется, `markDirty()` проходит через каждого предка, устанавливая `dirty = true` для каждого элемента и вызывая `yogaNode.markDirty()` для конечных текстовых узлов. Вот как изменение одного символа в глубоко вложенном текстовом узле приводит к повторной визуализации всего пути к корню, но только этого пути. Родственные поддеревья остаются чистыми и могут быть удалены из предыдущего кадра.
 
-The `ink-raw-ansi` element type deserves special mention. When a code block has already been syntax-highlighted (producing ANSI escape sequences), re-parsing those sequences to extract characters and styles would be wasteful. Instead, the pre-highlighted content is wrapped in an `ink-raw-ansi` node with `rawWidth` and `rawHeight` attributes that tell Yoga the exact dimensions. The rendering pipeline writes the raw ANSI content directly to the output buffer without decomposing it into individual styled characters. This makes syntax-highlighted code blocks essentially zero-cost after the initial highlighting pass -- the most expensive visual element in the UI is also the cheapest to render.
+Отдельного упоминания заслуживает тип элемента `ink-raw-ansi`. Если блок кода уже выделен синтаксисом (создавая escape-последовательности ANSI), повторный анализ этих последовательностей для извлечения символов и стилей был бы расточительным. Вместо этого предварительно выделенный контент заключен в узел `ink-raw-ansi` с атрибутами `rawWidth` и `rawHeight`, которые сообщают Yoga точные размеры. Конвейер рендеринга записывает необработанное содержимое ANSI непосредственно в выходной буфер, не разбивая его на отдельные стилизованные символы. Это делает блоки кода с подсветкой синтаксиса практически нулевыми после первоначального прохода выделения — самый дорогой визуальный элемент в пользовательском интерфейсе также является самым дешевым для рендеринга.
 
-The `ink-text` node's measure function is worth understanding because it runs inside Yoga's layout pass, which is synchronous and blocking. The function receives the available width and must return the text's dimensions. It performs word wrapping (respecting the `wrap` style prop: `wrap`, `truncate`, `truncate-start`, `truncate-middle`), accounts for grapheme cluster boundaries (so it does not split a multi-codepoint emoji across lines), measures CJK double-width characters correctly (each counts as 2 columns), and strips ANSI escape codes from the width calculation (escape sequences have zero visual width). All of this must complete in microseconds per node, because a conversation with 50 visible text nodes means 50 measure function calls per layout pass.
+Функцию измерения узла `ink-text` стоит понять, поскольку она выполняется внутри прохода компоновки Yoga, который является синхронным и блокирующим. Функция получает доступную ширину и должна вернуть размеры текста. Он выполняет перенос слов (с учетом реквизита стиля `wrap`: `wrap`, `truncate`, `truncate-start`, `truncate-middle`), учитывает границы кластера графем (поэтому он не разбивает эмодзи с несколькими кодами на строки), правильно измеряет символы двойной ширины CJK (каждый считается как 2 столбца), и удаляет escape-коды ANSI из расчета ширины (escape-последовательности имеют нулевую визуальную ширину). Все это должно выполняться за микросекунды на узел, поскольку общение с 50 видимыми текстовыми узлами означает 50 вызовов функций измерения за один проход макета.
 
 ---
 
-## The React Fiber Container
+## Контейнер React Fiber
 
-The reconciler bridge uses `react-reconciler` to create a custom host config. This is the same API that React DOM and React Native use. The key difference: Claude Code runs in `ConcurrentRoot` mode.
+Мост примирителя использует `react-reconciler` для создания пользовательской конфигурации хоста. Это тот же API, который используют React DOM и React Native. Ключевое отличие: Claude Code работает в режиме `ConcurrentRoot`.
 
 ```typescript
 createContainer(rootNode, ConcurrentRoot, ...)
 ```
 
-ConcurrentRoot enables React's concurrent features -- Suspense for lazy-loaded syntax highlighting, transitions for non-blocking state updates during streaming. The alternative, `LegacyRoot`, would force synchronous rendering and block the event loop during heavy markdown re-parses.
+ConcurrentRoot включает параллельные функции React — приостановку для подсветки синтаксиса с отложенной загрузкой, переходы для неблокирующих обновлений State во время streaming. Альтернатива, `LegacyRoot`, будет принудительно выполнять синхронный рендеринг и блокировать цикл событий во время повторного анализа тяжелых уценок.
 
-The host config methods map React operations to the custom DOM:
+Методы конфигурации хоста сопоставляют операции React с пользовательскими DOM:
 
-- **`createInstance(type, props)`** creates a `DOMElement` via `createNode()`, applies initial styles and attributes, attaches event handlers, and captures the React component owner chain for debug attribution. The owner chain is stored as `debugOwnerChain` and used by the `CLAUDE_CODE_DEBUG_REPAINTS` mode to attribute full-screen resets to specific components
-- **`createTextInstance(text)`** creates a `TextNode` -- but only if we are inside a text context. The reconciler enforces that raw strings must be wrapped in `<Text>`. Attempting to create a text node outside a text context throws, catching a class of bugs at reconciliation time rather than at render time
-- **`commitUpdate(node, type, oldProps, newProps)`** diffs old and new props via a shallow comparison, then applies only what changed. Styles, attributes, and event handlers each have their own update path. The diff function returns `undefined` if nothing changed, avoiding unnecessary DOM mutations entirely
-- **`removeChild(parent, child)`** removes the node from the tree, recursively frees Yoga nodes (calling `unsetMeasureFunc()` before `free()` to avoid accessing freed WASM memory), and notifies the focus manager
-- **`hideInstance(node)` / `unhideInstance(node)`** toggles `isHidden` and switches the Yoga node between `Display.None` and `Display.Flex`. This is React's mechanism for Suspense fallback transitions
-- **`resetAfterCommit(container)`** is the critical hook: it calls `rootNode.onComputeLayout()` to run Yoga, then `rootNode.onRender()` to schedule the terminal paint
+- **`createInstance(type, props)`** создает `DOMElement` через `createNode()`, применяет исходные стили и атрибуты, присоединяет обработчики событий и записывает цепочку владельцев компонентов React для атрибуции отладки. Цепочка владельцев хранится как `debugOwnerChain` и используется режимом `CLAUDE_CODE_DEBUG_REPAINTS` для присвоения полноэкранного сброса конкретным компонентам.
+- **`createTextInstance(text)`** создает `TextNode` -- но только если мы находимся внутри текстового контекста. Согласователь требует, чтобы необработанные строки были заключены в `<Text>`. Попытка создать текстовый узел вне текстового контекста выдает ошибку, выявляя класс ошибок во время согласования, а не во время рендеринга.
+- **`commitUpdate(node, type, oldProps, newProps)`** различает старые и новые реквизиты посредством поверхностного сравнения, а затем применяет только то, что изменилось. Каждый из стилей, атрибутов и обработчиков событий имеет собственный путь обновления. Функция diff возвращает `undefined`, если ничего не изменилось, полностью избегая ненужных мутаций DOM.
+- **`removeChild(parent, child)`** удаляет узел из дерева, рекурсивно освобождает узлы Yoga (вызов `unsetMeasureFunc()` перед `free()`, чтобы избежать доступа к освобожденной memory WASM) и уведомляет диспетчера фокуса.
+- **`hideInstance(node)` / `unhideInstance(node)`** переключает `isHidden` и переключает узел Yoga между `Display.None` и `Display.Flex`. Это механизм React для резервных переходов приостановки.
+- **`resetAfterCommit(container)`** — критический hook: он вызывает `rootNode.onComputeLayout()` для запуска Yoga, затем `rootNode.onRender()` для планирования отрисовки терминала.
 
-The reconciler tracks two performance counters per commit cycle: Yoga layout time (`lastYogaMs`) and total commit time (`lastCommitMs`). These flow into the `FrameEvent` that the Ink class reports, enabling performance monitoring in production.
+Средство согласования отслеживает два счетчика производительности за цикл фиксации: время макета Yoga (`lastYogaMs`) и общее время фиксации (`lastCommitMs`). Они передаются в `FrameEvent`, о котором сообщает класс Ink, что позволяет контролировать производительность в производстве.
 
-The event system mirrors the browser's capture/bubble model. A `Dispatcher` class implements full event propagation with three phases: capture (root to target), at-target, and bubble (target to root). Event types map to React scheduling priorities -- discrete for keyboard and click (highest priority, processed immediately), continuous for scroll and resize (can be deferred). The dispatcher wraps all event processing in `reconciler.discreteUpdates()` for proper React batching.
+Система событий отражает модель захвата/пузыря браузера. Класс `Dispatcher` реализует полное распространение событий в три этапа: захват (от корня к цели), попадание к цели и пузырь (от цели к корню). Типы событий соответствуют приоритетам планирования React: дискретные для клавиатуры и щелчка (наивысший приоритет, обрабатывается немедленно), непрерывные для прокрутки и изменения размера (можно отложить). Диспетчер завершает всю обработку событий в `reconciler.discreteUpdates()` для правильной batchной обработки React.
 
-When you press a key in the terminal, the resulting `KeyboardEvent` is dispatched through the custom DOM tree, bubbling from the focused element up to the root exactly as a keyboard event would bubble through browser DOM elements. Any handler along the path can call `stopPropagation()` or `preventDefault()`, and the semantics are identical to the browser specification.
+Когда вы нажимаете клавишу в терминале, результирующий `KeyboardEvent` передается через пользовательское дерево DOM, перемещаясь от элемента в фокусе до корня точно так же, как событие клавиатуры проходит через элементы браузера DOM. Любой обработчик по пути может вызвать `stopPropagation()` или `preventDefault()`, а семантика идентична спецификации браузера.
 
 ---
 
-## The Rendering Pipeline
+## Конвейер рендеринга
 
-Every frame traverses seven stages, each timed individually:
+Каждый кадр проходит семь этапов, каждый из которых рассчитан индивидуально:
 
 ```mermaid
 flowchart LR
@@ -102,21 +102,21 @@ flowchart LR
     style G fill:#e8f5e9
 ```
 
-Each stage is timed individually and reported in `FrameEvent.phases`. This per-stage instrumentation is essential for diagnosing performance issues: when a frame takes 30ms, you need to know whether the bottleneck is Yoga re-measuring text (stage 2), the renderer walking a large dirty subtree (stage 3), or stdout backpressure from a slow terminal (stage 7). The answer determines the fix.
+Каждый этап рассчитывается индивидуально и сообщается в формате `FrameEvent.phases`. Этот instrumentation на каждом этапе важен для диагностики проблем с производительностью: когда кадр занимает 30 мс, вам нужно знать, является ли узким местом повторное измерение текста Yoga (этап 2), рендеринг, проходящий по большому грязному поддереву (этап 3), или backpressure stdout от медленного терминала (этап 7). Ответ определяет исправление.
 
-**Stage 1: React commit and Yoga layout.** The reconciler processes state updates and calls `resetAfterCommit`. This sets the root node's width to `terminalColumns` and runs `yogaNode.calculateLayout()`. Yoga computes the entire flexbox tree in one pass, following the CSS flexbox specification: it resolves flex-grow, flex-shrink, padding, margin, gap, alignment, and wrapping across all nodes. The results -- `getComputedWidth()`, `getComputedHeight()`, `getComputedLeft()`, `getComputedTop()` -- are cached per node. For `ink-text` nodes, Yoga calls the custom measure function (`measureTextNode`) during layout, which computes text dimensions via word wrapping and grapheme measurement. This is the most expensive per-node operation: it must handle Unicode grapheme clusters, CJK double-width characters, emoji sequences, and ANSI escape codes embedded in text content.
+**Этап 1: фиксация React и макет Yoga.** Средство согласования обрабатывает обновления State и вызывает `resetAfterCommit`. Это задает ширину корневого узла `terminalColumns` и запускает `yogaNode.calculateLayout()`. Yoga вычисляет все дерево flexbox за один проход, следуя спецификации flexbox CSS: он разрешает flex-grow, flex-shrink, заполнения, поля, пробелы, выравнивание и перенос по всем узлам. Результаты — `getComputedWidth()`, `getComputedHeight()`, `getComputedLeft()`, `getComputedTop()` — кэшируются для каждого узла. Для узлов `ink-text` Yoga вызывает функцию пользовательской меры (`measureTextNode`) во время макета, которая вычисляет размеры текста посредством переноса слов и измерения графемы. Это самая дорогая операция для каждого узла: она должна обрабатывать кластеры графем Unicode, символы двойной ширины CJK, последовательности эмодзи и escape-коды ANSI, встроенные в текстовый контент.
 
-**Stage 2: DOM-to-screen.** The renderer walks the DOM tree depth-first, writing characters and styles into a `Screen` buffer. Each character becomes a packed cell. The output is a complete frame: every cell on the terminal has a defined character, style, and width.
+**Этап 2: DOM-на экран.** Средство визуализации сначала обходит дерево DOM в глубину, записывая символы и стили в буфер `Screen`. Каждый персонаж становится упакованной клеткой. На выходе получается полный кадр: каждая ячейка на терминале имеет определенный символ, стиль и ширину.
 
-**Stage 3: Overlay.** Text selection and search highlighting modify the screen buffer in-place, flipping style IDs on matching cells. Selection applies inverse video to create the familiar "highlighted text" appearance. Search highlighting applies a more aggressive visual treatment: inverse + yellow foreground + bold + underline for the current match, inverse only for other matches. This contaminates the buffer -- tracked by a `prevFrameContaminated` flag so the next frame knows to skip the blit fast-path. The contamination is a deliberate tradeoff: modifying the buffer in-place avoids allocating a separate overlay buffer (saving 48KB on a 200x120 terminal), at the cost of one full-damage frame after the overlay is cleared.
+**Этап 3. Наложение.** Выделение текста и выделение текста при поиске изменяют экранный буфер на месте, переворачивая идентификаторы стилей в совпадающих ячейках. При выборе применяется инверсное видео для создания знакомого вида «выделенного текста». При выделении поиска применяется более агрессивная визуальная обработка: инверсия + желтый передний план + жирный шрифт + подчеркивание для текущего совпадения, инверсия только для других совпадений. Это загрязняет буфер, отслеживаемый флагом `prevFrameContaminated`, поэтому следующий кадр знает, что следует пропустить быстрый путь передачи данных. Загрязнение является преднамеренным компромиссом: изменение буфера на месте позволяет избежать выделения отдельного буфера оверлея (экономия 48 КБ на терминале 200x120) за счет одного кадра с полным повреждением после очистки оверлея.
 
-**Stage 4: Diff.** The new screen is compared cell-by-cell against the front frame's screen. Only changed cells produce output. The comparison is two integer comparisons per cell (the two packed `Int32` words), and the diff walks the damage rectangle rather than the full screen. On a steady-state frame (only a spinner ticking), this might produce patches for 3 cells out of 24,000. Each patch is a `{ type: 'stdout', content: string }` object containing the cursor-move sequence and the ANSI-encoded cell content.
+**Этап 4: Разница.** Новый экран по ячейке сравнивается с экраном передней рамки. Только измененные клетки производят выходные данные. Сравнение представляет собой два целочисленных сравнения на ячейку (два упакованных слова `Int32`), при этом разница проходит по прямоугольнику повреждений, а не по всему экрану. В устойчивом кадре (только тиканье счетчика) это может привести к появлению патчей для 3 ячеек из 24 000. Каждый патч представляет собой объект `{ type: 'stdout', content: string }`, содержащий последовательность перемещения курсора и содержимое ячейки в кодировке ANSI.
 
-**Stage 5: Optimize.** Adjacent patches on the same row are merged into a single write. Redundant cursor moves are eliminated -- if patch N ends at column 10 and patch N+1 starts at column 11, the cursor is already in the right position and no move sequence is needed. Style transitions are pre-serialized via the `StylePool.transition()` cache, so changing from "bold red" to "dim green" is a single cached string lookup rather than a diff-and-serialize operation. The optimizer typically reduces the byte count by 30-50% compared to naive per-cell output.
+**Этап 5: Оптимизация.** Соседние патчи в одной строке объединяются в одну запись. Избыточные перемещения курсора исключены: если патч N заканчивается в столбце 10, а патч N+1 начинается в столбце 11, курсор уже находится в правильном положении и последовательность перемещений не требуется. Переходы стилей предварительно сериализуются через кэш `StylePool.transition()`, поэтому изменение с «жирного красного» на «тусклый зеленый» — это поиск одной кэшированной строки, а не операция сравнения и сериализации. Оптимизатор обычно уменьшает количество байтов на 30–50 % по сравнению с простым выводом по ячейкам.
 
-**Stage 6: Write.** The optimized patches are serialized to ANSI escape sequences and written to stdout in a single `write()` call, wrapped in synchronous update markers (BSU/ESU) on terminals that support them. BSU (Begin Synchronized Update, `ESC [ ? 2026 h`) tells the terminal to buffer all following output, and ESU (`ESC [ ? 2026 l`) tells it to flush. This eliminates visible tearing on terminals that support the protocol -- the entire frame appears atomically.
+**Этап 6: Запись.** Оптимизированные исправления сериализуются в escape-последовательности ANSI и записываются в stdout одним вызовом `write()`, завернутым в синхронные маркеры обновления (BSU/ESU) на терминалах, которые их поддерживают. BSU (Начать синхронизированное обновление, `ESC [ ? 2026 h`) приказывает терминалу буферизовать весь следующий вывод, а ESU (`ESC [ ? 2026 l`) приказывает ему сбросить данные. Это устраняет видимые разрывы на терминалах, поддерживающих этот протокол — весь кадр отображается атомарно.
 
-Every frame reports its timing breakdown via a `FrameEvent` object:
+Каждый кадр сообщает о своей временной разбивке через объект `FrameEvent`:
 
 ```typescript
 interface FrameEvent {
@@ -135,42 +135,42 @@ interface FrameEvent {
 }
 ```
 
-When `CLAUDE_CODE_DEBUG_REPAINTS` is enabled, full-screen resets are attributed to their source React component via `findOwnerChainAtRow()`. This is the terminal equivalent of React DevTools' "Highlight Updates" -- it shows you which component caused the entire screen to repaint, which is the most expensive thing that can happen in the rendering pipeline.
+Когда `CLAUDE_CODE_DEBUG_REPAINTS` включен, полноэкранный сброс присваивается исходному компоненту React через `findOwnerChainAtRow()`. Это терминальный эквивалент «Основных обновлений» React DevTools — он показывает, какой компонент вызвал перерисовку всего экрана, что является самой дорогостоящей вещью, которая может произойти в конвейере рендеринга.
 
-The blit optimization deserves special attention. When a node is not dirty and its position has not changed since the previous frame (checked via a node cache), the renderer copies cells directly from `prevScreen` to the current screen instead of re-rendering the subtree. This makes steady-state frames extremely cheap -- on a typical frame where only a spinner is ticking, the blit covers 99% of the screen and only the spinner's 3-4 cells are re-rendered from scratch.
+Отдельного внимания заслуживает оптимизация блита. Когда узел не загрязнен и его положение не изменилось с момента предыдущего кадра (проверено через кэш узла), средство рендеринга копирует ячейки непосредственно из `prevScreen` на текущий экран вместо повторного рендеринга поддерева. Это делает устойчивые кадры чрезвычайно дешевыми - в типичном кадре, где тикает только счетчик, блит покрывает 99% экрана, и только 3-4 ячейки счетчика перерисовываются с нуля.
 
-The blit is disabled under three conditions:
+Блит отключается при трёх условиях:
 
-1. **`prevFrameContaminated` is true** -- the selection overlay or a search highlight modified the front frame's screen buffer in-place, so those cells cannot be trusted as the "correct" previous state
-2. **An absolute-positioned node was removed** -- absolute positioning means the node could have painted over non-sibling cells, and those cells need to be re-rendered from the elements that actually own them
-3. **Layout shifted** -- any node's cached position differs from its current computed position, meaning the blit would copy cells to the wrong coordinates
+1. **`prevFrameContaminated` имеет значение true** — наложение выделения или выделение при поиске изменяют буфер экрана переднего кадра на месте, поэтому этим ячейкам нельзя доверять как «правильному» предыдущему State.
+2. **Узел с абсолютным позиционированием был удален**. Абсолютное позиционирование означает, что узел мог закрасить неродственные ячейки, и эти ячейки необходимо повторно визуализировать из элементов, которым они фактически принадлежат.
+3. **Макет смещен** — кэшированная позиция любого узла отличается от его текущей вычисленной позиции, что означает, что блит скопирует ячейки в неправильные координаты.
 
-The damage rectangle (`screen.damage`) tracks the bounding box of all written cells during rendering. The diff only examines rows within this rectangle, skipping entirely unchanged regions. On a 120-row terminal where a streaming message occupies rows 80-100, the diff checks 20 rows instead of 120 -- a 6x reduction in comparison work.
+Прямоугольник повреждения (`screen.damage`) отслеживает ограничивающую рамку всех записанных ячеек во время рендеринга. Функция сравнения проверяет только строки внутри этого прямоугольника, пропуская полностью неизмененные области. На терминале со 120 строками, где потоковое сообщение занимает строки 80–100, функция сравнения проверяет 20 строк вместо 120 — сокращение работы сравнения в 6 раз.
 
 ---
 
-## Double-Buffer Rendering and Frame Scheduling
+## Рендеринг с двойным буфером и планирование кадров
 
-The Ink class maintains two frame buffers:
+Класс Ink поддерживает два буфера кадров:
 
 ```typescript
 private frontFrame: Frame;  // Currently displayed on terminal
 private backFrame: Frame;   // Being rendered into
 ```
 
-Each `Frame` contains:
+Каждый `Frame` содержит:
 
-- `screen: Screen` -- the cell buffer (packed `Int32Array`)
-- `viewport: Size` -- terminal dimensions at render time
-- `cursor: { x, y, visible }` -- where to park the terminal cursor
-- `scrollHint` -- DECSTBM (scroll region) optimization hint for alt-screen mode
-- `scrollDrainPending` -- whether a ScrollBox has remaining scroll delta to process
+- `screen: Screen` -- буфер ячеек (упакованный `Int32Array`)
+- `viewport: Size` - размеры терминала во время рендеринга
+- `cursor: { x, y, visible }` -- где припарковать курсор терминала
+- `scrollHint` - prompt по оптимизации DECSTBM (область прокрутки) для режима альтернативного экрана.
+- `scrollDrainPending` - есть ли у ScrollBox оставшаяся дельта прокрутки для обработки
 
-After each render, the frames swap: `backFrame = frontFrame; frontFrame = newFrame`. The old front frame becomes the next back frame, providing the `prevScreen` for blit optimization and the baseline for cell-level diffing.
+После каждого рендеринга кадры меняются местами: `backFrame = frontFrame; frontFrame = newFrame`. Старый передний кадр становится следующим задним кадром, предоставляя `prevScreen` для оптимизации блит-анализа и базовую линию для сравнения на уровне ячеек.
 
-This double-buffer design eliminates allocation. Instead of creating a new `Screen` every frame, the renderer reuses the back frame's buffer. The swap is a pointer assignment. The pattern is borrowed from graphics programming, where double buffering prevents tearing by ensuring the display reads from a complete frame while the renderer writes to the other. In the terminal context, tearing is not the concern (the BSU/ESU protocol handles that); the concern is GC pressure from allocating and discarding `Screen` objects containing 48KB+ of typed arrays every 16ms.
+Эта конструкция с двойным буфером исключает распределение. Вместо создания нового `Screen` в каждом кадре средство рендеринга повторно использует буфер заднего кадра. Обмен — это присвоение указателя. Шаблон заимствован из графического программирования, где двойная буферизация предотвращает разрыв, гарантируя, что дисплей считывает полный кадр, в то время как средство рендеринга записывает в другой. В контексте терминала разрыв не является проблемой (это решает протокол BSU/ESU); Беспокойство вызывает давление GC из-за выделения и удаления объектов `Screen`, содержащих более 48 КБ типизированных массивов, каждые 16 мс.
 
-Render scheduling uses lodash `throttle` at 16ms (approximately 60fps), with leading and trailing edges enabled:
+При планировании рендеринга используется lodash `throttle` со скоростью 16 мс (приблизительно 60 кадров в секунду) с включенными передним и задним фронтами:
 
 ```typescript
 const deferredRender = () => queueMicrotask(this.onRender);
@@ -180,32 +180,32 @@ this.scheduleRender = throttle(deferredRender, FRAME_INTERVAL_MS, {
 });
 ```
 
-The microtask deferral is not accidental. `resetAfterCommit` runs before React's layout effects phase. If the renderer ran synchronously here, it would miss cursor declarations set in `useLayoutEffect`. The microtask runs after layout effects but within the same event-loop tick -- the terminal sees a single, consistent frame.
+Отсрочка микрозадачи не случайна. `resetAfterCommit` выполняется до фазы эффектов макета React. Если бы средство рендеринга работало здесь синхронно, оно пропустило бы объявления курсора, установленные в `useLayoutEffect`. Микрозадача выполняется после эффектов макета, но в пределах одного и того же тика цикла событий — терминал видит один последовательный кадр.
 
-For scroll operations, a separate `setTimeout` at 4ms (FRAME_INTERVAL_MS >> 2) provides faster scroll frames without interfering with the throttle. Scroll mutations bypass React entirely: `ScrollBox.scrollBy()` mutates DOM node properties directly, calls `markDirty()`, and schedules a render via microtask. No React state update, no reconciliation overhead, no re-rendering of the entire message list for a single wheel event.
+Для операций прокрутки отдельный `setTimeout` на 4 мс (FRAME_INTERVAL_MS >> 2) обеспечивает более быструю прокрутку кадров, не мешая дросселю. Мутации прокрутки полностью обходят React: `ScrollBox.scrollBy()` изменяет свойства узла DOM напрямую, вызывает `markDirty()` и планирует рендеринг с помощью микрозадачи. Никакого обновления State React, никаких затрат на сверку, никакого повторного рендеринга всего списка сообщений для одного события колеса.
 
-**Resize handling** is synchronous, not debounced. When the terminal resizes, `handleResize` updates dimensions immediately to keep layout consistent. For alt-screen mode, it resets frame buffers and defers `ERASE_SCREEN` into the next atomic BSU/ESU paint block rather than writing it immediately. Writing the erase synchronously would leave the screen blank for the ~80ms the render takes; deferring it into the atomic block means old content stays visible until the new frame is fully ready.
+**Обработка изменения размера** выполняется синхронно, без устранения дребезга. При изменении размера терминала `handleResize` немедленно обновляет размеры, чтобы сохранить единообразие макета. В режиме альтернативного экрана он сбрасывает буферы кадров и откладывает `ERASE_SCREEN` в следующий атомарный блок рисования BSU/ESU, а не записывает его немедленно. Синхронная запись стирания оставила бы экран пустым на ~80 мс, которые занимает рендеринг; откладывание его в атомный блок означает, что старый контент остается видимым до тех пор, пока новый кадр не будет полностью готов.
 
-**Alt-screen management** adds another layer. The `AlternateScreen` component enters DEC 1049 alternate screen buffer on mount, constraining height to terminal rows. It uses `useInsertionEffect` -- not `useLayoutEffect` -- to ensure the `ENTER_ALT_SCREEN` escape sequence reaches the terminal before the first render frame. Using `useLayoutEffect` would be too late: the first frame would render to the main screen buffer, producing a visible flash before the switch. `useInsertionEffect` runs before layout effects and before the browser (or terminal) would paint, making the transition seamless.
+**Управление альтернативным экраном** добавляет еще один уровень. Компонент `AlternateScreen` входит в альтернативный экранный буфер DEC 1049 при монтировании, ограничивая высоту строк терминалов. Он использует `useInsertionEffect`, а не `useLayoutEffect`, чтобы гарантировать, что escape-последовательность `ENTER_ALT_SCREEN` достигнет терминала до первого кадра рендеринга. Использовать `useLayoutEffect` было бы слишком поздно: первый кадр будет отображаться в буфере основного экрана, вызывая видимую вспышку перед переключением. `useInsertionEffect` запускается до эффектов макета и до того, как браузер (или терминал) начнет рисовать, что делает переход плавным.
 
 ---
 
-## Pool-Based Memory: Why Interning Matters
+## Memory на основе пула: почему интернирование имеет значение
 
-A 200-column by 120-row terminal has 24,000 cells. If each cell were a JavaScript object with a `char` string, a `style` string, and a `hyperlink` string, that is 72,000 string allocations per frame -- plus 24,000 object allocations for the cells themselves. At 60fps, that is 5.76 million allocations per second. V8's garbage collector can handle this, but not without pauses that show up as dropped frames. The GC pauses are typically 1-5ms, but they are unpredictable: they might hit during a streaming token update, causing a visible stutter exactly when the user is watching the output.
+Терминал с 200 столбцами и 120 строками имеет 24 000 ячеек. Если бы каждая ячейка была объектом JavaScript со строкой `char`, строкой `style` и строкой `hyperlink`, то это 72 000 выделений строк на кадр - плюс 24 000 выделений объектов для самих ячеек. При 60 кадрах в секунду это 5,76 миллиона выделений в секунду. Bundler мусора V8 может справиться с этим, но не без пауз, которые проявляются в виде пропущенных кадров. Паузы GC обычно составляют 1–5 мс, но они непредсказуемы: они могут случаться во время обновления токена streaming, вызывая видимые заикания именно тогда, когда пользователь просматривает выходные данные.
 
-Claude Code eliminates this entirely with packed typed arrays and three interning pools. The result: zero per-frame object allocations for the cell buffer. The only allocations are in the pools themselves (amortized, since most characters and styles are interned on the first frame and reused thereafter) and in the patch strings produced by the diff (unavoidable, since stdout.write requires string or Buffer arguments).
+Claude Code полностью устраняет эту проблему с помощью упакованных типизированных массивов и трех пулов интернирования. Результат: нулевое выделение объектов для каждого кадра в буфере ячеек. Единственные выделения находятся в самих пулах (амортизируются, поскольку большинство символов и стилей интернируются в первом кадре и впоследствии используются повторно) и в строках патчей, созданных в результате сравнения (неизбежно, поскольку stdout.write требует строковые или буферные аргументы).
 
-**The cell layout** uses two `Int32` words per cell, stored in a contiguous `Int32Array`:
+**Макет ячеек** использует два слова `Int32` на ячейку, хранящиеся в смежной ячейке `Int32Array`:
 
 ```
 word0: charId        (32 bits, index into CharPool)
 word1: styleId[31:17] | hyperlinkId[16:2] | width[1:0]
 ```
 
-A parallel `BigInt64Array` view over the same buffer enables bulk operations -- clearing a row is a single `fill()` call on 64-bit words instead of zeroing individual fields.
+Параллельное представление `BigInt64Array` одного и того же буфера позволяет выполнять массовые операции: очистка строки выполняется одним вызовом `fill()` для 64-битных слов вместо обнуления отдельных полей.
 
-**CharPool** interns character strings to integer IDs. It has a fast path for ASCII: a 128-entry `Int32Array` maps character codes directly to pool indices, avoiding the `Map` lookup entirely. Multi-byte characters (emoji, CJK ideographs) fall through to a `Map<string, number>`. Index 0 is always space, index 1 is always empty string.
+**CharPool** преобразует строки символов в целочисленные идентификаторы. У него есть быстрый путь для ASCII: `Int32Array` из 128 записей сопоставляет коды символов непосредственно с индексами пула, полностью избегая поиска `Map`. Многобайтовые символы (эмодзи, иероглифы CJK) преобразуются в `Map<string, number>`. Индекс 0 — это всегда пробел, индекс 1 — всегда пустая строка.
 
 ```typescript
 export class CharPool {
@@ -230,54 +230,54 @@ export class CharPool {
 }
 ```
 
-**StylePool** interns arrays of ANSI style codes to integer IDs. The clever part: bit 0 of each ID encodes whether the style has a visible effect on space characters (background color, inverse, underline). Foreground-only styles get even IDs; styles visible on spaces get odd IDs. This lets the renderer skip invisible spaces with a single bitmask check -- `if (!(styleId & 1) && charId === 0) continue` -- without looking up the style definition. The pool also caches pre-serialized ANSI transition strings between any two style IDs, so transitioning from "bold red" to "dim green" is a cached string concatenation, not a diff-and-serialize operation.
+**StylePool** преобразует массивы кодов стилей ANSI в целочисленные идентификаторы. Самое интересное: бит 0 каждого идентификатора кодирует, оказывает ли стиль видимое влияние на пробельные символы (цвет фона, инверсия, подчеркивание). Стили, предназначенные только для переднего плана, получают четные идентификаторы; стили, видимые в пробелах, получают нечетные идентификаторы. Это позволяет средству визуализации пропускать невидимые пробелы с помощью одной проверки битовой маски — `if (!(styleId & 1) && charId === 0) continue` — без поиска определения стиля. Пул также кэширует предварительно сериализованные строки перехода ANSI между любыми двумя идентификаторами стилей, поэтому переход от «жирного красного» к «тусклому зеленому» представляет собой конкатенацию кэшированных строк, а не операцию сравнения и сериализации.
 
-**HyperlinkPool** interns OSC 8 hyperlink URIs. Index 0 means no hyperlink.
+**HyperlinkPool** интерпретирует URI гиперссылок OSC 8. Индекс 0 означает отсутствие гиперссылки.
 
-All three pools are shared across the front and back frames. This is a critical design decision. Because the pools are shared, interned IDs are valid across frames: the blit optimization can copy packed cell words directly from `prevScreen` to the current screen without re-interning. The diff can compare IDs as integers without string lookups. If each frame had its own pools, the blit would need to re-intern every copied cell (looking up the string by old ID, then interning it in the new pool), which would negate most of the blit's performance benefit.
+Все три бассейна являются общими для передней и задней рамы. Это критическое дизайнерское решение. Поскольку пулы являются общими, интернированные идентификаторы действительны во всех кадрах: оптимизация блит-анализа может копировать упакованные слова ячеек непосредственно из `prevScreen` на текущий экран без повторного интернирования. Функция diff может сравнивать идентификаторы как целые числа без поиска строк. Если бы каждый кадр имел свои собственные пулы, то блиту пришлось бы повторно интернировать каждую скопированную ячейку (ища строку по старому идентификатору, а затем интернируя ее в новый пул), что сводило бы на нет большую часть выигрыша в производительности блита.
 
-Pools are periodically reset (every 5 minutes) to prevent unbounded growth during long sessions. A migration pass re-interns the front frame's live cells into the fresh pools.
+Пулы периодически сбрасываются (каждые 5 минут), чтобы предотвратить неограниченный рост во время длительных сессий. Миграционный проход повторно помещает живые клетки передней рамки в свежие пулы.
 
-**CellWidth** handles double-wide characters with a 2-bit classification:
+**CellWidth** обрабатывает символы двойной ширины с 2-битной классификацией:
 
-| Value | Meaning |
+| Значение | Значение |
 |-------|---------|
-| 0 (Narrow) | Standard single-column character |
-| 1 (Wide) | CJK/emoji head cell, occupies two columns |
-| 2 (SpacerTail) | Second column of a wide character |
-| 3 (SpacerHead) | Soft-wrap continuation marker |
+| 0 (Узкий) | Стандартный одноколоночный символ |
+| 1 (широкий) | Головная ячейка CJK/emoji, занимает два столбца |
+| 2 (спейсертейл) | Второй столбец широкого характера |
+| 3 (Распорная головка) | Мягкий маркер продолжения |
 
-This is stored in the low 2 bits of `word1`, making width checks on packed cells free -- no field extraction needed for the common case.
+Оно хранится в младших двух битах `word1`, что делает проверку ширины упакованных ячеек бесплатной — в обычном случае извлечение полей не требуется.
 
-Additional per-cell metadata lives in parallel arrays rather than the packed cells:
+Дополнительные метаданные для каждой ячейки хранятся в параллельных массивах, а не в упакованных ячейках:
 
-- **`noSelect: Uint8Array`** -- per-cell flag excluding content from text selection. Used for UI chrome (borders, indicators) that should not appear in copied text
-- **`softWrap: Int32Array`** -- per-row marker indicating word-wrap continuation. When the user selects text across a soft-wrapped line, the selection logic knows not to insert a newline at the wrap point
-- **`damage: Rectangle`** -- bounding box of all written cells in the current frame. The diff only examines rows within this rectangle, skipping entirely unchanged regions
+- **`noSelect: Uint8Array`** — флаг для каждой ячейки, исключающий содержимое из выделения текста. Используется для хрома UI (рамки, индикаторы), который не должен появляться в скопированном тексте.
+- **`softWrap: Int32Array`** – маркер каждой строки, указывающий продолжение переноса по словам. Когда пользователь выделяет текст поперек строки с мягким переносом, логика выбора знает, что не следует вставлять новую строку в точку переноса.
+- **`damage: Rectangle`** — ограничивающая рамка всех записанных ячеек в текущем кадре. Функция diff проверяет только строки внутри этого прямоугольника, пропуская полностью неизмененные области.
 
-These parallel arrays avoid widening the packed cell format (which would increase cache pressure in the diff inner loop) while providing the metadata that selection, copy, and optimization need.
+Эти параллельные массивы позволяют избежать расширения формата упакованных ячеек (что могло бы увеличить нагрузку на кэш во внутреннем цикле сравнения), обеспечивая при этом метаданные, необходимые для выбора, копирования и оптимизации.
 
-The `Screen` also exposes a `createScreen()` factory that takes dimensions and pool references. Creating a screen zeroes the `Int32Array` via `fill(0n)` on the `BigInt64Array` view -- a single native call that clears the entire buffer in microseconds. This is used during resize (when new frame buffers are needed) and during pool migration (when the old screen's cells are re-interned into fresh pools).
+`Screen` также предоставляет фабрику `createScreen()`, которая принимает размеры и ссылки на пул. Создание экрана обнуляет `Int32Array` через `fill(0n)` в представлении `BigInt64Array` — один встроенный вызов, который очищает весь буфер за микросекунды. Это используется во время изменения размера (когда необходимы новые буферы кадров) и во время миграции пула (когда ячейки старого экрана повторно интернируются в новые пулы).
 
 ---
 
-## The REPL Component
+## Компонент REPL
 
-The REPL (`REPL.tsx`) is approximately 5,000 lines. It is the largest single component in the codebase, and for good reason: it is the orchestrator of the entire interactive experience. Everything flows through it.
+REPL (`REPL.tsx`) составляет примерно 5000 строк. Это самый крупный компонент в кодовой базе, и на это есть веская причина: он является организатором всего интерактивного взаимодействия. Все течет через него.
 
-The component is organized into roughly nine sections:
+Компонент состоит примерно из девяти разделов:
 
-1. **Imports** (~100 lines) -- pulls in bootstrap state, commands, history, hooks, components, keybindings, cost tracking, notifications, swarm/team support, voice integration
-2. **Feature-flagged imports** -- conditional loading of voice integration, proactive mode, brief tool, and coordinator agent via `feature()` guards with `require()`
-3. **State management** -- extensive `useState` calls covering messages, input mode, pending permissions, dialogs, cost thresholds, session state, tool state, and agent state
-4. **QueryGuard** -- manages active API call lifecycle, preventing concurrent requests from stepping on each other
-5. **Message handling** -- processes incoming messages from the query loop, normalizes ordering, manages streaming state
-6. **Tool permission flow** -- coordinates permission requests between tool use blocks and the PermissionRequest dialog
-7. **Session management** -- resume, switch, export conversations
-8. **Keybinding setup** -- wires the keybinding providers: `KeybindingSetup`, `GlobalKeybindingHandlers`, `CommandKeybindingHandlers`
-9. **Render tree** -- composes the final UI from all the above
+1. **Импорт** (~100 строк) — извлекает State начальной загрузки, команды, историю, hooks, компоненты, привязки клавиш, отслеживание затрат, уведомления, поддержку роя/команды, голосовую интеграцию.
+2. **Импорт с пометкой функции** – условная загрузка голосовой интеграции, упреждающего режима, краткого tool и agent координатора через защиту `feature()` с помощью `require()`.
+3. **Управление State** — расширенные вызовы `useState`, охватывающие сообщения, режим ввода, ожидающие разрешения, диалоговые окна, пороговые значения стоимости, State сеанса, State tool и State agent.
+4. **QueryGuard** — управляет жизненным циклом активного вызова API, предотвращая наложение одновременных запросов друг на друга.
+5. **Обработка сообщений** — обрабатывает входящие сообщения из цикла запросов, нормализует порядок, управляет State streaming.
+6. **Поток разрешений для tool** — координирует запросы разрешений между блоками использования tool и диалоговым окном PermissionRequest.
+7. **Управление сеансом** — возобновление, переключение, экспорт разговоров.
+8. **Настройка привязки клавиш** — подключает provider привязок клавиш: `KeybindingSetup`, `GlobalKeybindingHandlers`, `CommandKeybindingHandlers`.
+9. **Дерево рендеринга** – составляет окончательный UI из всего вышеперечисленного.
 
-Its render tree composes the full interface in fullscreen mode:
+Его дерево рендеринга составляет полный интерфейс в полноэкранном режиме:
 
 ```mermaid
 graph TD
@@ -298,9 +298,9 @@ graph TD
     MR --> TUB[ToolUseBlock]
 ```
 
-`OffscreenFreeze` is a performance optimization specific to terminal rendering. When a message scrolls above the viewport, its React element is cached and its subtree is frozen. This prevents timer-based updates (spinners, elapsed time counters) in off-screen messages from triggering terminal resets. Without this, a spinning indicator in message 3 would cause a full repaint even though the user is looking at message 47.
+`OffscreenFreeze` — это оптимизация производительности, специфичная для рендеринга терминала. Когда сообщение прокручивается над областью просмотра, его элемент React кэшируется, а его поддерево замораживается. Это не позволяет обновлениям на основе таймера (спиннеры, счетчики прошедшего времени) в закадровых сообщениях вызывать перезагрузку терминала. Без этого вращающийся индикатор в сообщении 3 вызвал бы полную перерисовку, даже если пользователь просматривает сообщение 47.
 
-The component is compiled by the React Compiler throughout. Instead of manual `useMemo` and `useCallback`, the compiler inserts per-expression memoization using slot arrays:
+Компонент полностью компилируется компилятором React. Вместо ручных `useMemo` и `useCallback` компилятор вставляет запоминание для каждого выражения, используя массивы слотов:
 
 ```typescript
 const $ = _c(14);  // 14 memoization slots
@@ -313,69 +313,69 @@ if ($[0] !== dep1 || $[1] !== dep2) {
 }
 ```
 
-This pattern appears in every component in the codebase. It provides finer granularity than `useMemo` (which memoizes at the hook level) -- individual expressions within a render function get their own dependency tracking and caching. For a 5,000-line component like the REPL, this eliminates hundreds of potential unnecessary recomputations per render.
+Этот шаблон появляется в каждом компоненте кодовой базы. Он обеспечивает более тонкую детализацию, чем `useMemo` (который запоминает на уровне hook) — отдельные выражения внутри функции рендеринга получают собственное отслеживание и кэширование зависимостей. Для компонента из 5000 строк, такого как REPL, это устраняет сотни потенциально ненужных повторных вычислений за один рендер.
 
 ---
 
-## Selection and Search Highlighting
+## Выбор и выделение при поиске
 
-Text selection and search highlighting operate as screen-buffer overlays, applied after the main render but before the diff.
+Выбор текста и подсветка поиска действуют как наложения экранного буфера, применяемые после основного рендеринга, но до сравнения.
 
-**Text selection** is alt-screen only. The Ink instance holds a `SelectionState` tracking anchor and focus points, drag mode (character/word/line), and captured rows that have scrolled off-screen. When the user clicks and drags, the selection handler updates these coordinates. During `onRender`, `applySelectionOverlay` walks the affected rows and modifies cell style IDs in-place using `StylePool.withSelectionBg()`, which returns a new style ID with inverse video added. This direct mutation of the screen buffer is why the `prevFrameContaminated` flag exists -- the front frame's buffer has been modified by the overlay, so the next frame cannot trust it for blit optimization and must do a full-damage diff.
+**Выделение текста** доступно только на альтернативном экране. Экземпляр Ink содержит привязку отслеживания `SelectionState` и точки фокусировки, режим перетаскивания (символ/слово/строка) и захваченные строки, прокрутившиеся за пределы экрана. Когда пользователь щелкает мышью и перетаскивает, обработчик выбора обновляет эти координаты. Во время `onRender` `applySelectionOverlay` просматривает затронутые строки и изменяет идентификаторы стилей ячеек на месте с помощью `StylePool.withSelectionBg()`, который возвращает новый идентификатор стиля с добавленным инверсным видео. Эта прямая мутация экранного буфера является причиной существования флага `prevFrameContaminated` — буфер переднего кадра был изменен наложением, поэтому следующий кадр не может доверять ему для оптимизации блиц и должен выполнять разницу с полным повреждением.
 
-Mouse tracking uses SGR 1003 mode, which reports clicks, drags, and motion with column/row coordinates. The `App` component implements multi-click detection: double-click selects a word, triple-click selects a line. The detection uses a 500ms timeout and 1-cell position tolerance (the mouse can move one cell between clicks without resetting the multi-click counter). Hyperlink clicks are intentionally deferred by this timeout -- double-clicking a link selects the word instead of opening the browser, matching the behavior users expect from text editors.
+Для отслеживания мыши используется режим SGR 1003, который сообщает о щелчках, перетаскиваниях и движении с координатами столбца/строки. Компонент `App` реализует обнаружение множественных щелчков: двойной щелчок выделяет слово, тройной щелчок выделяет строку. При обнаружении используется тайм-аут 500 мс и допуск положения в 1 ячейку (мышь может перемещать одну ячейку между щелчками без сброса счетчика нескольких щелчков). Щелчки по гиперссылке намеренно откладываются на этот тайм-аут — двойной щелчок по ссылке выбирает слово вместо открытия браузера, что соответствует поведению, которое пользователи ожидают от текстовых редакторов.
 
-A lost-release recovery mechanism handles the case where the user starts a drag inside the terminal, moves the mouse outside the window, and releases. The terminal reports the press and the drag, but not the release (which happened outside its window). Without recovery, the selection would be stuck in drag mode permanently. The recovery works by detecting mouse motion events with no buttons pressed -- if we are in a drag state and receive a no-button motion event, we infer that the button was released outside the window and finalize the selection.
+Механизм восстановления потерянного выпуска обрабатывает случай, когда пользователь начинает перетаскивание внутри терминала, перемещает мышь за пределы окна и отпускает. Терминал сообщает о нажатии и перетаскивании, но не об отпускании (которое произошло за его окном). Без восстановления выделение навсегда застрянет в режиме перетаскивания. Восстановление работает путем обнаружения событий движения мыши без нажатых кнопок — если мы находимся в State перетаскивания и получаем событие отсутствия движения кнопки, мы делаем вывод, что кнопка была отпущена за пределами окна, и завершаем выбор.
 
-**Search highlighting** has two mechanisms running in parallel. The scan-based path (`applySearchHighlight`) walks visible cells looking for the query string and applies SGR inverse styling. The position-based path uses pre-computed `MatchPosition[]` from `scanElementSubtree()`, stored message-relative, and applies them at known offsets with a "current match" yellow highlight using stacked ANSI codes (inverse + yellow foreground + bold + underline). The yellow foreground combined with inverse becomes a yellow background -- the terminal swaps fg/bg when inverse is active. The underline is the fallback visibility marker for themes where the yellow clashes with existing background colors.
+**Подсветка поиска** имеет два механизма, работающих параллельно. Путь на основе сканирования (`applySearchHighlight`) проходит по видимым ячейкам в поисках строки запроса и применяет инверсный стиль SGR. Путь на основе позиции использует предварительно вычисленные `MatchPosition[]` из `scanElementSubtree()`, сохраненные относительно сообщения, и применяет их к известным смещениям с желтой подсветкой «текущего соответствия» с использованием составных кодов ANSI (инверсный + желтый передний план + жирный шрифт + подчеркивание). Желтый передний план в сочетании с инверсным становится желтым фоном — терминал меняет местами fg/bg, когда инверсия активна. Подчеркивание — это запасной маркер видимости для тем, в которых желтый цвет конфликтует с существующими цветами фона.
 
-**Cursor declaration** solves a subtle problem. Terminal emulators render IME (Input Method Editor) preedit text at the physical cursor position. CJK users composing characters need the cursor to be at the text input's caret, not at the bottom of the screen where the terminal would naturally park it. The `useDeclaredCursor` hook lets a component declare where the cursor should be after each frame. The Ink class reads the declared node's position from `nodeCache`, translates it to screen coordinates, and emits cursor-move sequences after the diff. Screen readers and magnifiers also track the physical cursor, so this mechanism benefits accessibility as well as CJK input.
+**Объявление курсора** решает тонкую проблему. Эмуляторы терминала отображают предварительно отредактированный текст IME (редактор метода ввода) в физической позиции курсора. Пользователям CJK, составляющим символы, необходимо, чтобы курсор находился в позиции курсора ввода текста, а не в нижней части экрана, где терминал естественным образом парковал бы его. Hook `useDeclaredCursor` позволяет компоненту объявлять, где должен находиться курсор после каждого кадра. Класс Ink считывает позицию объявленного узла из `nodeCache`, преобразует ее в экранные координаты и генерирует последовательности перемещения курсора после сравнения. Программы чтения с экрана и лупы также отслеживают физический курсор, поэтому этот механизм обеспечивает удобство доступа так же, как и ввод CJK.
 
-In main-screen mode, the declared cursor position is tracked separately from `frame.cursor` (which must stay at the content bottom for the log-update's relative-move invariants). In alt-screen mode, the problem is simpler: every frame begins with `CSI H` (cursor home), so the declared cursor is just an absolute position emitted at the end of the frame.
-
----
-
-## Streaming Markdown
-
-Rendering LLM output is the most demanding task the terminal UI faces. Tokens arrive one at a time, 10-50 per second, and each one changes the content of a message that might contain code blocks, lists, bold text, and inline code. The naive approach -- re-parse the entire message on every token -- would be catastrophic at scale.
-
-Claude Code uses three optimizations:
-
-**Token caching.** A module-level LRU cache (500 entries) stores `marked.lexer()` results keyed by content hash. The cache survives React unmount/remount cycles during virtual scrolling. When a user scrolls back to a previously visible message, the markdown tokens are served from cache instead of re-parsed.
-
-**Fast-path detection.** `hasMarkdownSyntax()` checks the first 500 characters for markdown markers via a single regex. If no syntax is found, it constructs a single-paragraph token directly, bypassing the full GFM parser. This saves approximately 3ms per render on plain-text messages -- which matters when you are rendering 60 frames per second.
-
-**Lazy syntax highlighting.** Code block highlighting is loaded via React `Suspense`. The `MarkdownBody` component renders immediately with `highlight={null}` as a fallback, then resolves asynchronously with the cli-highlight instance. The user sees the code immediately (unstyled), then it pops into color a frame or two later.
-
-The streaming case adds a wrinkle. When tokens arrive from the model, the markdown content grows incrementally. Re-parsing the entire content on every token would be O(n^2) over the course of a message. The fast-path detection helps -- most streaming content is plain text paragraphs, which bypass the parser entirely -- but for messages with code blocks and lists, the LRU cache provides the real optimization. The cache key is the content hash, so when 10 tokens arrive and only the last paragraph changes, the cached parse result for the unchanged prefix is reused. The markdown renderer only re-parses the tail that changed.
-
-The `StreamingMarkdown` component is distinct from the static `Markdown` component. It handles the case where the content is still being generated: incomplete code fences (a ` ``` ` without a closing fence), partial bold markers, and truncated list items. The streaming variant is more forgiving in its parsing -- it does not error on unclosed syntax because the closing syntax has not arrived yet. When the message finishes streaming, the component transitions to the static `Markdown` renderer, which applies full GFM parsing with strict syntax checking.
-
-Syntax highlighting for code blocks is the most expensive per-element operation in the rendering pipeline. A 100-line code block can take 50-100ms to highlight with cli-highlight. Loading the highlighting library itself takes 200-300ms (it bundles grammar definitions for dozens of languages). Both costs are hidden behind React `Suspense`: the code block renders immediately as plain text, the highlighting library loads asynchronously, and when it resolves, the code block re-renders with colors. The user sees code instantly and colors a moment later -- a much better experience than a 300ms blank frame while the library loads.
+В режиме главного экрана объявленная позиция курсора отслеживается отдельно от `frame.cursor` (который должен оставаться внизу содержимого для инвариантов относительного перемещения обновления журнала). В режиме альтернативного экрана проблема проще: каждый кадр начинается с `CSI H` (домой курсора), поэтому объявленный курсор — это просто абсолютная позиция, создаваемая в конце кадра.
 
 ---
 
-## Apply This: Rendering Streaming Output Efficiently
+## Потоковая разметка
 
-The terminal rendering pipeline is a case study in eliminating work. Three principles drive the design:
+Рендеринг вывода LLM — самая требовательная Task, с которой сталкивается UI терминала. Токены поступают по одному, 10–50 в секунду, и каждый меняет содержимое сообщения, которое может содержать блоки кода, списки, жирный текст и встроенный код. Наивный подход — повторный анализ всего сообщения для каждого токена — будет иметь катастрофические масштабы.
 
-**Intern everything.** If you have a value that appears in thousands of cells -- a style, a character, a URL -- store it once and reference it by integer ID. Integer comparison is one CPU instruction. String comparison is a loop. When your inner loop runs 24,000 times per frame at 60fps, the difference between `===` on integers and `===` on strings is the difference between smooth scrolling and visible lag.
+Claude Code использует три оптимизации:
 
-**Diff at the right level.** Cell-level diffing sounds expensive -- 24,000 comparisons per frame. But it is two integer comparisons per cell (the packed words), and on a steady-state frame, the diff bails out of most rows after checking the first cell. The alternative -- re-rendering the entire screen and writing it to stdout -- would produce 100KB+ of ANSI escape sequences per frame. The diff typically produces under 1KB.
+**Кэширование токенов.** Кэш LRU на уровне модуля (500 записей) хранит результаты `marked.lexer()`, связанные с хэшем контента. Кэш выдерживает циклы размонтирования/перемонтирования React во время виртуальной прокрутки. Когда пользователь прокручивает назад к ранее отображаемому сообщению, токены Markdown обслуживаются из кеша, а не анализируются повторно.
 
-**Separate the hot path from React.** Scroll events arrive at mouse-input frequency (potentially hundreds per second). Routing each one through React's reconciler -- state update, reconciliation, commit, layout, render -- adds 5-10ms of latency per event. By mutating DOM nodes directly and scheduling renders via microtask, the scroll path stays under 1ms. React is involved only in the final paint, where it would run anyway.
+**Обнаружение быстрого пути.** `hasMarkdownSyntax()` проверяет первые 500 символов на наличие маркеров Markdown с помощью одного регулярного выражения. Если синтаксис не найден, он создает токен из одного абзаца напрямую, минуя полный анализатор GFM. Это экономит примерно 3 мс на рендеринг текстовых сообщений, что важно при рендеринге со скоростью 60 кадров в секунду.
 
-These principles apply to any streaming output system, not just terminals. If you are building a web application that renders real-time data -- a log viewer, a chat client, a monitoring dashboard -- the same tradeoffs apply. Intern repeated values. Diff against the previous frame. Keep the hot path out of your reactive framework.
+**Отложенная подсветка синтаксиса.** Подсветка блоков кода загружается через React `Suspense`. Компонент `MarkdownBody` немедленно визуализируется с использованием `highlight={null}` в качестве запасного варианта, а затем разрешается асинхронно с экземпляром cli-highlight. Пользователь видит код сразу (без стиля), а через пару кадров он становится цветным.
 
-A fourth principle, specific to long-running sessions: **clean up periodically.** Claude Code's pools grow monotonically as new characters and styles are interned. Over a multi-hour session, the pools could accumulate thousands of entries that are no longer referenced by any live cell. The 5-minute reset cycle bounds this growth: every 5 minutes, fresh pools are created, the front frame's cells are migrated (re-interned into the new pools), and the old pools become garbage. This is a generational collection strategy, applied at the application level because the JavaScript GC has no visibility into the semantic liveness of pool entries.
+Случай с потоковой передачей добавляет морщин. Когда токены поступают из модели, содержимое Markdown постепенно увеличивается. Повторный анализ всего содержимого каждого токена будет занимать O(n^2) в течение всего сообщения. Обнаружение быстрого пути помогает — большая часть потокового контента представляет собой простые текстовые абзацы, которые полностью обходят анализатор, — но для сообщений с блоками кода и списками реальную оптимизацию обеспечивает кэш LRU. Ключом кэша является хеш контента, поэтому, когда прибудет 10 токенов и изменится только последний абзац, cached результат анализа для неизмененного префикса будет повторно использован. Средство рендеринга Markdown повторно анализирует только измененный хвост.
 
-The decision to use `Int32Array` over plain objects has a subtler benefit beyond GC pressure: memory locality. When the diff compares 24,000 cells, it walks a contiguous typed array. Modern CPUs prefetch sequential memory accesses, so the entire screen comparison runs within the L1/L2 cache. An object-per-cell layout would scatter cells across the heap, turning every comparison into a cache miss. The performance difference is measurable: on a 200x120 screen, the typed-array diff completes in under 0.5ms, while an equivalent object-based diff takes 3-5ms -- enough to blow the 16ms frame budget when combined with the other pipeline stages.
+Компонент `StreamingMarkdown` отличается от статического компонента `Markdown`. Он обрабатывает случай, когда контент все еще генерируется: неполные границы кода (` ``` ` без закрывающей границы), частичные жирные маркеры и усеченные элементы списка. Потоковый вариант более щадящий при синтаксическом анализе — он не допускает ошибок в незамкнутом синтаксисе, поскольку закрывающий синтаксис еще не прибыл. Когда сообщение завершает потоковую передачу, компонент переходит к статическому средству визуализации `Markdown`, которое применяет полный анализ GFM со строгой проверкой синтаксиса.
 
-A fifth principle applies to any system that renders into a fixed-size grid: **track damage bounds.** The `damage` rectangle on each screen records the bounding box of cells that were written during rendering. The diff consults this rectangle and skips rows outside it entirely. When a streaming message occupies the bottom 20 rows of a 120-row terminal, the diff examines 20 rows, not 120. Combined with the blit optimization (which populates the damage rectangle only for re-rendered regions, not blitted ones), this means the common case -- one message streaming while the rest of the conversation is static -- touches a fraction of the screen buffer.
+Подсветка синтаксиса для блоков кода — самая затратная операция для каждого элемента в конвейере рендеринга. Для выделения блока кода из 100 строк с помощью cli-highlight может потребоваться 50–100 мс. Загрузка самой библиотеки подсветки занимает 200-300мс (она объединяет определения грамматики для десятков языков). Обе затраты скрыты за React `Suspense`: блок кода немедленно визуализируется как обычный текст, библиотека подсветки загружается асинхронно, и когда она разрешается, блок кода повторно визуализируется с использованием цветов. Пользователь мгновенно видит код и мгновенно раскрашивает его — гораздо лучше, чем пустой кадр длительностью 300 мс во время загрузки библиотеки.
 
-The broader lesson: performance in a rendering system is not about making any single operation fast. It is about eliminating operations entirely. The blit eliminates re-rendering. The damage rectangle eliminates diffing. The pool sharing eliminates re-interning. The packed cells eliminate allocation. Each optimization removes an entire category of work, and they stack multiplicatively.
+---
 
-To put numbers on it: a worst-case frame (everything dirty, no blit, full-screen damage) on a 200x120 terminal takes approximately 12ms. A best-case frame (one dirty node, blit everything else, 3-row damage rectangle) takes under 1ms. The system spends most of its time in the best case. The streaming token arrival triggers one dirty text node, which dirties its ancestors up to the message container, which is typically 10-30 rows of the screen. The blit handles the other 90-110 rows. The damage rectangle constrains the diff to the dirty region. The pool lookups are integer operations. The steady-state cost of streaming one token is dominated by Yoga layout (which re-measures the dirty text node and its ancestors) and the markdown re-parse -- not by the rendering pipeline itself.
+## Примените это: эффективный рендеринг потокового вывода
+
+Конвейер рендеринга терминала — это пример устранения работы. В основе дизайна лежат три принципа:
+
+**Интернируйте все.** Если у вас есть значение, которое появляется в тысячах ячеек (стиль, символ, URL-адрес), сохраните его один раз и ссылайтесь на него по целочисленному идентификатору. Целочисленное сравнение — это одна инструкция процессора. Сравнение строк представляет собой цикл. Когда ваш внутренний цикл выполняется 24 000 раз за кадр со скоростью 60 кадров в секунду, разница между `===` для целых чисел и `===` для строк — это разница между плавной прокруткой и видимой задержкой.
+
+**Различие на правильном уровне.** Различие на уровне ячеек звучит дорого — 24 000 сравнений на кадр. Но это два целочисленных сравнения на ячейку (упакованные слова), и в устойчивом кадре diff выходит из большинства строк после проверки первой ячейки. Альтернатива — повторная визуализация всего экрана и запись его в stdout — создаст более 100 КБ escape-последовательностей ANSI на кадр. Разница обычно составляет менее 1 КБ.
+
+**Отделите «горячий» путь от React.** События прокрутки поступают с частотой ввода данных мышью (потенциально сотни в секунду). Маршрутизация каждого из них через устройство согласования React — обновление State, согласование, фиксация, макет, рендеринг — добавляет задержку на 5–10 мс на каждое событие. Путем непосредственного изменения узлов DOM и планирования рендеринга с помощью микрозадачи путь прокрутки остается менее 1 мс. React участвует только в финальной отрисовке, где он и так будет работать.
+
+Эти принципы применимы к любой системе потокового вывода, а не только к терминалам. Если вы создаете веб-приложение, которое отображает данные в реальном времени — средство просмотра журналов, клиент чата, панель мониторинга — применяются те же компромиссы. Стажер повторяющиеся значения. Отличие от предыдущего кадра. Держите горячий путь подальше от своей реактивной структуры.
+
+Четвертый принцип, характерный для длительных сессий: **периодическая очистка.** Пулы Claude Code монотонно растут по мере интернирования новых персонажей и стилей. За многочасовой сеанс пулы могут накопить тысячи записей, на которые больше не ссылается ни одна живая ячейка. Этот рост ограничивается 5-минутным циклом сброса: каждые 5 минут создаются новые пулы, ячейки переднего фрейма мигрируют (переинтернируются в новые пулы), а старые пулы становятся мусором. Это стратегия сбора данных поколений, применяемая на уровне приложения, поскольку garbage collector JavaScript не имеет представления о семантической жизнеспособности записей пула.
+
+Решение использовать `Int32Array` вместо простых объектов имеет более тонкое преимущество, помимо давления GC: локальность memory. Когда функция diff сравнивает 24 000 ячеек, она проходит по непрерывному типизированному массиву. Современные процессоры предварительно выбирают последовательные обращения к memory, поэтому сравнение всего экрана выполняется в кэше L1/L2. Макет «объект на ячейку» будет разбрасывать ячейки по куче, превращая каждое сравнение в промах в кэше. Разница в производительности измерима: на экране 200x120 разница типизированного массива завершается менее чем за 0,5 мс, тогда как эквивалентная разница на основе объектов занимает 3–5 мс — этого достаточно, чтобы сократить бюджет кадра в 16 мс в сочетании с другими этапами конвейера.
+
+Пятый принцип применим к любой системе, которая отображает сетку фиксированного размера: **отслеживайте границы повреждений.** Прямоугольник `damage` на каждом экране записывает ограничивающую рамку ячеек, которые были записаны во время рендеринга. Функция diff обращается к этому прямоугольнику и полностью пропускает строки за его пределами. Когда потоковое сообщение занимает нижние 20 строк 120-строчного терминала, функция diff проверяет 20 строк, а не 120. В сочетании с оптимизацией blit (которая заполняет прямоугольник повреждения только для перерисованных, а не для перерисованных областей), это означает, что общий случай - одно сообщение в streaming, в то время как остальная часть разговора статична - затрагивает часть экранного буфера.
+
+Более общий урок: производительность системы рендеринга заключается не в том, чтобы сделать какую-то отдельную операцию быстрой. Речь идет о полном отказе от операций. Блит исключает повторный рендеринг. Прямоугольник повреждений устраняет различия. Совместное использование пула исключает повторное стажирование. Упакованные клетки исключают выделение. Каждая оптимизация удаляет целую категорию работы, и они складываются мультипликативно.
+
+Для сравнения: кадр в худшем случае (все грязное, без пятен, полноэкранные повреждения) на терминале 200x120 занимает примерно 12 мс. В лучшем случае кадр (один грязный узел, все остальное разрушено, трехрядный прямоугольник повреждений) занимает менее 1 мс. В лучшем случае система проводит большую часть своего времени. Прибытие токена streaming запускает один грязный текстовый узел, который загрязняет своих предков до контейнера сообщений, который обычно занимает 10–30 строк экрана. Блит обрабатывает остальные 90-110 строк. Прямоугольник повреждения ограничивает разницу грязной областью. Поиск в пуле представляет собой целочисленную операцию. В стабильной стоимости streaming одного токена преобладает макет Yoga (который повторно измеряет грязный текстовый узел и его предки) и повторный анализ Markdown, а не сам конвейер рендеринга.
 
 
 ---

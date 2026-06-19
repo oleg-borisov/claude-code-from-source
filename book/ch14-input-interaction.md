@@ -1,22 +1,22 @@
-# Chapter 14: Input and Interaction
+# Глава 14: Ввод и взаимодействие
 
-## Raw Bytes, Meaningful Actions
+## Необработанные байты, значимые действия
 
-When you press Ctrl+X followed by Ctrl+K in Claude Code, the terminal sends two byte sequences separated by perhaps 200 milliseconds. The first is `0x18` (ASCII CAN). The second is `0x0B` (ASCII VT). Neither of these bytes carries any inherent meaning beyond "control character." The input system must recognize that these two bytes, arriving in sequence within a timeout window, constitute the chord `ctrl+x ctrl+k`, which maps to the action `chat:killAgents`, which terminates all running sub-agents.
+Когда вы нажимаете Ctrl+X, а затем Ctrl+K в Claude Code, терминал отправляет две последовательности байтов, разделенные примерно 200 миллисекундами. Первый — `0x18` (ASCII CAN). Второй — `0x0B` (ASCII VT). Ни один из этих байтов не несет никакого внутреннего значения, кроме «символа управления». Система ввода должна распознавать, что эти два байта, поступающие последовательно в течение тайм-аута, составляют хорду `ctrl+x ctrl+k`, которая соответствует действию `chat:killAgents`, которое завершает работу всех работающих sub-agents.
 
-Between the raw bytes and the killed agents, six systems activate: a tokenizer splits escape sequences, a parser classifies them across five terminal protocols, a keybinding resolver matches the sequence against context-specific bindings, a chord state machine manages the multi-key sequence, a handler executes the action, and React batches the resulting state updates into a single render.
+Между необработанными байтами и уничтоженными agentsи активируются шесть систем: токенизатор разделяет escape-последовательности, синтаксический анализатор классифицирует их по пяти терминальным протоколам, преобразователь привязки клавиш сопоставляет последовательность с контекстно-зависимыми привязками, конечный автомат аккордов управляет последовательностью нескольких клавиш, обработчик выполняет действие, а React группирует результирующие обновления State в один рендеринг.
 
-The difficulty is not in any one of these systems. It is in the combinatorial explosion of terminal diversity. iTerm2 sends Kitty keyboard protocol sequences. macOS Terminal sends legacy VT220 sequences. Ghostty over SSH sends xterm modifyOtherKeys. tmux may eat, transform, or passthrough any of these depending on its configuration. Windows Terminal has its own quirks with VT mode. The input system must produce correct `ParsedKey` objects from all of them, because a user should not have to know which keyboard protocol their terminal uses.
+Трудность не заключается ни в одной из этих систем. Это комбинаторный взрыв терминального разнообразия. iTerm2 отправляет последовательности протокола клавиатуры Kitty. Терминал macOS отправляет устаревшие последовательности VT220. Ghostty через SSH отправляет xterm ModifyOtherKeys. tmux может поглощать, преобразовывать или передавать через любой из них в зависимости от его конфигурации. У Windows Terminal есть свои особенности работы с режимом VT. Система ввода должна создавать правильные объекты `ParsedKey` из всех них, поскольку пользователю не нужно знать, какой протокол клавиатуры использует его терминал.
 
-This chapter traces the path from raw bytes to meaningful actions across that landscape.
+В этой главе прослеживается путь от необработанных байтов к значимым действиям в этом ландшафте.
 
-The design philosophy is progressive enhancement with graceful degradation. On a modern terminal with Kitty keyboard protocol support, Claude Code gets full modifier detection (Ctrl+Shift+A is distinct from Ctrl+A), super key reporting (Cmd shortcuts), and unambiguous key identification. On a legacy terminal over SSH, it falls back to the best available protocol, losing some modifier distinctions but keeping core functionality intact. The user never sees an error message about their terminal being unsupported. They might not be able to use `ctrl+shift+f` for global search, but `ctrl+r` for history search works everywhere.
+Философия дизайна — постепенное улучшение с плавным ухудшением. На современном терминале с поддержкой протокола клавиатуры Kitty Claude Code обеспечивает полное обнаружение модификаторов (Ctrl+Shift+A отличается от Ctrl+A), отчет о суперклавишах (сочетания клавиш Cmd) и однозначную идентификацию клавиш. На устаревшем терминале через SSH он возвращается к лучшему доступному протоколу, теряя некоторые различия модификаторов, но сохраняя основные функциональные возможности. Пользователь никогда не увидит сообщения об ошибке о том, что его терминал не поддерживается. Возможно, они не смогут использовать `ctrl+shift+f` для глобального поиска, но `ctrl+r` для поиска по истории работает везде.
 
 ---
 
-## The Key Parsing Pipeline
+## Конвейер анализа ключей
 
-Input arrives as chunks of bytes on stdin. The pipeline processes them in stages:
+Ввод поступает в виде блоков байтов на stdin. Конвейер обрабатывает их поэтапно:
 
 ```mermaid
 flowchart TD
@@ -37,52 +37,52 @@ flowchart TD
     style BATCH fill:#e8f5e9
 ```
 
-The tokenizer is the foundation. Terminal input is a stream of bytes that mixes printable characters, control codes, and multi-byte escape sequences with no explicit framing. A single `read()` from stdin might return `\x1b[1;5A` (Ctrl+Up arrow), or it might return `\x1b` in one read and `[1;5A` in the next, depending on how fast bytes arrive from the PTY. The tokenizer maintains a state machine that buffers partial escape sequences and emits complete tokens.
+Токенайзер — это основа. Ввод терминала представляет собой поток байтов, в котором смешаны печатные символы, управляющие коды и многобайтовые escape-последовательности без явного кадрирования. Одиночный `read()` из stdin может возвращать `\x1b[1;5A` (Ctrl+стрелка вверх) или может возвращать `\x1b` при одном чтении и `[1;5A` при следующем, в зависимости от того, насколько быстро байты поступают из PTY. Токенизатор поддерживает конечный автомат, который буферизует частичные escape-последовательности и выдает полные токены.
 
-The incomplete-sequence problem is fundamental. When the tokenizer sees a lone `\x1b`, it cannot know whether this is the Escape key or the start of a CSI sequence. It buffers the byte and starts a 50ms timer. If no continuation arrives, the buffer is flushed and the `\x1b` becomes an Escape keypress. But before flushing, the tokenizer checks `stdin.readableLength` -- if bytes are waiting in the kernel buffer, the timer re-arms rather than flushing. This handles the case where the event loop was blocked past 50ms and the continuation bytes are already buffered but not yet read.
+Проблема неполной последовательности является фундаментальной. Когда токенизатор видит одиночный `\x1b`, он не может знать, является ли это клавишей Escape или началом последовательности CSI. Он буферизует байт и запускает таймер на 50 мс. Если продолжение не поступает, буфер очищается, и `\x1b` становится нажатием клавиши Escape. Но перед сбросом токенизатор проверяет `stdin.readableLength` — если байты ожидают в буфере ядра, таймер перезагружается, а не сбрасывается. Это обрабатывает случай, когда цикл событий был заблокирован по истечении 50 мс, а байты продолжения уже буферизованы, но еще не прочитаны.
 
-For paste operations, the timeout extends to 500ms. Pasted text can be large and arrive in multiple chunks.
+Для операций вставки время ожидания увеличивается до 500 мс. Вставленный текст может быть большим и состоять из нескольких фрагментов.
 
-All parsed keys from a single `read()` are processed in one `reconciler.discreteUpdates()` call. This batches React state updates so that pasting 100 characters produces one re-render, not 100. The batching is essential: without it, each character in a paste would trigger a full reconciliation cycle -- state update, reconciliation, commit, Yoga layout, render, diff, write. At 5ms per cycle, a 100-character paste would take 500ms to process. With batching, the same paste takes one 5ms cycle.
+Все проанализированные ключи из одного `read()` обрабатываются за один вызов `reconciler.discreteUpdates()`. При этом batchно обновляется State React, так что вставка 100 символов приводит к одному повторному рендерингу, а не к 100. Пакетирование имеет важное значение: без него каждый символ в вставке запускает полный цикл согласования - обновление State, согласование, фиксация, макет Yoga, рендеринг, сравнение, запись. При 5 мс за цикл обработка 100-символьной вставки займет 500 мс. При batchной обработке та же паста занимает один цикл длительностью 5 мс.
 
-### stdin Management
+### stdin Управление
 
-The `App` component manages raw mode via reference counting. When any component needs raw input (the prompt, a dialog, vim mode), it calls `setRawMode(true)`, incrementing a counter. When it no longer needs raw input, it calls `setRawMode(false)`, decrementing. Raw mode is only disabled when the counter reaches zero. This prevents a common bug in terminal applications: component A enables raw mode, component B enables raw mode, component A disables raw mode, and suddenly component B's input breaks because raw mode was globally disabled.
+Компонент `App` управляет необработанным режимом посредством подсчета ссылок. Когда любому компоненту требуется необработанный ввод (prompt, диалоговое окно, режим vim), он вызывает `setRawMode(true)`, увеличивая счетчик. Когда ему больше не нужны необработанные данные, он вызывает `setRawMode(false)`, уменьшая его. Режим Raw отключается только тогда, когда счетчик достигает нуля. Это предотвращает распространенную ошибку в терминальных приложениях: компонент A включает необработанный режим, компонент B включает необработанный режим, компонент A отключает необработанный режим, и внезапно вход компонента B прерывается, поскольку необработанный режим был глобально отключен.
 
-When raw mode is first enabled, the App:
+При первом включении режима Raw приложение:
 
-1. Stops early input capture (the bootstrap-phase mechanism that collects keystrokes before React mounts)
-2. Puts stdin into raw mode (no line buffering, no echo, no signal processing)
-3. Attaches a `readable` listener for async input processing
-4. Enables bracketed paste (so pasted text is identifiable)
-5. Enables focus reporting (so the app knows when the terminal window gains/loses focus)
-6. Enables extended key reporting (Kitty keyboard protocol + xterm modifyOtherKeys)
+1. Останавливает ранний захват ввода (механизм фазы начальной загрузки, который собирает нажатия клавиш до монтирования React)
+2. Переводит stdin в необработанный режим (без буферизации строк, без эха, без обработки сигнала)
+3. Подключает прослушиватель `readable` для асинхронной обработки ввода.
+4. Включает вставку в квадратных скобках (чтобы вставленный текст можно было идентифицировать).
+5. Включает отчеты о фокусе (чтобы приложение знало, когда окно терминала получает или теряет фокус)
+6. Включает расширенную отчетность по клавишам (протокол клавиатуры Kitty + xterm ModifyOtherKeys).
 
-On disable, all of these are reversed in the opposite order. The careful sequencing prevents escape sequence leaks -- disabling extended key reporting before disabling raw mode ensures that the terminal does not continue sending Kitty-encoded sequences after the app has stopped parsing them.
+При отключении все происходит в обратном порядке. Тщательное секвенирование предотвращает утечки escape-последовательностей — отключение расширенной отчетности по ключам перед отключением необработанного режима гарантирует, что терминал не продолжит отправлять последовательности в кодировке Kitty после того, как приложение прекратило их анализ.
 
-The `onExit` signal handler (via the `signal-exit` package) ensures cleanup happens even on unexpected termination. If the process receives SIGTERM or SIGINT, the handler disables raw mode, restores the terminal state, exits alternate screen if active, and re-shows the cursor before the process exits. Without this cleanup, a crashed Claude Code session would leave the terminal in raw mode with no cursor and no echo -- the user would need to blindly type `reset` to recover their terminal.
+Обработчик сигнала `onExit` (через batch `signal-exit`) обеспечивает очистку даже при неожиданном завершении. Если процесс получает SIGTERM или SIGINT, обработчик отключает необработанный режим, восстанавливает State терминала, выходит из альтернативного экрана, если он активен, и повторно показывает курсор перед завершением процесса. Без этой очистки сбой сеанса Claude Code оставил бы терминал в необработанном режиме без курсора и эха — пользователю нужно было бы вслепую набрать `reset`, чтобы восстановить свой терминал.
 
 ---
 
-## Multi-Protocol Support
+## Поддержка нескольких протоколов
 
-Terminals do not agree on how to encode keyboard input. A modern terminal emulator like Kitty sends structured sequences with full modifier information. A legacy terminal over SSH sends ambiguous byte sequences that require context to interpret. Claude Code's parser handles five distinct protocols simultaneously, because the user's terminal might be any of them.
+Терминалы не договорились о том, как кодировать ввод с клавиатуры. Современный эмулятор терминала, такой как Kitty, отправляет структурированные последовательности с полной информацией о модификаторах. Устаревший терминал через SSH отправляет неоднозначные последовательности байтов, для интерпретации которых требуется контекст. Синтаксический анализатор Claude Code одновременно обрабатывает пять различных протоколов, поскольку терминал пользователя может быть любым из них.
 
-**CSI u (Kitty keyboard protocol)** is the modern standard. Format: `ESC [ codepoint [; modifier] u`. Example: `ESC[13;2u` is Shift+Enter, `ESC[27u` is Escape with no modifiers. The codepoint identifies the key unambiguously -- there is no ambiguity between Escape-the-key and Escape-as-sequence-prefix. The modifier word encodes shift, alt, ctrl, and super (Cmd) as individual bits. Claude Code enables this protocol on terminals that support it via the `ENABLE_KITTY_KEYBOARD` escape sequence at startup, and disables it on exit via `DISABLE_KITTY_KEYBOARD`. The protocol is detected through a query/response handshake: the application sends `CSI ? u` and the terminal responds with `CSI ? flags u`, where `flags` indicates the supported protocol level.
+**CSI u (протокол клавиатуры Kitty)** — современный стандарт. Формат: `ESC [ codepoint [; modifier] u`. Пример: `ESC[13;2u` — это Shift+Enter, `ESC[27u` — Escape без модификаторов. Кодовая точка однозначно идентифицирует ключ — между Escape-the-key и Escape-as-sequence-prefix нет никакой двусмысленности. Слово-модификатор кодирует сдвиг, alt, ctrl и super (Cmd) как отдельные биты. Claude Code включает этот протокол на терминалах, которые его поддерживают, через escape-последовательность `ENABLE_KITTY_KEYBOARD` при запуске и отключает его при выходе через `DISABLE_KITTY_KEYBOARD`. Протокол обнаруживается посредством подтверждения запроса/ответа: приложение отправляет `CSI ? u`, а терминал отвечает `CSI ? flags u`, где `flags` указывает поддерживаемый уровень протокола.
 
-**xterm modifyOtherKeys** is the fallback for terminals like Ghostty over SSH, where the Kitty protocol is not negotiated. Format: `ESC [ 27 ; modifier ; keycode ~`. Note that the parameter order is reversed from CSI u -- modifier comes before keycode, then keycode. This is a common source of parser bugs. The protocol is enabled via `CSI > 4 ; 2 m` and emitted by Ghostty, tmux, and xterm when the terminal's TERM identification is not detected (common over SSH where `TERM_PROGRAM` is not forwarded).
+**xterm ModifyOtherKeys** — это запасной вариант для таких терминалов, как Ghostty, через SSH, где протокол Kitty не согласован. Формат: `ESC [ 27 ; modifier ; keycode ~`. Обратите внимание, что порядок параметров обратный: модификатор CSI u идет перед кодом клавиши, а затем перед кодом клавиши. Это распространенный источник ошибок парсера. Протокол включается через `CSI > 4 ; 2 m` и генерируется Ghostty, tmux и xterm, когда идентификация TERM терминала не обнаружена (обычно для SSH, где `TERM_PROGRAM` не пересылается).
 
-**Legacy terminal sequences** cover everything else: function keys via `ESC O` and `ESC [` sequences, arrow keys, numpad, Home/End/Insert/Delete, and the full zoo of VT100/VT220/xterm variations accumulated over 40 years of terminal evolution. The parser uses two regular expressions to match these: `FN_KEY_RE` for the `ESC O/N/[/[[` prefix pattern (matching function keys, arrow keys, and their modified variants), and `META_KEY_CODE_RE` for meta-key codes (`ESC` followed by a single alphanumeric, the traditional Alt+key encoding).
+**Устаревшие последовательности терминалов** охватывают все остальное: функциональные клавиши через последовательности `ESC O` и `ESC [`, клавиши со стрелками, цифровую клавиатуру, Home/End/Insert/Delete, а также полный зоопарк вариаций VT100/VT220/xterm, накопленных за 40 лет эволюции терминала. Для их сопоставления анализатор использует два регулярных выражения: `FN_KEY_RE` для шаблона префикса `ESC O/N/[/[[` (соответствие функциональных клавиш, клавиш со стрелками и их модифицированных вариантов) и `META_KEY_CODE_RE` для кодов мета-ключей (`ESC`, за которым следует одна буквенно-цифровая комбинация, традиционная кодировка клавиш Alt+).
 
-The challenge with legacy sequences is ambiguity. `ESC [ 1 ; 2 R` could be Shift+F3 or a cursor position report, depending on context. The parser resolves this with a private-marker check: cursor position reports use `CSI ? row ; col R` (with the `?` private marker), while modified function keys use `CSI params R` (without it). This disambiguation is why Claude Code requests DECXCPR (extended cursor position reports) rather than standard CPR -- the extended form is unambiguous.
+Проблема с устаревшими последовательностями — двусмысленность. `ESC [ 1 ; 2 R` может быть Shift+F3 или отчетом о положении курсора, в зависимости от контекста. Анализатор решает эту проблему с помощью проверки частного маркера: в отчетах о положении курсора используется `CSI ? row ; col R` (с частным маркером `?`), а для модифицированных функциональных клавиш используется `CSI params R` (без него). Именно из-за этой неоднозначности Claude Code запрашивает DECXCPR (расширенные отчеты о положении курсора), а не стандартный CPR — расширенная форма однозначна.
 
-Terminal identification adds another layer of complexity. On startup, Claude Code sends an `XTVERSION` query (`CSI > 0 q`) to discover the terminal's name and version. The response (`DCS > | name ST`) survives SSH connections -- unlike `TERM_PROGRAM`, which is an environment variable that does not propagate through SSH. Knowing the terminal identity allows the parser to handle terminal-specific quirks. For example, xterm.js (used by VS Code's integrated terminal) has different escape sequence behavior from native xterm, and the identification string (`xterm.js(X.Y.Z)`) allows the parser to account for these differences.
+Идентификация терминала добавляет еще один уровень сложности. При запуске Claude Code отправляет запрос `XTVERSION` (`CSI > 0 q`), чтобы узнать имя и версию терминала. Ответ (`DCS > | name ST`) сохраняется при подключении по SSH — в отличие от `TERM_PROGRAM`, который представляет собой переменную среды, которая не распространяется через SSH. Знание идентификатора терминала позволяет синтаксическому анализатору обрабатывать особенности терминала. Например, xterm.js (используемый встроенным терминалом VS Code) имеет поведение escape-последовательности, отличное от собственного xterm, а строка идентификации (`xterm.js(X.Y.Z)`) позволяет синтаксическому анализатору учитывать эти различия.
 
-**SGR mouse events** use the format `ESC [ < button ; col ; row M/m`, where `M` is press and `m` is release. Button codes encode the action: 0/1/2 for left/middle/right click, 64/65 for wheel up/down (0x40 OR'd with a wheel bit), 32+ for drag (0x20 OR'd with a motion bit). Wheel events are converted to `ParsedKey` objects so they flow through the keybinding system; click and drag events become `ParsedMouse` objects routed to the selection handler.
+**События мыши SGR** используют формат `ESC [ < button ; col ; row M/m`, где `M` — нажатие, а `m` — отпускание. Коды кнопок кодируют действие: 0/1/2 для щелчка левой/средней/правой кнопкой мыши, 64/65 для перемещения колесика вверх/вниз (0x40 ИЛИ с битом колеса), 32+ для перетаскивания (0x20 ИЛИ с битом движения). События колеса преобразуются в объекты `ParsedKey` и проходят через систему привязки клавиш; События щелчка и перетаскивания становятся объектами `ParsedMouse`, направляемыми в обработчик выбора.
 
-**Bracketed paste** wraps pasted content between `ESC [200~` and `ESC [201~` markers. Everything between the markers becomes a single `ParsedKey` with `isPasted: true`, regardless of what escape sequences the pasted text might contain. This prevents pasted code from being interpreted as commands -- a critical safety feature when a user pastes a code snippet containing `\x03` (which is Ctrl+C as a raw byte).
+**Вставка в квадратных скобках** помещает вставленное содержимое между маркерами `ESC [200~` и `ESC [201~`. Все, что находится между маркерами, становится одним `ParsedKey` с `isPasted: true`, независимо от того, какие escape-последовательности может содержать вставленный текст. Это предотвращает интерпретацию вставленного кода как команды — важная функция безопасности, когда пользователь вставляет фрагмент кода, содержащий `\x03` (который представляет собой сочетание клавиш Ctrl+C в виде необработанного байта).
 
-The output types from the parser form a clean discriminated union:
+Типы выходных данных парсера образуют чистое дискриминируемое объединение:
 
 ```typescript
 type ParsedKey = {
@@ -107,11 +107,11 @@ type ParsedResponse = {
 }
 ```
 
-The `kind` discriminant ensures that downstream code handles each input type explicitly. A key cannot be accidentally processed as a mouse event; a terminal response cannot be accidentally interpreted as a keypress. The `ParsedKey` type also carries the raw `sequence` string for debugging -- when a user reports "pressing Ctrl+Shift+A does nothing," the debug log can show exactly what byte sequence the terminal sent, making it possible to diagnose whether the issue is in the terminal's encoding, the parser's recognition, or the keybinding's configuration.
+Дискриминант `kind` гарантирует, что нижестоящий код явно обрабатывает каждый тип входных данных. Клавиша не может быть случайно обработана как событие мыши; ответ терминала не может быть случайно интерпретирован как нажатие клавиши. Тип `ParsedKey` также содержит необработанную строку `sequence` для отладки — когда пользователь сообщает, что «нажатие Ctrl+Shift+A ничего не дает», журнал отладки может точно показать, какую последовательность байтов отправил терминал, что позволяет диагностировать, связана ли проблема с кодировкой терминала, распознаванием синтаксического анализатора или конфигурацией привязки клавиш.
 
-The `isPasted` flag on `ParsedKey` is critical for security. When bracketed paste is enabled, the terminal wraps pasted content in marker sequences. The parser sets `isPasted: true` on the resulting key event, and the keybinding resolver skips keybinding matching for pasted keys. Without this, pasting text containing `\x03` (Ctrl+C as a raw byte) or escape sequences would trigger application commands. With it, pasted content is treated as literal text input regardless of its byte content.
+Флаг `isPasted` на `ParsedKey` имеет решающее значение для безопасности. Когда включена вставка в квадратных скобках, терминал переносит вставленный контент в последовательности маркеров. Анализатор устанавливает `isPasted: true` для результирующего события ключа, а преобразователь привязок клавиш пропускает сопоставление привязок клавиш для вставленных ключей. Без этого вставка текста, содержащего `\x03` (Ctrl+C как необработанный байт) или escape-последовательности, приведет к запуску команд приложения. При этом вставленный контент рассматривается как буквальный ввод текста независимо от его байтового содержимого.
 
-The parser also recognizes terminal responses -- sequences sent by the terminal itself in answer to queries. These include device attributes (DA1, DA2), cursor position reports, Kitty keyboard flag responses, XTVERSION (terminal identification), and DECRPM (mode status). These are routed to a `TerminalQuerier` rather than the input handler:
+Анализатор также распознает ответы терминала — последовательности, отправленные самим терминалом в ответ на запросы. К ним относятся атрибуты устройства (DA1, DA2), отчеты о положении курсора, ответы на флаги клавиатуры Kitty, XTVERSION (идентификация терминала) и DECRPM (State режима). Они направляются в `TerminalQuerier`, а не в обработчик ввода:
 
 ```typescript
 type TerminalResponse =
@@ -124,37 +124,37 @@ type TerminalResponse =
   | { type: 'xtversion'; version: string }
 ```
 
-**Modifier decoding** follows the XTerm convention: the modifier word is `1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0) + (super ? 8 : 0)`. The `meta` field in `ParsedKey` maps to Alt/Option (bit 2). The `super` field is distinct (bit 8, Cmd on macOS). This distinction matters because Cmd shortcuts are reserved by the OS and cannot be captured by terminal applications -- unless the terminal uses the Kitty protocol, which reports super-modified keys that other protocols silently swallow.
+**Декодирование модификатора** соответствует соглашению XTerm: слово-модификатор — `1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0) + (super ? 8 : 0)`. Поле `meta` в `ParsedKey` соответствует Alt/Option (бит 2). Поле `super` является отдельным (бит 8, Cmd в macOS). Это различие имеет значение, поскольку ярлыки Cmd зарезервированы ОС и не могут быть перехвачены терминальными приложениями — если только терминал не использует протокол Kitty, который сообщает о супермодифицированных ключах, которые другие протоколы молча проглатывают.
 
-A stdin-gap detector triggers terminal mode re-assertion when no input arrives for 5 seconds after a gap. This handles tmux reattach and laptop wake scenarios, where the terminal's keyboard mode may have been reset by the multiplexer or the OS. When re-assertion fires, it re-sends `ENABLE_KITTY_KEYBOARD`, `ENABLE_MODIFY_OTHER_KEYS`, bracketed paste, and focus reporting sequences. Without this, detaching from a tmux session and reattaching would silently downgrade the keyboard protocol to legacy mode, breaking modifier detection for the rest of the session.
+Детектор разрыва stdin запускает повторное подтверждение режима терминала, когда ввод не поступает в течение 5 секунд после перерыва. Это обрабатывает сценарии повторного подключения tmux и пробуждения ноутбука, когда режим клавиатуры терминала мог быть сброшен мультиплексором или операционной системой. При повторном подтверждении он повторно отправляет последовательности отчетов `ENABLE_KITTY_KEYBOARD`, `ENABLE_MODIFY_OTHER_KEYS`, вставку в квадратных скобках и фокус. Без этого отключение от сеанса tmux и повторное подключение автоматически понизили бы протокол клавиатуры до устаревшего режима, нарушив обнаружение модификаторов для остальной части сеанса.
 
-### The Terminal I/O Layer
+### Уровень терминального ввода-вывода
 
-Beneath the parser sits a structured terminal I/O subsystem in `ink/termio/`:
+Под анализатором находится структурированная подсистема терминального ввода-вывода в `ink/termio/`:
 
-- **csi.ts** -- CSI (Control Sequence Introducer) sequences: cursor movement, erase, scroll regions, bracketed paste enable/disable, focus event enable/disable, Kitty keyboard protocol enable/disable
-- **dec.ts** -- DEC private mode sequences: alternate screen buffer (1049), mouse tracking modes (1000/1002/1003), cursor visibility, bracketed paste (2004), focus events (1004)
-- **osc.ts** -- Operating System Commands: clipboard access (OSC 52), tab status, iTerm2 progress indicators, tmux/screen multiplexer wrapping (DCS passthrough for sequences that need to traverse a multiplexer boundary)
-- **sgr.ts** -- Select Graphic Rendition: the ANSI style code system (colors, bold, italic, underline, inverse)
-- **tokenize.ts** -- The stateful tokenizer for escape sequence boundary detection
+- **csi.ts** -- Последовательности CSI (Control Sequence Introducer): перемещение курсора, стирание, области прокрутки, вставка в квадратных скобках, включение/выключение события фокусировки, включение/выключение протокола клавиатуры Kitty
+- **dec.ts** -- Последовательности приватного режима DEC: альтернативный экранный буфер (1049), режимы отслеживания мыши (1000/1002/1003), видимость курсора, вставка в квадратных скобках (2004), события фокусировки (1004)
+- **osc.ts** - Команды операционной системы: доступ к буферу обмена (OSC 52), State вкладок, индикаторы выполнения iTerm2, перенос мультиплексора tmux/экрана (проход DCS для последовательностей, которым необходимо пересечь границу мультиплексора)
+- **sgr.ts** -- Выбор графического представления: система кодирования стиля ANSI (цвета, жирный шрифт, курсив, подчеркивание, инверсия)
+- **tokenize.ts** -- токенизатор с отслеживанием State для обнаружения границ escape-последовательности.
 
-The multiplexer wrapping deserves a note. When Claude Code runs inside tmux, certain escape sequences (like Kitty keyboard protocol negotiation) must pass through to the outer terminal. tmux uses DCS passthrough (`ESC P ... ST`) to forward sequences it does not understand. The `wrapForMultiplexer` function in `osc.ts` detects the multiplexer environment and wraps sequences appropriately. Without this, Kitty keyboard mode would silently fail inside tmux, and the user would never know why their Ctrl+Shift bindings stopped working.
+Обертка мультиплексора заслуживает внимания. Когда Claude Code запускается внутри tmux, определенные escape-последовательности (например, согласование протокола клавиатуры Kitty) должны передаваться на внешний терминал. tmux использует транзит DCS (`ESC P ... ST`) для пересылки последовательностей, которые он не понимает. Функция `wrapForMultiplexer` в `osc.ts` определяет среду мультиплексора и соответствующим образом переносит последовательности. Без этого режим клавиатуры Kitty автоматически отключался бы внутри tmux, и пользователь никогда бы не узнал, почему его привязки Ctrl+Shift перестали работать.
 
-### The Event System
+### Система событий
 
-The `ink/events/` directory implements a browser-compatible event system with seven event types: `KeyboardEvent`, `ClickEvent`, `FocusEvent`, `InputEvent`, `TerminalFocusEvent`, and base `TerminalEvent`. Each carries `target`, `currentTarget`, `eventPhase`, and supports `stopPropagation()`, `stopImmediatePropagation()`, and `preventDefault()`.
+Каталог `ink/events/` реализует совместимую с браузером систему событий с семью типами событий: `KeyboardEvent`, `ClickEvent`, `FocusEvent`, `InputEvent`, `TerminalFocusEvent` и базовый `TerminalEvent`. Каждый из них содержит `target`, `currentTarget`, `eventPhase` и поддерживает `stopPropagation()`, `stopImmediatePropagation()` и `preventDefault()`.
 
-The `InputEvent` wrapping `ParsedKey` exists for backward compatibility with the legacy `EventEmitter` path, which older components may still use. New components use the DOM-style keyboard event dispatch with capture/bubble phases. Both paths fire from the same parsed key, so they are always consistent -- a key that arrives on stdin produces exactly one `ParsedKey`, which spawns both an `InputEvent` (for legacy listeners) and a `KeyboardEvent` (for DOM-style dispatch). This dual-path design allows incremental migration from the EventEmitter pattern to the DOM event pattern without breaking existing components.
+Обертка `InputEvent` `ParsedKey` существует для обратной совместимости с устаревшим путем `EventEmitter`, который все еще могут использовать старые компоненты. В новых компонентах используется диспетчеризация событий клавиатуры в стиле DOM с фазами захвата/пузыря. Оба пути запускаются из одного и того же проанализированного ключа, поэтому они всегда согласованы - ключ, который поступает на stdin, создает ровно один `ParsedKey`, который порождает как `InputEvent` (для устаревших прослушивателей), так и `KeyboardEvent` (для отправки в стиле DOM). Такая двухпутевая конструкция позволяет осуществлять поэтапный переход от шаблона EventEmitter к шаблону событий DOM без нарушения существующих компонентов.
 
 ---
 
-## The Keybinding System
+## Система привязки клавиш
 
-The keybinding system separates three concerns that are often tangled together: what key triggers what action (bindings), what happens when an action fires (handlers), and which bindings are active right now (contexts).
+Система привязки клавиш разделяет три проблемы, которые часто переплетаются: какая клавиша какое действие запускает (привязки), что происходит, когда действие срабатывает (обработчики), и какие привязки активны прямо сейчас (контексты).
 
-### Bindings: Declarative Configuration
+### Привязки: декларативная конфигурация
 
-Default bindings are defined in `defaultBindings.ts` as an array of `KeybindingBlock` objects, each scoped to a context:
+Привязки по умолчанию определены в `defaultBindings.ts` как массив объектов `KeybindingBlock`, каждый из которых ограничен контекстом:
 
 ```typescript
 export const DEFAULT_BINDINGS: KeybindingBlock[] = [
@@ -181,87 +181,87 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
 ]
 ```
 
-Platform-specific bindings are handled at definition time. Image paste is `ctrl+v` on macOS/Linux but `alt+v` on Windows (where `ctrl+v` is system paste). Mode cycling is `shift+tab` on terminals with VT mode support but `meta+m` on Windows Terminal without it. Feature-flagged bindings (quick search, voice mode, terminal panel) are conditionally included.
+Привязки, специфичные для платформы, обрабатываются во время определения. Вставка изображения — `ctrl+v` в macOS/Linux, но `alt+v` в Windows (где `ctrl+v` — системная вставка). Смена режима — это `shift+tab` на терминалах с поддержкой режима VT, но `meta+m` на терминале Windows без нее. Условно включены функциональные привязки (быстрый поиск, голосовой режим, панель терминала).
 
-Users can override any binding via `~/.claude/keybindings.json`. The parser accepts modifier aliases (`ctrl`/`control`, `alt`/`opt`/`option`, `cmd`/`command`/`super`/`win`), key aliases (`esc` -> `escape`, `return` -> `enter`), chord notation (space-separated steps like `ctrl+k ctrl+s`), and null actions to unbind default keys. A null action is not the same as not defining a binding -- it explicitly blocks the default binding from firing, which is important for users who want to reclaim a key for their terminal's use.
+Пользователи могут отменить любую привязку с помощью `~/.claude/keybindings.json`. Парсер принимает псевдонимы модификаторов (`ctrl`/`control`, `alt`/`opt`/`option`, `cmd`/`command`/`super`/`win`), псевдонимы клавиш (`esc` -> `escape`, `return` -> `enter`), обозначения аккордов (разделенные пробелами шаги, например `ctrl+k ctrl+s`) и нулевые действия по отмене привязки ключей по умолчанию. Нулевое действие — это не то же самое, что отсутствие определения привязки — оно явно блокирует срабатывание привязки по умолчанию, что важно для пользователей, которые хотят вернуть ключ для использования своим терминалом.
 
-### Contexts: 16 Scopes of Activity
+### Контексты: 16 сфер деятельности
 
-Each context represents a mode of interaction where a specific set of bindings applies:
+Каждый контекст представляет собой режим взаимодействия, в котором применяется определенный набор привязок:
 
-| Context | When Active |
+| Контекст | Когда активен |
 |---------|------------|
-| Global | Always |
-| Chat | Prompt input is focused |
-| Autocomplete | Completion menu is visible |
-| Confirmation | Permission dialog is showing |
-| Scroll | Alt-screen with scrollable content |
-| Transcript | Read-only transcript viewer |
-| HistorySearch | Reverse history search (ctrl+r) |
-| Task | A background task is running |
-| Help | Help overlay is displayed |
-| MessageSelector | Rewind dialog |
-| MessageActions | Message cursor navigation |
-| DiffDialog | Diff viewer |
-| Select | Generic selection list |
-| Settings | Config panel |
-| Tabs | Tab navigation |
-| Footer | Footer indicators |
+| Глобальный | Всегда |
+| Чат | Быстрый ввод сосредоточен |
+| Автозаполнение | Видно меню завершения |
+| Подтверждение | Отображается диалоговое окно разрешения |
+| Прокрутка | Альтернативный экран с прокручиваемым содержимым |
+| Стенограмма | Просмотр транскриптов только для чтения |
+| ИсторияПоиск | Обратный поиск по истории (ctrl+r) |
+| Task | Выполняется фоновая Task |
+| Помощь | Отображается наложение справки |
+| Селектор сообщений | Диалог перемотки назад |
+| Действия сообщения | Навигация курсором сообщений |
+| Дифдиалог | Просмотрщик различий |
+| Выбрать | Общий список выбора |
+| Настройки | Панель конфигурации |
+| Вкладки | Вкладка навигации |
+| Нижний колонтитул | Индикаторы нижнего колонтитула |
 
-When a key arrives, the resolver builds a context list from the currently active contexts (determined by React component state), deduplicates it preserving priority order, and searches for a matching binding. The last matching binding wins -- this is how user overrides take precedence over defaults. The context list is rebuilt on every keystroke (it is cheap: array concatenation and deduplication of at most 16 strings), so context changes take effect immediately without any subscription or listener mechanism.
+Когда приходит ключ, преобразователь создает список контекстов из текущих активных контекстов (определяемых State компонента React), дедуплицирует его, сохраняя порядок приоритетов, и ищет соответствующую привязку. Побеждает последняя совпавшая привязка — именно поэтому пользовательские переопределения имеют приоритет над значениями по умолчанию. Список контекстов перестраивается при каждом нажатии клавиши (это дешево: объединение массивов и дедупликация не более 16 строк), поэтому изменения контекста вступают в силу немедленно без какой-либо подписки или механизма прослушивания.
 
-The context design handles a tricky interaction pattern: nested modals. When a permission dialog appears during a running task, both `Confirmation` and `Task` contexts might be active. The `Confirmation` context takes priority (it is registered later in the component tree), so `y` triggers "approve" rather than any task-level binding. When the dialog closes, the `Confirmation` context deactivates and `Task` bindings resume. This stacking behavior emerges naturally from the context list's priority ordering -- no special modal-handling code is needed.
+Контекстный дизайн обрабатывает сложную схему взаимодействия: вложенные модальные окна. Когда во время выполнения Task появляется диалоговое окно разрешений, оба контекста `Confirmation` и `Task` могут быть активными. Контекст `Confirmation` имеет приоритет (он регистрируется позже в дереве компонентов), поэтому `y` запускает «утверждение», а не любую привязку уровня Task. Когда диалоговое окно закрывается, контекст `Confirmation` деактивируется и привязки `Task` возобновляются. Такое поведение наложения естественным образом возникает из-за упорядочения приоритетов контекстного списка — никакого специального кода для модальной обработки не требуется.
 
-### Reserved Shortcuts
+### Зарезервированные ярлыки
 
-Not everything can be rebound. The system enforces three tiers of reservation:
+Не все можно восстановить. Система обеспечивает три уровня резервирования:
 
-**Non-rebindable** (hardcoded behavior): `ctrl+c` (interrupt/exit), `ctrl+d` (exit), `ctrl+m` (identical to Enter in all terminals -- rebinding it would break Enter).
+**Неперепривязываемый** (жестко запрограммированное поведение): `ctrl+c` (прерывание/выход), `ctrl+d` (выход), `ctrl+m` (идентично Enter во всех терминалах - перепривязка приведет к поломке Enter).
 
-**Terminal-reserved** (warnings): `ctrl+z` (SIGTSTP), `ctrl+\` (SIGQUIT). These can technically be bound, but the terminal will intercept them before the application sees them in most configurations.
+**Терминал зарезервирован** (предупреждения): `ctrl+z` (SIGTSTP), `ctrl+\` (SIGQUIT). Технически они могут быть привязаны, но в большинстве конфигураций терминал перехватывает их до того, как приложение увидит их.
 
-**macOS-reserved** (errors): `cmd+c`, `cmd+v`, `cmd+x`, `cmd+q`, `cmd+w`, `cmd+tab`, `cmd+space`. The OS intercepts these before they reach the terminal. Binding them would create a shortcut that never fires.
+**зарезервировано для macOS** (ошибки): `cmd+c`, `cmd+v`, `cmd+x`, `cmd+q`, `cmd+w`, `cmd+tab`, `cmd+space`. ОС перехватывает их до того, как они достигнут терминала. Их привязка создаст ярлык, который никогда не сработает.
 
-### The Resolution Flow
+### Порядок разрешения
 
-When a key arrives, the resolution path is:
+Когда ключ прибывает, путь разрешения:
 
-1. Build the context list: the component's registered active contexts plus Global, deduplicated with priority preserved
-2. Call `resolveKeyWithChordState(input, key, contexts)` against the merged binding table
-3. On `match`: clear any pending chord, call the handler, `stopImmediatePropagation()` on the event
-4. On `chord_started`: save the pending keystrokes, stop propagation, start the chord timeout
-5. On `chord_cancelled`: clear the pending chord, let the event fall through
-6. On `unbound`: clear the chord -- this is an explicit unbinding (user set the action to `null`), so propagation is stopped but no handler runs
-7. On `none`: fall through to other handlers
+1. Создайте список контекстов: зарегистрированные активные контексты компонента плюс глобальные, дедуплицированные с сохранением приоритета.
+2. Вызовите `resolveKeyWithChordState(input, key, contexts)` для таблицы объединенной привязки.
+3. На `match`: очистите все ожидающие аккорды, вызовите обработчик `stopImmediatePropagation()` по событию.
+4. На `chord_started`: сохраните ожидающие нажатия клавиш, остановите распространение, запустите таймаут аккорда.
+5. На `chord_cancelled`: очистить ожидающий аккорд, позволить событию провалиться
+6. На `unbound`: очистите аккорд — это явная отвязка (пользователь установил действие на `null`), поэтому распространение останавливается, но обработчик не запускается.
+7. На `none`: перейти к другим обработчикам.
 
-The "last wins" resolution strategy means that if both the default bindings and user bindings define `ctrl+k` in the `Chat` context, the user's binding takes precedence. This is evaluated at match time by iterating bindings in definition order and keeping the last match, rather than building an override map at load time. The advantage: context-specific overrides compose naturally. A user can override `enter` in `Chat` without affecting `enter` in `Confirmation`.
-
----
-
-## Chord Support
-
-The `ctrl+x ctrl+k` binding is a chord: two keystrokes that together form a single action. The resolver manages this with a state machine.
-
-When a key arrives:
-
-1. The resolver appends it to any pending chord prefix
-2. It checks whether any binding's chord starts with this prefix. If so, it returns `chord_started` and saves the pending keystrokes
-3. If the full chord matches a binding exactly, it returns `match` and clears the pending state
-4. If the chord prefix matches nothing, it returns `chord_cancelled`
-
-A `ChordInterceptor` component intercepts all input during the chord wait state. It has a 1000ms timeout -- if the second keystroke does not arrive within a second, the chord is cancelled and the first keystroke is discarded. The `KeybindingContext` provides a `pendingChordRef` for synchronous access to the pending state, avoiding React state update delays that could cause the second keystroke to be processed before the first one's state update completes.
-
-The chord design avoids shadowing readline editing keys. Without chords, the keybinding for "kill agents" might be `ctrl+k` -- but that is readline's "kill to end of line," which users expect in a terminal text input. By using `ctrl+x` as a prefix (matching readline's own chord prefix convention), the system gets a namespace of bindings that do not conflict with single-key editing shortcuts.
-
-The implementation handles an edge case that most chord systems miss: what happens when the user presses `ctrl+x` but then types a character that is not part of any chord? Without careful handling, that character would be swallowed -- the chord interceptor consumed the input, the chord was cancelled, and the character is gone. Claude Code's `ChordInterceptor` returns `chord_cancelled` in this case, which causes the pending input to be discarded but allows the non-matching character to fall through to normal input processing. The character is not lost; only the chord prefix is discarded. This matches the behavior users expect from Emacs-style chord prefixes.
+Стратегия разрешения «последних побед» означает, что если и привязки по умолчанию, и привязки пользователя определяют `ctrl+k` в контексте `Chat`, привязка пользователя имеет приоритет. Это оценивается во время сопоставления путем итерации привязок в порядке определения и сохранения последнего совпадения, а не построения карты переопределения во время загрузки. Преимущество: контекстно-зависимые переопределения компонуются естественным образом. Пользователь может переопределить `enter` в `Chat`, не затрагивая `enter` в `Confirmation`.
 
 ---
 
-## Vim Mode
+## Поддержка аккордов
 
-### The State Machine
+Обвязка `ctrl+x ctrl+k` представляет собой аккорд: два нажатия клавиш, которые вместе образуют одно действие. Резолвер управляет этим с помощью конечного автомата.
 
-The vim implementation is a pure state machine with exhaustive type checking. The types are the documentation:
+Когда приходит ключ:
+
+1. Резолвер добавляет его к любому ожидающему префиксу аккорда.
+2. Проверяется, начинается ли какой-либо аккорд привязки с этого префикса. Если да, он возвращает `chord_started` и сохраняет ожидающие нажатия клавиш.
+3. Если полный аккорд точно соответствует привязке, он возвращает `match` и очищает State ожидания.
+4. Если префикс аккорда ничему не соответствует, возвращается `chord_cancelled`.
+
+Компонент `ChordInterceptor` перехватывает все входные данные в State ожидания аккорда. Тайм-аут составляет 1000 мс: если второе нажатие клавиши не происходит в течение секунды, аккорд отменяется, а первое нажатие клавиши отменяется. `KeybindingContext` предоставляет `pendingChordRef` для синхронного доступа к State ожидания, избегая задержек обновления State React, которые могут привести к тому, что второе нажатие клавиши будет обработано до завершения обновления State первого.
+
+Дизайн аккордов позволяет избежать затенения клавиш редактирования строки чтения. Без аккордов сочетание клавиш для «agents уничтожения» могло бы быть `ctrl+k` — но это «уничтожение до конца строки» readline, которое пользователи ожидают при вводе текста в терминале. Используя `ctrl+x` в качестве префикса (соответствующего собственному соглашению о префиксах аккордов readline), система получает пространство имен привязок, которые не конфликтуют с сочетаниями клавиш редактирования с одной клавишей.
+
+Реализация обрабатывает крайний случай, который пропускает большинство систем аккордов: что происходит, когда пользователь нажимает `ctrl+x`, но затем вводит символ, который не является частью какого-либо аккорда? Без осторожного обращения этот символ был бы проглочен — hook аккорда поглотил входные данные, аккорд был отменен, и символ исчез. В этом случае Claude Code `ChordInterceptor` возвращает `chord_cancelled`, что приводит к отбрасыванию ожидающего ввода, но позволяет несовпадающему символу перейти к нормальной обработке ввода. Персонаж не потерян; отбрасывается только префикс аккорда. Это соответствует поведению, которое пользователи ожидают от префиксов аккордов в стиле Emacs.
+
+---
+
+## Vim Режим
+
+### Государственная машина
+
+Реализация vim представляет собой чистый конечный автомат с исчерпывающей проверкой типов. Типы - это документация:
 
 ```typescript
 export type VimState =
@@ -282,11 +282,11 @@ export type CommandState =
   | { type: 'indent'; dir: '>' | '<'; count: number }
 ```
 
-This is a discriminated union with 12 variants. TypeScript's exhaustive checking ensures that every `switch` statement on `CommandState.type` handles all 12 cases. Adding a new state to the union causes every incomplete switch to produce a compile error. The state machine cannot have dead states or missing transitions -- the type system forbids it.
+Это дискриминируемый союз с 12 вариантами. Исчерпывающая проверка TypeScript гарантирует, что каждый оператор `switch` в `CommandState.type` обрабатывает все 12 случаев. Добавление нового State в объединение приводит к тому, что каждое незавершенное переключение приводит к ошибке компиляции. У конечного автомата не может быть мертвых State или отсутствующих переходов — это запрещено системой типов.
 
-Notice how each state carries exactly the data needed for the next transition. The `operator` state knows which operator (`op`) and the preceding count. The `operatorCount` state adds the digit accumulator (`digits`). The `operatorTextObj` state adds the scope (`inner` or `around`). No state carries data it does not need. This is not just good taste -- it prevents an entire class of bugs where a handler reads stale data from a previous command. If you are in the `find` state, you have a `FindType` and a `count`. You do not have an operator, because no operator is pending. The type makes the impossible state unrepresentable.
+Обратите внимание, что каждое State несет именно те данные, которые необходимы для следующего перехода. State `operator` знает, какой оператор (`op`) и предыдущий счетчик. State `operatorCount` добавляет цифровой аккумулятор (`digits`). State `operatorTextObj` добавляет область действия (`inner` или `around`). Ни одно state не несет данных, которые ему не нужны. Это не просто хороший вкус — это предотвращает целый класс ошибок, когда обработчик считывает устаревшие данные из предыдущей команды. Если вы находитесь в State `find`, у вас есть `FindType` и `count`. У вас нет оператора, поскольку ни один оператор не ожидает ответа. Тип делает невозможное State непредставимым.
 
-The state diagram tells the story:
+Диаграмма State рассказывает следующую историю:
 
 ```mermaid
 stateDiagram-v2
@@ -318,11 +318,11 @@ stateDiagram-v2
     indent --> idle: repeat (>>, <<)
 ```
 
-From `idle`, pressing `d` enters the `operator` state. From `operator`, pressing `w` executes `delete` with the `w` motion. Pressing `d` again (`dd`) triggers a line deletion. Pressing `2` enters `operatorCount`, so `d2w` becomes "delete the next 2 words." Pressing `i` enters `operatorTextObj`, so `di"` becomes "delete inside quotes." Every intermediate state carries exactly the context needed for the next transition -- no more, no less.
+Из `idle` нажатие `d` переходит в State `operator`. Из `operator` нажатие `w` выполняет `delete` с движением `w`. Повторное нажатие `d` (`dd`) запускает удаление строки. Нажатие `2` приводит к вводу `operatorCount`, поэтому `d2w` становится «удалить следующие 2 слова». Нажатие `i` приводит к вводу `operatorTextObj`, поэтому `di"` становится «удалить внутри кавычек». Каждое промежуточное State несет в себе именно тот контекст, который необходим для следующего перехода — ни больше, ни меньше.
 
-### Transitions as Pure Functions
+### Переходы как чистые функции
 
-The `transition()` function dispatches on the current state type to one of 10 handler functions. Each returns a `TransitionResult`:
+Функция `transition()` отправляет текущий тип State в одну из 10 функций-обработчиков. Каждый возвращает `TransitionResult`:
 
 ```typescript
 type TransitionResult = {
@@ -331,46 +331,46 @@ type TransitionResult = {
 }
 ```
 
-Side effects are returned, not executed. The transition function is pure -- given a state and a key, it returns the next state and optionally a closure that performs the action. The caller decides when to run the effect. This makes the state machine trivially testable: feed it states and keys, assert on the returned states, ignore the closures. It also means the transition function has no dependencies on the editor state, the cursor position, or the buffer content. Those details are captured by the closure at creation time, not consumed by the state machine at transition time.
+Побочные эффекты возвращаются, а не выполняются. Функция перехода чистая: учитывая State и ключ, она возвращает следующее State и, возможно, замыкание, выполняющее действие. Вызывающий решает, когда запускать эффект. Это делает конечный автомат легко тестируемым: подавайте в него State и ключи, утверждайте возвращаемые State, игнорируйте замыкания. Это также означает, что функция перехода не зависит от State редактора, положения курсора или содержимого буфера. Эти детали фиксируются замыканием во время создания, а не потребляются конечным автоматом во время перехода.
 
-The `fromIdle` handler is the entry point and covers the full vim vocabulary:
+Обработчик `fromIdle` является точкой входа и охватывает весь словарь vim:
 
-- **Count prefix**: `1-9` enters the `count` state, accumulating digits. `0` is special -- it is the "start of line" motion, not a count digit, unless digits have already been accumulated
-- **Operators**: `d`, `c`, `y` enter the `operator` state, waiting for a motion or text object to define the range
-- **Find**: `f`, `F`, `t`, `T` enter the `find` state, waiting for a character to search for
-- **G-prefix**: `g` enters the `g` state for composite commands (`gg`, `gj`, `gk`)
-- **Replace**: `r` enters the `replace` state, waiting for the replacement character
-- **Indent**: `>`, `<` enter the `indent` state (for `>>` and `<<`)
-- **Simple motions**: `h/j/k/l/w/b/e/W/B/E/0/^/$` execute immediately, moving the cursor
-- **Immediate commands**: `x` (delete char), `~` (toggle case), `J` (join lines), `p/P` (paste), `D/C/Y` (operator shortcuts), `G` (go to end), `.` (dot-repeat), `;/,` (find repeat), `u` (undo), `i/I/a/A/o/O` (enter insert mode)
+- **Префикс счета**: `1-9` переходит в State `count`, накапливая цифры. `0` является особенным - это движение «начала строки», а не цифра счета, если цифры еще не были накоплены.
+- **Операторы**: `d`, `c`, `y` входят в State `operator`, ожидая движения или текстового объекта для определения диапазона.
+- **Найти**: `f`, `F`, `t`, `T` войти в State `find`, ожидая символа для поиска.
+- **G-префикс**: `g` переходит в State `g` для составных команд (`gg`, `gj`, `gk`)
+- **Заменить**: `r` переходит в State `replace`, ожидая символа замены.
+- **Отступ**: `>`, `<` переводят в State `indent` (для `>>` и `<<`)
+- **Простые движения**: `h/j/k/l/w/b/e/W/B/E/0/^/$` выполняются немедленно, перемещая курсор.
+- **Непосредственные команды**: `x` (удалить символ), `~` (переключить регистр), `J` (объединить строки), `p/P` (вставить), `D/C/Y` (ярлыки оператора), `G` (перейти в конец), `.` (точечный повтор), `;/,` (найти повтор), `u` (отменить), `i/I/a/A/o/O` (ввести режим вставки)
 
-### Motions, Operators, and Text Objects
+### Движения, операторы и текстовые объекты
 
-**Motions** are pure functions mapping a key to a cursor position. `resolveMotion(key, cursor, count)` applies the motion `count` times, short-circuiting if the cursor stops moving (you cannot move left past column 0). This short-circuit is important for `3w` at the end of a line -- it stops at the last word rather than wrapping or erroring.
+**Движения** — это чистые функции, сопоставляющие клавишу с позицией курсора. `resolveMotion(key, cursor, count)` применяет движение `count` раз, закорачивая, если курсор перестает двигаться (вы не можете перемещаться влево за столбец 0). Это короткое замыкание важно для `3w` в конце строки — оно останавливается на последнем слове, а не переносится или выдает ошибку.
 
-Motions are classified by how they interact with operators:
+Движения классифицируются по способу взаимодействия с операторами:
 
-- **Exclusive** (default) -- the character at the destination is NOT included in the range. `dw` deletes up to but not including the first character of the next word
-- **Inclusive** (`e`, `E`, `$`) -- the character at the destination IS included. `de` deletes through the last character of the current word
-- **Linewise** (`j`, `k`, `G`, `gg`, `gj`, `gk`) -- when used with operators, the range extends to cover full lines. `dj` deletes the current line and the one below, not just the characters between the two cursor positions
+- **Эксклюзивный** (по умолчанию) — символ в месте назначения НЕ включен в диапазон. `dw` удаляет до первого символа следующего слова, но не включая его.
+- **Включая** (`e`, `E`, `$`) — символ в пункте назначения включен. `de` удаляет последний символ текущего слова.
+- **Линейно** (`j`, `k`, `G`, `gg`, `gj`, `gk`) — при использовании с операторами диапазон расширяется и охватывает полные строки. `dj` удаляет текущую строку и строку ниже, а не только символы между двумя позициями курсора.
 
-**Operators** apply to a range. `delete` removes text and saves it to the register. `change` removes text and enters insert mode. `yank` copies to the register without modification. The `cw`/`cW` special case follows vim convention: change-word goes to the end of the current word, not the start of the next word (unlike `dw`).
+**Операторы** применяются к диапазону. `delete` удаляет текст и сохраняет его в реестр. `change` удаляет текст и переходит в режим вставки. `yank` копирует в реестр без изменений. Особый случай `cw`/`cW` соответствует соглашению vim: слово изменения переходит в конец текущего слова, а не в начало следующего слова (в отличие от `dw`).
 
-One interesting edge case: `[Image #N]` chip snapping. When a word motion lands inside an image reference chip (rendered as a single visual unit in the terminal), the range extends to cover the entire chip. This prevents partial deletions of what the user perceives as an atomic element -- you cannot delete half of `[Image #3]` because the motion system treats the entire chip as a single word.
+Один интересный крайний случай: обрыв стружки `[Image #N]`. Когда движение слова попадает внутрь эталонного чипа изображения (представленного в терминале как единая визуальная единица), диапазон расширяется и охватывает весь чип. Это предотвращает частичное удаление того, что пользователь воспринимает как атомарный элемент — вы не можете удалить половину `[Image #3]`, потому что система движения рассматривает весь чип как одно слово.
 
-Additional commands cover the full expected vim vocabulary: `x` (delete character), `r` (replace character), `~` (toggle case), `J` (join lines), `p`/`P` (paste with linewise/characterwise awareness), `>>` / `<<` (indent/outdent with 2-space stops), `o`/`O` (open line below/above and enter insert mode).
+Дополнительные команды охватывают полный ожидаемый словарь vim: `x` (удалить символ), `r` (заменить символ), `~` (переключить регистр), `J` (объединить строки), `p`/`P` (вставить с построчным/посимвольным учетом), `>>` / `<<` (отступ/отступ с двумя пробелами), `o`/`O` (открыть строку ниже/выше и войти в режим вставки).
 
-**Text objects** find boundaries around the cursor. They answer the question: "what is the 'thing' the cursor is inside?"
+**Текстовые объекты** обнаруживают границы вокруг курсора. Они отвечают на вопрос: «Что за «вещь», внутри которой находится курсор?»
 
-Word objects (`iw`, `aw`, `iW`, `aW`) segment text into graphemes, classify each as word-character, whitespace, or punctuation, and expand the selection to the word boundary. The `i` (inner) variant selects just the word. The `a` (around) variant includes surrounding whitespace -- trailing whitespace preferred, falling back to leading if at line end. The uppercase variants (`W`, `aW`) treat any non-whitespace sequence as a word, ignoring punctuation boundaries.
+Объекты Word (`iw`, `aw`, `iW`, `aW`) сегментируют текст на графемы, классифицируют каждую из них как символ слова, пробел или знак препинания и расширяют выделение до границы слова. Вариант `i` (внутренний) выбирает только слово. Вариант `a` (вокруг) включает окружающие пробелы - предпочтительны конечные пробелы, возвращающиеся к началу, если они находятся в конце строки. Варианты в верхнем регистре (`W`, `aW`) рассматривают любую последовательность без пробелов как слово, игнорируя границы пунктуации.
 
-Quote objects (`i"`, `a"`, `i'`, `a'`, `` i` ``, `` a` ``) find paired quotes on the current line. Pairs are matched in order (first and second quote form a pair, third and fourth form the next pair, etc.). If the cursor is between the first and second quote, that is the match. The `a` variant includes the quote characters; the `i` variant excludes them.
+Объекты кавычек (`i"`, `a"`, `i'`, `a'`, `` i` ``, `` a` ``) find paired quotes on the current line. Pairs are matched in order (first and second quote form a pair, third and fourth form the next pair, etc.). If the cursor is between the first and second quote, that is the match. The `a` variant includes the quote characters; the `i` вариант исключает их.
 
-Bracket objects (`ib`/`i(`, `ab`/`a(`, `i[`/`a[`, `iB`/`i{`/`aB`/`a{`, `i<`/`a<`) do depth-tracking search for matching delimiters. They search outward from the cursor, maintaining a nesting count, until they find the matching pair at depth zero. This correctly handles nested brackets -- `d i (` inside `foo((bar))` deletes `bar`, not `(bar)`.
+Объекты в скобках (`ib`/`i(`, `ab`/`a(`, `i[`/`a[`, `iB`/`i{`/`aB`/`a{`, `i<`/`a<`) выполняют поиск совпадающих разделителей с отслеживанием глубины. Они выполняют поиск за пределами курсора, поддерживая счетчик вложений, пока не найдут совпадающую пару на нулевой глубине. Это правильно обрабатывает вложенные скобки: `d i (` внутри `foo((bar))` удаляет `bar`, а не `(bar)`.
 
-### Persistent State and Dot-Repeat
+### Постоянное State и повторение точки
 
-The vim mode maintains a `PersistentState` that survives across commands -- the "memory" that makes vim feel like vim:
+Режим vim поддерживает `PersistentState`, который сохраняется при выполнении команд — «memory», благодаря которой vim ощущается как vim:
 
 ```typescript
 interface PersistentState {
@@ -381,82 +381,82 @@ interface PersistentState {
 }
 ```
 
-Every mutating command records itself as a `RecordedChange` -- a discriminated union covering insert, operator+motion, operator+textObj, operator+find, replace, delete-char, toggle-case, indent, open-line, and join. The `.` command replays `lastChange` from persistent state, using the recorded count, operator, and motion to reproduce the exact same edit at the current cursor position.
+Каждая изменяющая команда записывает себя как `RecordedChange` — распознаваемое объединение, охватывающее вставку, оператор+движение, оператор+текстовый объект, оператор+поиск, замену, удаление символов, переключение регистра, отступ, открытие строки и соединение. Команда `.` воспроизводит `lastChange` из постоянного State, используя записанный счетчик, оператор и движение для воспроизведения точно такого же редактирования в текущей позиции курсора.
 
-Find-repeat (`;` and `,`) uses `lastFind`. The `;` command repeats the last find in the same direction. The `,` command flips the direction: `f` becomes `F`, `t` becomes `T`, and vice versa. This means after `fa` (find next 'a'), `;` finds the next 'a' forward and `,` finds the next 'a' backward -- without the user having to remember which direction they were searching.
+Поиск-повтор (`;` и `,`) использует `lastFind`. Команда `;` повторяет последнюю находку в том же направлении. Команда `,` меняет направление: `f` становится `F`, `t` становится `T`, и наоборот. Это означает, что после `fa` (найти следующую букву «а») `;` находит следующую букву «а» вперед, а `,` находит следующую букву «а» назад, причем пользователю не нужно запоминать, в каком направлении он искал.
 
-The register tracks yanked and deleted text. When register content ends with `\n`, it is flagged as linewise, which changes paste behavior: `p` inserts below the current line (not after the cursor), and `P` inserts above. This distinction is invisible to the user but critical for the "delete a line, paste it somewhere else" workflow that vim users rely on constantly.
-
----
-
-## Virtual Scrolling
-
-Long Claude Code sessions produce long conversations. A heavy debugging session might generate 200+ messages, each containing markdown, code blocks, tool use results, and permission records. Without virtualization, React would maintain 200+ component subtrees in memory, each with its own state, effects, and memoization caches. The DOM tree would contain thousands of nodes. Yoga layout would visit all of them on every frame. The terminal would be unusable.
-
-The `VirtualMessageList` component solves this by rendering only the messages visible in the viewport plus a small buffer above and below. In a conversation with hundreds of messages, this is the difference between mounting 500 React subtrees (each with markdown parsing, syntax highlighting, and tool use blocks) and mounting 15.
-
-The component maintains:
-
-- **Height cache** per message, invalidated when terminal column count changes
-- **Jump handle** for transcript search navigation (jump to index, next/previous match)
-- **Search text extraction** with warm-cache support (pre-lowercase all messages when the user enters `/`)
-- **Sticky prompt tracking** -- when the user scrolls away from the input, their last prompt text appears at the top as context
-- **Message actions navigation** -- cursor-based message selection for the rewind feature
-
-The `useVirtualScroll` hook computes which messages to mount based on `scrollTop`, `viewportHeight`, and cumulative message heights. It maintains scroll clamp bounds on the `ScrollBox` to prevent blank screens when burst `scrollTo` calls race past React's async re-render -- a classic problem with virtualized lists where the scroll position can outrun the DOM update.
-
-The interaction between virtual scrolling and the markdown token cache is worth noting. When a message scrolls out of the viewport, its React subtree unmounts. When the user scrolls back, the subtree remounts. Without caching, this would mean re-parsing the markdown for every message the user scrolls past. The module-level LRU cache (500 entries, keyed by content hash) ensures that the expensive `marked.lexer()` call happens at most once per unique message content, regardless of how many times the component mounts and unmounts.
-
-The `ScrollBox` component itself provides an imperative API via `useImperativeHandle`:
-
-- `scrollTo(y)` -- absolute scroll, breaks sticky-scroll mode
-- `scrollBy(dy)` -- accumulates into `pendingScrollDelta`, drained by the renderer at a capped rate
-- `scrollToElement(el, offset)` -- defers position read to render time via `scrollAnchor`
-- `scrollToBottom()` -- re-enables sticky-scroll mode
-- `setClampBounds(min, max)` -- constrains the virtual scroll window
-
-All scroll mutations go directly to DOM node properties and schedule renders via microtask, bypassing React's reconciler. The `markScrollActivity()` call signals background intervals (spinners, timers) to skip their next tick, reducing event-loop contention during active scrolling. This is a cooperative scheduling pattern: the scroll path tells background work "I am in a latency-sensitive operation, please yield." Background intervals check this flag before scheduling their next tick and delay by one frame if scrolling is active. The result is consistently smooth scrolling even when multiple spinners and timers are running in the background.
+Регистр отслеживает выдернутый и удаленный текст. Когда содержимое регистра заканчивается на `\n`, оно помечается как построчное, что меняет поведение вставки: `p` вставляется ниже текущей строки (не после курсора), а `P` вставляется выше. Это различие незаметно для пользователя, но имеет решающее значение для рабочего процесса «удалить строку, вставить ее куда-нибудь еще», на который постоянно полагаются пользователи vim.
 
 ---
 
-## Apply This: Building a Context-Aware Keybinding System
+## Виртуальная прокрутка
 
-Claude Code's keybinding architecture offers a template for any application with modal input -- editors, IDEs, drawing tools, terminal multiplexers. The key insights:
+Длинные сеансы Claude Code приводят к длинным разговорам. В ходе интенсивного сеанса отладки может быть создано более 200 сообщений, каждое из которых содержит уценку, блоки кода, результаты использования tools и записи разрешений. Без виртуализации React поддерживал бы в memory более 200 поддеревьев компонентов, каждое из которых имело бы собственное State, эффекты и кэши мемоизации. Дерево DOM будет содержать тысячи узлов. Раскладка йоги будет посещать их всех в каждом кадре. Терминал будет непригоден для использования.
 
-**Separate bindings from handlers.** Bindings are data (which key maps to which action name). Handlers are code (what happens when the action fires). Keeping them separate means bindings can be serialized to JSON for user customization, while handlers remain in the components that own the relevant state. A user can rebind `ctrl+k` to `chat:submit` without touching any component code.
+Компонент `VirtualMessageList` решает эту проблему, отображая только сообщения, видимые в области просмотра, плюс небольшой буфер сверху и снизу. В разговоре с сотнями сообщений это разница между установкой 500 поддеревьев React (каждое с анализом Markdown, подсветкой синтаксиса и блоками использования tools) и установкой 15.
 
-**Context as a first-class concept.** Instead of one flat keymap, define contexts that activate and deactivate based on application state. When a dialog opens, the `Confirmation` context activates and its bindings take precedence over `Chat` bindings. When the dialog closes, `Chat` bindings resume. This eliminates the conditional soup of `if (dialogOpen && key === 'y')` scattered through event handlers.
+Компонент поддерживает:
 
-**Chord state as an explicit machine.** Multi-key sequences (chords) are not a special case of single-key bindings -- they are a different kind of binding that requires a state machine with timeout and cancellation semantics. Making this explicit (with a dedicated `ChordInterceptor` component and a `pendingChordRef`) prevents subtle bugs where the second keystroke of a chord is consumed by a different handler because React's state update had not yet propagated.
+- **Кэш высоты** для каждого сообщения, аннулируется при изменении количества столбцов терминала.
+- **Рычаг перехода** для навигации по поиску стенограммы (переход к индексу, следующее/предыдущее совпадение)
+- **Извлечение текста при поиске** с поддержкой теплого кэша (все сообщения переводятся в нижний регистр, когда пользователь вводит `/`)
+- **Прикрепленное отслеживание prompts** – когда пользователь прокручивает страницу ввода, текст последней prompt отображается вверху в качестве контекста.
+- **Навигация по действиям с сообщениями** – выбор сообщения с помощью курсора для функции перемотки назад.
 
-**Reserve early, warn clearly.** Identify keys that cannot be rebound (system shortcuts, terminal control characters) at definition time, not at resolution time. When a user tries to bind `ctrl+c`, show an error during configuration loading rather than silently accepting a binding that will never fire. This is the difference between a keybinding system that works and one that produces mysterious bug reports.
+Hook `useVirtualScroll` вычисляет, какие сообщения монтировать, на основе `scrollTop`, `viewportHeight` и совокупной высоты сообщений. Он поддерживает ограничения прокрутки на `ScrollBox`, чтобы предотвратить появление пустых экранов при batchных вызовах `scrollTo`, проходящих мимо асинхронного повторного рендеринга React — классическая проблема с виртуализированными списками, когда позиция прокрутки может опережать обновление DOM.
 
-**Design for terminal diversity.** Claude Code's keybinding system defines platform-specific alternatives at the binding level, not the handler level. Image paste is `ctrl+v` or `alt+v` depending on the OS. Mode cycling is `shift+tab` or `meta+m` depending on VT mode support. The handler for each action is the same regardless of which key triggers it. This means testing covers one code path per action, not one per platform-key combination. And when a new terminal quirk surfaces (Windows Terminal lacking VT mode before Node 24.2.0, for example), the fix is a single conditional in the binding definition, not a scattered set of `if (platform === 'windows')` checks in handler code.
+Стоит отметить взаимодействие между виртуальной прокруткой и кешем токенов Markdown. Когда сообщение прокручивается за пределы области просмотра, его поддерево React размонтируется. Когда пользователь прокручивает назад, поддерево перемонтируется. Без кэширования это означало бы повторный анализ Markdown для каждого сообщения, которое пользователь прокручивает. Кэш LRU на уровне модуля (500 записей, связанных хешем содержимого) гарантирует, что дорогостоящий вызов `marked.lexer()` произойдет не более одного раза для каждого уникального содержимого сообщения, независимо от того, сколько раз компонент монтируется и размонтируется.
 
-**Provide escape hatches.** The null-action unbinding mechanism is small but important. A user who runs Claude Code inside a terminal multiplexer might find that `ctrl+t` (toggle todos) conflicts with their multiplexer's tab-switching shortcut. By adding `{ "ctrl+t": null }` to their keybindings.json, they disable the binding entirely. The key press passes through to the multiplexer. Without null unbinding, the user's only option would be to rebind `ctrl+t` to some other action they do not want, or to reconfigure their multiplexer -- neither of which is a good experience.
+Сам компонент `ScrollBox` предоставляет императивный запрос API через `useImperativeHandle`:
 
-The vim mode implementation adds one more lesson: **make the type system enforce your state machine**. The 12-variant `CommandState` union makes it impossible to forget a state in a switch statement. The `TransitionResult` type separates state changes from side effects, making the machine testable as a pure function. If your application has modal input, express the modes as a discriminated union and let the compiler verify exhaustiveness. The time spent defining the types pays for itself in eliminated runtime bugs.
+- `scrollTo(y)` - абсолютная прокрутка, отключение режима липкой прокрутки
+- `scrollBy(dy)` - накапливается в `pendingScrollDelta`, истощается рендерером с ограниченной скоростью.
+- `scrollToElement(el, offset)` - откладывает чтение позиции до времени рендеринга через `scrollAnchor`.
+- `scrollToBottom()` - повторно включает режим липкой прокрутки.
+- `setClampBounds(min, max)` - ограничивает окно виртуальной прокрутки.
 
-Consider the alternative: a vim implementation using mutable state and imperative conditionals. The `fromOperator` handler would be a nest of `if (mode === 'operator' && pendingCount !== null && isDigit(key))` checks, with each branch mutating shared variables. Adding a new state (say, a macro-recording mode) would require auditing every branch to ensure the new state is handled. With a discriminated union, the compiler does the audit -- the PR that adds the new variant will not build until every switch statement handles it.
-
-This is the deeper lesson of Claude Code's input system: at every layer -- tokenizer, parser, keybinding resolver, vim state machine -- the architecture converts unstructured input into typed, exhaustively handled structures as early as possible. Raw bytes become `ParsedKey` at the parser boundary. `ParsedKey` becomes an action name at the keybinding boundary. The action name becomes a typed handler at the component boundary. Each conversion narrows the space of possible states, and each narrowing is enforced by TypeScript's type system. By the time a keystroke reaches application logic, the ambiguity is gone. There is no "what if the key is undefined?" There is no "what if the modifier combination is impossible?" The types have already forbidden those states from existing.
-
-The two chapters together tell one story. Chapter 13 showed how the rendering system eliminates unnecessary work -- blitting unchanged regions, interning repeated values, diffing at the cell level, tracking damage bounds. Chapter 14 showed how the input system eliminates ambiguity -- parsing five protocols into one type, resolving keys against contextual bindings, expressing modal state as exhaustive unions. The rendering system answers "how do you paint 24,000 cells 60 times per second?" The input system answers "how do you turn a byte stream into meaningful actions across a fragmented ecosystem?" Both answers follow the same principle: push complexity to the boundaries, where it can be handled once and correctly, so that everything downstream operates on clean, typed, well-bounded data. The terminal is chaos. The application is order. The boundary code does the hard work of converting one into the other.
+Все мутации прокрутки передаются непосредственно в свойства узла DOM и планируют рендеринг через микрозадачу, минуя примиритель React. Вызов `markScrollActivity()` сигнализирует фоновым интервалам (спиннерам, таймерам) пропустить следующий такт, уменьшая конфликты в цикле событий во время активной прокрутки. Это шаблон совместного планирования: путь прокрутки сообщает фоновой работе: «Я выполняю операцию, чувствительную к задержке, пожалуйста, уступите». Фоновые интервалы проверяют этот флаг перед планированием следующего тика и задерживают на один кадр, если прокрутка активна. Результатом является стабильно плавная прокрутка, даже когда в фоновом режиме работает несколько счетчиков и таймеров.
 
 ---
 
-## Summary: Two Systems, One Design Philosophy
+## Примените это: создание контекстно-зависимой системы привязки клавиш
 
-Chapters 13 and 14 covered the two halves of the terminal interface: output and input. Despite their different concerns, both systems follow the same architectural principles.
+Архитектура привязки клавиш Claude Code предлагает шаблон для любого приложения с модальным вводом — редакторов, IDE, tools рисования, терминальных мультиплексоров. Ключевые идеи:
 
-**Interning and indirection.** The rendering system interns characters, styles, and hyperlinks into pools, replacing string comparisons with integer comparisons throughout the hot path. The input system interns escape sequences into structured `ParsedKey` objects at the parser boundary, replacing byte-level pattern matching with typed field access throughout the handler path.
+**Отдельные привязки от обработчиков.** Привязки — это данные (какой ключ соответствует какому имени действия). Обработчики — это код (что происходит, когда действие срабатывает). Сохранение их отдельно означает, что привязки можно сериализовать в JSON для настройки пользователя, в то время как обработчики остаются в компонентах, владеющих соответствующим State. Пользователь может перепривязать `ctrl+k` к `chat:submit`, не трогая какой-либо код компонента.
 
-**Layered elimination of work.** The rendering system stacks five optimizations (dirty flags, blit, damage rectangles, cell-level diff, patch optimization) that each eliminate a category of unnecessary computation. The input system stacks three (tokenizer, protocol parser, keybinding resolver) that each eliminate a category of ambiguity.
+**Контекст как первоклассная концепция.** Вместо одной простой раскладки клавиш определите контексты, которые активируются и деактивируются в зависимости от State приложения. Когда открывается диалоговое окно, активируется контекст `Confirmation`, и его привязки имеют приоритет над привязками `Chat`. Когда диалоговое окно закроется, привязки `Chat` возобновятся. Это устраняет условный суп из `if (dialogOpen && key === 'y')`, разбросанный по обработчикам событий.
 
-**Pure functions and typed state machines.** The vim mode is a pure state machine with typed transitions. The keybinding resolver is a pure function from (key, contexts, chord-state) to resolution-result. The rendering pipeline is a pure function from (DOM tree, previous screen) to (new screen, patches). Side effects happen at the boundaries -- writing to stdout, dispatching to React -- not in the core logic.
+**State аккорда как явный автомат.** Многоклавишные последовательности (аккорды) не являются особым случаем одноклавишных привязок — это другой тип привязки, для которого требуется конечный автомат с семантикой тайм-аута и отмены. Если сделать это явным образом (с помощью специального компонента `ChordInterceptor` и `pendingChordRef`), это предотвратит тонкие ошибки, при которых второе нажатие клавиши аккорда используется другим обработчиком, поскольку обновление State React еще не распространилось.
 
-**Graceful degradation across environments.** The rendering system adapts to terminal size, alt-screen support, and synchronized-update protocol availability. The input system adapts to Kitty keyboard protocol, xterm modifyOtherKeys, legacy VT sequences, and multiplexer passthrough requirements. Neither system requires a specific terminal to function; both get better on more capable terminals.
+**Зарезервируйте заранее, четко предупредите.** Определите ключи, которые нельзя повторно использовать (системные ярлыки, символы управления терминалом) во время определения, а не во время разрешения. Когда пользователь пытается привязать `ctrl+c`, покажите ошибку во время загрузки конфигурации, а не молча принимайте привязку, которая никогда не сработает. В этом разница между работающей системой назначения клавиш и системой, которая выдает загадочные отчеты об ошибках.
 
-These principles are not specific to terminal applications. They apply to any system that must process high-frequency input and produce low-latency output across a diverse set of runtime environments. The terminal just happens to be an environment where the constraints are sharp enough that violating these principles produces immediately visible degradation -- a dropped frame, a swallowed keystroke, a flicker. That sharpness makes it an excellent teacher.
+**Разработано с учетом разнообразия терминалов.** Система привязки клавиш Claude Code определяет альтернативы для конкретной платформы на уровне привязки, а не на уровне обработчика. Вставка изображения — `ctrl+v` или `alt+v` в зависимости от ОС. Смена режима — `shift+tab` или `meta+m` в зависимости от поддержки режима VT. Обработчик каждого действия один и тот же, независимо от того, какая клавиша его запускает. Это означает, что тестирование охватывает один путь кода для каждого действия, а не для каждой комбинации клавиш платформы. А когда появляется новая особенность терминала (например, в Windows Terminal отсутствует режим VT до Node 24.2.0), исправлением является одно условие в определении привязки, а не разрозненный набор проверок `if (platform === 'windows')` в коде обработчика.
 
-The next chapter moves from the UI layer to the protocol layer: how Claude Code implements MCP -- the universal tool protocol that lets any external service become a first-class tool. The terminal UI handles the last mile of the user experience -- converting data structures into pixels on a screen and keystrokes into application actions. MCP handles the first mile of extensibility -- discovering, connecting, and executing tools that live outside the agent's own codebase. Between them, the memory system (Chapter 11) and the skills/hooks system (Chapter 12) define the intelligence and control layers. The quality ceiling of the entire system depends on all four: no amount of model intelligence compensates for a laggy UI, and no amount of rendering performance compensates for a model that cannot reach the tools it needs.
+**Предусмотрите аварийные люки.** Механизм разблокировки нулевого действия небольшой, но важный. Пользователь, запускающий Claude Code внутри терминального мультиплексора, может обнаружить, что `ctrl+t` (переключение Task) конфликтует с ярлыком переключения вкладок его мультиплексора. Добавляя `{ "ctrl+t": null }` к своему keybindings.json, они полностью отключают привязку. Нажатие клавиши передается на мультиплексор. Без нулевой отмены привязки единственным вариантом для пользователя было бы повторно привязать `ctrl+t` к какому-либо другому действию, которое ему не нужно, или перенастроить свой мультиплексор — ни то, ни другое не является хорошим опытом.
+
+Реализация режима vim добавляет еще один урок: **заставьте систему типов обеспечивать соблюдение вашего конечного автомата**. Объединение `CommandState` с 12 вариантами делает невозможным забыть State в операторе переключения. Тип `TransitionResult` отделяет изменения State от побочных эффектов, что позволяет тестировать машину как чистую функцию. Если ваше приложение имеет модальный ввод, выразите режимы как распознаваемое объединение и позвольте компилятору проверить полноту. Время, потраченное на определение типов, окупается за счет устранения ошибок во время выполнения.
+
+Рассмотрим альтернативу: реализацию vim с использованием изменяемого State и императивных условий. Обработчик `fromOperator` будет представлять собой совокупность проверок `if (mode === 'operator' && pendingCount !== null && isDigit(key))`, каждая из которых будет изменять общие переменные. Добавление нового State (скажем, режима записи макросов) потребует аудита каждой ветки, чтобы гарантировать обработку нового State. При использовании дискриминированного объединения компилятор проводит аудит — PR, добавляющий новый вариант, не будет построен, пока его не обработает каждый оператор переключения.
+
+Это более глубокий урок системы ввода Claude Code: на каждом уровне — токенизаторе, синтаксическом анализаторе, преобразователе привязки клавиш, конечном автомате vim — архитектура преобразует неструктурированный ввод в типизированные, исчерпывающе обрабатываемые структуры как можно раньше. Необработанные байты на границе анализатора становятся `ParsedKey`. `ParsedKey` становится именем действия на границе привязки клавиш. Имя действия становится типизированным обработчиком на границе компонента. Каждое преобразование сужает пространство возможных State, и каждое сужение обеспечивается системой типов TypeScript. К тому времени, когда нажатие клавиши достигает логики приложения, двусмысленность исчезает. Нет вопроса «что, если ключ не определен?» Нет вопроса «что, если комбинация модификаторов невозможна?» Типы уже запретили этим государствам существовать.
+
+Две главы вместе рассказывают одну историю. В главе 13 показано, как система рендеринга устраняет ненужную работу — удаление неизмененных областей, интернирование повторяющихся значений, различие на уровне ячеек, отслеживание границ повреждения. В главе 14 показано, как система ввода устраняет двусмысленность — анализ пяти протоколов в один тип, разрешение ключей на основе контекстных привязок, выражение модального State в виде исчерпывающих объединений. Система рендеринга отвечает: «Как закрашивать 24 000 ячеек 60 раз в секунду?» Система ввода отвечает: «Как превратить поток байтов в значимые действия во фрагментированной экосистеме?» Оба ответа следуют одному и тому же принципу: довести сложность до пределов, где ее можно будет обработать один раз и правильно, чтобы все последующие операции работали на чистых, типизированных и хорошо связанных данных. Терминал — это хаос. Приложение заказное. Граничный код выполняет тяжелую работу по преобразованию одного в другое.
+
+---
+
+## Резюме: две системы, одна философия дизайна
+
+В главах 13 и 14 рассматривались две половины интерфейса терминала: вывод и ввод. Несмотря на разные проблемы, обе системы следуют одним и тем же архитектурным принципам.
+
+**Интернирование и косвенность.** Система рендеринга помещает символы, стили и гиперссылки в пулы, заменяя сравнение строк целочисленными сравнениями по всему горячему пути. Система ввода интерпретирует escape-последовательности в структурированные объекты `ParsedKey` на границе анализатора, заменяя сопоставление шаблонов на уровне байтов доступом к типизированным полям на протяжении всего пути обработчика.
+
+**Послойное устранение работы.** Система рендеринга объединяет пять оптимизаций (грязные флаги, блитирование, прямоугольники повреждений, различия на уровне ячеек, оптимизация патчей), каждая из которых устраняет определенную категорию ненужных вычислений. В системе ввода есть три стека (токенизатор, анализатор протоколов, преобразователь привязок клавиш), каждый из которых устраняет определенную категорию двусмысленности.
+
+**Чистые функции и типизированные конечные автоматы.** Режим vim — это чистый конечный автомат с типизированными переходами. Распознаватель привязки клавиш — это чистая функция от (клавиши, контекста, State аккорда) до результата разрешения. Конвейер рендеринга — это чистая функция от (дерево DOM, предыдущий экран) до (новый экран, патчи). Побочные эффекты происходят на границах — запись в stdout, отправка в React — а не в основной логике.
+
+**Мягкая деградация в разных средах.** Система рендеринга адаптируется к размеру терминала, поддержке альтернативного экрана и доступности протокола синхронизированного обновления. Система ввода адаптируется к протоколу клавиатуры Kitty, xterm ModifyOtherKeys, устаревшим последовательностям VT и требованиям сквозной передачи мультиплексора. Ни одна из систем не требует для работы определенного терминала; оба становятся лучше на более функциональных терминалах.
+
+Эти принципы не являются специфичными для терминальных приложений. Они применимы к любой системе, которая должна обрабатывать высокочастотный входной сигнал и выдавать выходные данные с малой задержкой в ​​различных средах выполнения. Терминал просто представляет собой среду, где ограничения достаточно жесткие, и нарушение этих принципов приводит к немедленному заметному ухудшению качества — пропущенный кадр, проглоченное нажатие клавиши, мерцание. Эта острота делает его отличным учителем.
+
+Следующая глава переходит от уровня UI к уровню протокола: как Claude Code реализует MCP — универсальный протокол tool, который позволяет любому внешнему сервису стать первоклассным tool. Пользовательский интерфейс терминала обрабатывает последнюю милю пользовательского опыта — преобразует структуры данных в пиксели на экране и нажатия клавиш в действия приложения. MCP обеспечивает первую милю расширяемости — обнаружение, подключение и выполнение tools, находящихся за пределами собственной кодовой базы agent. Между ними система memory (глава 11) и система skills/зацепок (глава 12) определяют уровни интеллекта и контроля. Потолок качества всей системы зависит от всех четырех: никакие интеллектуальные возможности модели не компенсируют медленный UI, и никакая производительность рендеринга не компенсирует модель, которая не может достичь необходимых ей tools.

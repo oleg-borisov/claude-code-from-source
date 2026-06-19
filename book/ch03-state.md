@@ -1,48 +1,48 @@
-# Chapter 3: State -- The Two-Tier Architecture
+# Глава 3: State. Двухуровневая архитектура
 
-Chapter 2 traced the bootstrap pipeline from process start to first render. By the end, the system had a fully configured environment. But configured with *what*? Where does the session ID live? The current model? The message history? The cost tracker? The permission mode? Where does state live, and why does it live there?
+В главе 2 прослеживался конвейер начальной загрузки от запуска процесса до первого рендеринга. К концу система имела полностью настроенную среду. Но настроено с *чем*? Где хранится идентификатор сеанса? Текущая модель? История сообщений? Трекер затрат? Режим разрешения? Где живет state и почему оно там живет?
 
-Every long-running application eventually faces this question. For a simple CLI tool the answer is trivial -- a few variables in `main()`. But Claude Code is not a simple CLI tool. It is a React application rendered through Ink, with a process lifecycle that spans hours, a plugin system that loads at arbitrary times, an API layer that must construct prompts from cached context, a cost tracker that survives process restarts, and dozens of infrastructure modules that need to read and write shared data without importing each other.
+Каждое долго работающее приложение рано или поздно сталкивается с этим вопросом. Для простого tool CLI ответ тривиален — несколько переменных в `main()`. Но Claude Code — это не простой tool CLI. Это приложение React, созданное с помощью Ink, с жизненным циклом процесса, охватывающим несколько часов, системой плагинов, загружающейся в произвольное время, слоем API, который должен создавать prompt из кэшированного контекста, средством отслеживания затрат, которое выдерживает перезапуск процесса, и десятками модулей инфраструктуры, которым необходимо читать и записывать общие данные без импорта друг друга.
 
-The naive approach -- a single global store -- fails immediately. If the cost tracker updated the same store that drives React re-renders, every API call would trigger a full component tree reconciliation. Infrastructure modules (bootstrap, context building, cost tracking, telemetry) cannot import React. They run before React mounts. They run after React unmounts. They run in contexts where no component tree exists at all. Putting everything into a React-aware store would create circular dependencies across the entire import graph.
+Наивный подход — единое глобальное хранилище — сразу дает сбой. Если средство отслеживания затрат обновило то же хранилище, которое выполняет повторную визуализацию React, каждый вызов API будет вызывать полную сверку дерева компонентов. Модули инфраструктуры (начальная загрузка, построение контекста, отслеживание затрат, телеметрия) не могут импортировать React. Они работают до установки React. Они запускаются после размонтирования React. Они работают в контекстах, где вообще не существует дерева компонентов. Помещение всего в хранилище, поддерживающее React, создаст циклические зависимости по всему графу импорта.
 
-Claude Code solves this with a two-tier architecture: a mutable process singleton for infrastructure state, and a minimal reactive store for UI state. This chapter explains both tiers, the side-effect system that bridges them, and the supporting subsystems that depend on this foundation. Every subsequent chapter assumes you understand where state lives and why it lives there.
+Claude Code решает эту проблему с помощью двухуровневой архитектуры: одноэлементного изменяемого процесса для State инфраструктуры и минимального реактивного хранилища для State UI. В этой главе описываются оба уровня, система побочных эффектов, соединяющая их, и вспомогательные подсистемы, зависящие от этой основы. Каждая последующая глава предполагает, что вы понимаете, где живет state и почему оно там живет.
 
 ---
 
-## 3.1 Bootstrap State -- The Process Singleton
+## 3.1 State начальной загрузки — синглтон процесса
 
-### Why a Mutable Singleton
+### Почему изменчивый синглтон
 
-The bootstrap state module (`bootstrap/state.ts`) is a single mutable object created once at process start:
+Модуль State начальной загрузки (`bootstrap/state.ts`) представляет собой один изменяемый объект, создаваемый один раз при запуске процесса:
 
 ```typescript
 const STATE: State = getInitialState()
 ```
 
-The comment above this line reads: `AND ESPECIALLY HERE`. Two lines above the type definition: `DO NOT ADD MORE STATE HERE - BE JUDICIOUS WITH GLOBAL STATE`. These comments have the tone of engineers who learned the cost of an ungoverned global object the hard way.
+Комментарий над этой строкой гласит: `AND ESPECIALLY HERE`. Две строки над определением типа: `DO NOT ADD MORE STATE HERE - BE JUDICIOUS WITH GLOBAL STATE`. Эти комментарии имеют тон инженеров, которые на собственном горьком опыте узнали стоимость неуправляемого глобального объекта.
 
-A mutable singleton is the right choice here for three reasons. First, bootstrap state must be available before any framework initializes -- before React mounts, before the store is created, before plugins load. Module-scope initialization is the only mechanism that guarantees availability at import time. Second, the data is inherently process-scoped: session IDs, telemetry counters, cost accumulators, cached paths. There is no meaningful "previous state" to diff against, no subscribers to notify, no undo history. Third, the module must be a leaf in the import dependency graph. If it imported React, or the store, or any service module, it would create cycles that break the bootstrap sequence described in Chapter 2. By depending on nothing but utility types and `node:crypto`, it remains importable from anywhere.
+Изменяемый синглтон — правильный выбор здесь по трем причинам. Во-первых, State начальной загрузки должно быть доступно до инициализации любой платформы — до монтирования React, до создания хранилища, до загрузки плагинов. Инициализация области модуля — единственный механизм, гарантирующий доступность во время импорта. Во-вторых, данные по своей сути привязаны к процессу: идентификаторы сеансов, счетчики телеметрии, аккумуляторы затрат, кэшированные пути. Нет значимого «предыдущего State», с которым можно было бы сравнивать, нет подписчиков, которых нужно уведомлять, нет истории отмены. В-третьих, модуль должен быть листом в графе зависимостей импорта. Если бы он импортировал React, или хранилище, или любой сервисный модуль, это создало бы циклы, которые нарушают последовательность начальной загрузки, описанную в главе 2. Поскольку он не зависит ни от чего, кроме типов утилит и `node:crypto`, его можно импортировать откуда угодно.
 
-### The ~80 Fields
+### ~80 полей
 
-The `State` type contains approximately 80 fields. A sampling reveals the breadth:
+Тип `State` содержит около 80 полей. Выборка показывает широту:
 
-**Identity and paths** -- `originalCwd`, `projectRoot`, `cwd`, `sessionId`, `parentSessionId`. The `originalCwd` is resolved through `realpathSync` and NFC-normalized at process start. It never changes.
+**Идентификация и пути** – `originalCwd`, `projectRoot`, `cwd`, `sessionId`, `parentSessionId`. `originalCwd` разрешается через `realpathSync` и нормализуется NFC при запуске процесса. Оно никогда не меняется.
 
-**Cost and metrics** -- `totalCostUSD`, `totalAPIDuration`, `totalLinesAdded`, `totalLinesRemoved`. These accumulate monotonically through the session and persist to disk on exit.
+**Стоимость и показатели** – `totalCostUSD`, `totalAPIDuration`, `totalLinesAdded`, `totalLinesRemoved`. Они монотонно накапливаются в течение сеанса и сохраняются на диске при выходе.
 
-**Telemetry** -- `meter`, `sessionCounter`, `costCounter`, `tokenCounter`. OpenTelemetry handles, all nullable (null until telemetry initializes).
+**Телеметрия** — `meter`, `sessionCounter`, `costCounter`, `tokenCounter`. Дескрипторы OpenTelemetry, все значения которых допускают значение NULL (ноль до тех пор, пока не будет инициализирована телеметрия).
 
-**Model configuration** -- `mainLoopModelOverride`, `initialMainLoopModel`. The override is set when the user changes models mid-session.
+**Конфигурация модели** -- `mainLoopModelOverride`, `initialMainLoopModel`. Переопределение устанавливается, когда пользователь меняет модели в середине сеанса.
 
-**Session flags** -- `isInteractive`, `kairosActive`, `sessionTrustAccepted`, `hasExitedPlanMode`. Booleans that gate behavior for the session duration.
+**Флаги сеанса** – `isInteractive`, `kairosActive`, `sessionTrustAccepted`, `hasExitedPlanMode`. Логические значения, которые контролируют поведение на протяжении сеанса.
 
-**Cache optimization** -- `promptCache1hAllowlist`, `promptCache1hEligible`, `systemPromptSectionCache`, `cachedClaudeMdContent`. These exist to prevent redundant computation and prompt cache busting.
+**Оптимизация кэша** — `promptCache1hAllowlist`, `promptCache1hEligible`, `systemPromptSectionCache`, `cachedClaudeMdContent`. Они существуют для предотвращения избыточных вычислений и быстрого сброса кэша.
 
-### The Getter/Setter Pattern
+### Шаблон получения/установки
 
-The `STATE` object is never exported. All access goes through approximately 100 individual getter and setter functions:
+Объект `STATE` никогда не экспортируется. Весь доступ осуществляется примерно через 100 отдельных функций получения и установки:
 
 ```typescript
 // Pseudocode — illustrates the pattern
@@ -55,15 +55,15 @@ export function setProjectRoot(dir: string): void {
 }
 ```
 
-This pattern enforces encapsulation, NFC normalization on every path setter (preventing Unicode mismatches on macOS), type narrowing, and bootstrap isolation. The trade-off is verbosity -- a hundred functions for eighty fields. But in a codebase where a stray mutation could bust a 50,000-token prompt cache, explicitness wins.
+Этот шаблон обеспечивает инкапсуляцию, нормализацию NFC для каждого установщика пути (предотвращая несоответствие Юникода в macOS), сужение типов и изоляцию начальной загрузки. Компромисс — многословие — сто функций для восьмидесяти полей. Но в кодовой базе, где случайная мутация может вывести из строя Prompt Cache на 50 000 токенов, явность побеждает.
 
-### The Signal Pattern
+### Модель сигнала
 
-Bootstrap cannot import listeners (it is a DAG leaf), so it uses a minimal pub/sub primitive called `createSignal`. The `sessionSwitched` signal has exactly one consumer: `concurrentSessions.ts`, which keeps PID files in sync. The signal is exposed as `onSessionSwitch = sessionSwitched.subscribe`, letting callers register themselves without bootstrap knowing who they are.
+Bootstrap не может импортировать прослушиватели (это лист DAG), поэтому он использует минимальный примитив pub/sub под названием `createSignal`. Сигнал `sessionSwitched` имеет ровно одного потребителя: `concurrentSessions.ts`, который обеспечивает синхронизацию файлов PID. Сигнал представлен как `onSessionSwitch = sessionSwitched.subscribe`, что позволяет вызывающим абонентам зарегистрироваться без предварительной загрузки, зная, кто они.
 
-### The Five Sticky Latches
+### Пять липких защелок
 
-The most subtle fields in bootstrap state are five boolean latches that follow the same pattern: once a feature is first activated during a session, a corresponding flag stays `true` for the rest of the session. They all exist for one reason: prompt cache preservation.
+Наиболее тонкими полями в State начальной загрузки являются пять логических защелок, которые следуют одному и тому же шаблону: как только функция впервые активируется во время сеанса, соответствующий флаг остается `true` до конца сеанса. Все они существуют по одной причине: быстрое сохранение кэша.
 
 ```mermaid
 sequenceDiagram
@@ -87,21 +87,21 @@ sequenceDiagram
     Note over C: No cache bust at any toggle
 ```
 
-Claude's API supports server-side prompt caching. When consecutive requests share the same system prompt prefix, the server reuses cached computations. But the cache key includes HTTP headers and request body fields. If a beta header appears in request N but not request N+1, the cache is busted -- even if the prompt content is identical. For a system prompt exceeding 50,000 tokens, a cache miss is expensive.
+API Клода поддерживает кэширование prompts на стороне сервера. Когда последовательные запросы используют один и тот же префикс System Prompt, сервер повторно использует кэшированные вычисления. Но ключ кэша включает в себя заголовки HTTP и поля тела запроса. Если бета-frontmatter появляется в запросе N, но не в запросе N+1, кэш разрушается, даже если содержимое запроса идентично. Для System Prompt, превышающего 50 000 токенов, промах в кэше обходится дорого.
 
-The five latches:
+Пять защелок:
 
-| Latch | What It Prevents |
+| защелка | Что это предотвращает |
 |-------|-----------------|
-| `afkModeHeaderLatched` | Shift+Tab auto mode toggling flips the AFK beta header on/off |
-| `fastModeHeaderLatched` | Fast mode cooldown enter/exit flips the fast mode header |
-| `cacheEditingHeaderLatched` | Remote feature flag changes bust every active user's cache |
-| `thinkingClearLatched` | Triggered on confirmed cache miss (>1h idle). Prevents re-enabling thinking blocks from busting freshly warmed cache |
-| `pendingPostCompaction` | Consume-once flag for telemetry: distinguishes compaction-induced cache misses from TTL-expiry misses |
+| `afkModeHeaderLatched` | Переключение автоматического режима Shift+Tab включает/отключает бета-frontmatter AFK |
+| `fastModeHeaderLatched` | Время восстановления быстрого режима: вход/выход переворачивает frontmatter быстрого режима |
+| `cacheEditingHeaderLatched` | Удаленные изменения флагов функций разрушают кэш каждого активного пользователя |
+| `thinkingClearLatched` | Срабатывает при подтвержденном промахе кэша (>1 час простоя). Предотвращает повторное включение блоков мышления из-за разрушения только что разогретого кэша |
+| `pendingPostCompaction` | Флаг Consume-once для телеметрии: отличает промахи кэша, вызванные уплотнением, от промахов по истечении TTL |
 
-All five use a three-state type: `boolean | null`. The `null` initial value means "not yet evaluated." `true` means "latched on." They never return to `null` or `false` once set to `true`. This is the defining property of a latch.
+Все пять используют тип с тремя состояниями: `boolean | null`. Начальное значение `null` означает «еще не оценено». `true` означает «зафиксирован». Они никогда не возвращаются к `null` или `false`, если установлено значение `true`. Это определяющее свойство защелки.
 
-The implementation pattern:
+Схема реализации:
 
 ```typescript
 function shouldSendBetaHeader(featureCurrentlyActive: boolean): boolean {
@@ -115,17 +115,17 @@ function shouldSendBetaHeader(featureCurrentlyActive: boolean): boolean {
 }
 ```
 
-Why not just always send all beta headers? Because headers are part of the cache key. Sending an unrecognized header creates a different cache namespace. The latch ensures you only enter a cache namespace when you actually need it, then stay there.
+Почему бы просто не всегда отправлять все заголовки бета-версии? Потому что заголовки являются частью ключа кэша. Отправка нераспознанного заголовка создает другое пространство имен кэша. Защелка гарантирует, что вы войдете в пространство имен кэша только тогда, когда оно вам действительно нужно, и остаетесь там.
 
 ---
 
-## 3.2 AppState -- The Reactive Store
+## 3.2 AppState — Реактивный store
 
-### The 34-Line Implementation
+### Реализация в 34 строки
 
-The UI state store lives in `state/store.ts`:
+Хранилище State UI находится в `state/store.ts`:
 
-The store implementation is approximately 30 lines: a closure over a `state` variable, an `Object.is` equality check to prevent spurious updates, synchronous listener notification, and an `onChange` callback for side effects. The skeleton looks like:
+Реализация хранилища занимает примерно 30 строк: замыкание переменной `state`, проверка на равенство `Object.is` для предотвращения ложных обновлений, синхронное уведомление прослушивателя и обратный вызов `onChange` для побочных эффектов. Скелет выглядит так:
 
 ```typescript
 // Pseudocode — illustrates the pattern
@@ -140,21 +140,21 @@ function makeStore(initial, onTransition) {
 }
 ```
 
-Thirty-four lines. No middleware, no devtools, no time-travel debugging, no action types. Just a closure over a mutable variable, a Set of listeners, and an `Object.is` equality check. This is Zustand without the library.
+Тридцать четыре строки. Никакого промежуточного программного обеспечения, никаких tools разработчика, никакой отладки во времени, никаких типов действий. Просто замыкание изменяемой переменной, набора прослушивателей и проверки на равенство `Object.is`. Это Зустанд без библиотеки.
 
-The design decisions worth examining:
+Дизайнерские решения, заслуживающие внимания:
 
-**Updater function pattern.** There is no `setState(newValue)` -- only `setState((prev) => next)`. Every mutation receives the current state and must produce the next state, eliminating stale-state bugs from concurrent mutations.
+**Шаблон функции обновления.** `setState(newValue)` нет — есть только `setState((prev) => next)`. Каждая мутация получает текущее State и должна создать следующее State, устраняя ошибки устаревшего State из одновременных мутаций.
 
-**`Object.is` equality check.** If the updater returns the same reference, the mutation is a no-op. No listeners fire. No side effects run. Critical for performance -- components that spread-and-set without changing values produce no re-renders.
+**`Object.is` проверка на равенство.** Если средство обновления возвращает ту же ссылку, мутация невозможна. Никто из слушателей не стреляет. Никаких побочных эффектов не наблюдается. Критично для производительности — компоненты, которые распространяются и устанавливаются без изменения значений, не производят повторной визуализации.
 
-**`onChange` fires before listeners.** The optional `onChange` callback receives both old and new state and fires synchronously before any subscriber is notified. This is used for side effects (Section 3.4) that must complete before the UI re-renders.
+**`onChange` срабатывает раньше прослушивателей.** Необязательный обратный вызов `onChange` получает как старое, так и новое State и срабатывает синхронно, прежде чем какой-либо подписчик будет уведомлен. Это используется для побочных эффектов (раздел 3.4), которые должны завершиться перед повторной отрисовкой UI.
 
-**No middleware, no devtools.** This is not an oversight. When your store needs exactly three operations (get, set, subscribe), an `Object.is` equality check, and a synchronous `onChange` hook, 34 lines of code you own is better than a dependency. You control the exact semantics. You can read the entire implementation in thirty seconds.
+**Нет промежуточного программного обеспечения, нет tools разработки.** Это не упущение. Когда вашему storeу требуется ровно три операции (получить, установить, подписаться), проверка на равенство `Object.is` и синхронный hook `onChange`, 34 собственных строки кода лучше, чем зависимость. Вы контролируете точную семантику. Вы можете прочитать всю реализацию за тридцать секунд.
 
-### The AppState Type
+### Тип AppState
 
-The `AppState` type (~452 lines) is the shape of everything the UI needs to render. It is wrapped in `DeepImmutable<>` for most fields, with explicit exclusions for fields containing function types:
+Тип `AppState` (~452 строки) — это форма всего, что нужно отрисовать UI. Для большинства полей он заключен в `DeepImmutable<>`, с явными исключениями для полей, содержащих типы функций:
 
 ```typescript
 export type AppState = DeepImmutable<{
@@ -167,11 +167,11 @@ export type AppState = DeepImmutable<{
 }
 ```
 
-The intersection type lets most fields be deeply immutable while exempting fields that hold functions, Maps, and mutable refs. Full immutability is the default, with surgical escape hatches where the type system would fight the runtime semantics.
+Тип пересечения позволяет большинству полей быть глубоко неизменяемыми, исключая при этом поля, которые содержат функции, карты и изменяемые ссылки. По умолчанию используется полная неизменяемость с хирургическими аварийными люками, в которых система типов будет бороться с семантикой времени выполнения.
 
-### React Integration
+### React Интеграция
 
-The store integrates with React through `useSyncExternalStore`:
+Магазин интегрируется с React через `useSyncExternalStore`:
 
 ```typescript
 // Standard React pattern — useSyncExternalStore with a selector
@@ -184,13 +184,13 @@ export function useAppState<T>(selector: (state: AppState) => T): T {
 }
 ```
 
-The selector must return an existing sub-object reference (not a freshly constructed object) for `Object.is` comparison to prevent unnecessary re-renders. If you write `useAppState(s => ({ a: s.a, b: s.b }))`, every render produces a new object reference, and the component re-renders on every state change. This is the same constraint Zustand users face -- cheaper comparisons, but the selector author must understand reference identity.
+Селектор должен возвращать существующую ссылку на подобъект (а не только что созданный объект) для сравнения `Object.is`, чтобы предотвратить ненужные повторные рендеринги. Если вы напишете `useAppState(s => ({ a: s.a, b: s.b }))`, при каждом рендеринге создается новая ссылка на объект, и компонент повторно визуализируется при каждом изменении State. Это то же ограничение, с которым сталкиваются пользователи Zustand — более дешевые сравнения, но автор селектора должен понимать ссылочную идентичность.
 
 ---
 
-## 3.3 How the Two Tiers Relate
+## 3.3 Как связаны два уровня
 
-The two tiers communicate through explicit, narrow interfaces.
+Два уровня взаимодействуют через явные, узкие интерфейсы.
 
 ```mermaid
 graph TD
@@ -206,100 +206,100 @@ graph TD
     style RC fill:#ddf,stroke:#333
 ```
 
-Bootstrap state flows into AppState during initialization: `getDefaultAppState()` reads settings from disk (which bootstrap helped locate), checks feature flags (which bootstrap evaluated), and sets the initial model (which bootstrap resolved from CLI args and settings).
+State начальной загрузки переходит в AppState во время инициализации: `getDefaultAppState()` считывает настройки с диска (которые помогла найти загрузочная загрузка), проверяет флаги функций (которые оцениваются загрузочной загрузкой) и устанавливает исходную модель (которая загрузочная загрузка разрешает из аргументов и настроек CLI).
 
-AppState flows back to bootstrap state through side effects: when the user changes the model, `onChangeAppState` calls `setMainLoopModelOverride()` in bootstrap. When settings change, credential caches in bootstrap are cleared.
+AppState возвращается в State начальной загрузки из-за побочных эффектов: когда пользователь меняет модель, `onChangeAppState` вызывает `setMainLoopModelOverride()` в начальной загрузке. При изменении настроек кэш учетных данных в начальной загрузке очищается.
 
-But the two tiers never share a reference. A module that imports bootstrap state does not need to know about React. A component that reads AppState does not need to know about the process singleton.
+Но эти два уровня никогда не имеют общей ссылки. Модулю, который импортирует State начальной загрузки, не обязательно знать о React. Компоненту, который читает AppState, не обязательно знать об одноэлементном процессе.
 
-A concrete example clarifies the data flow. When the user types `/model claude-sonnet-4`:
+Конкретный пример поясняет поток данных. Когда пользователь вводит `/model claude-sonnet-4`:
 
-1. The command handler calls `store.setState(prev => ({ ...prev, mainLoopModel: 'claude-sonnet-4' }))`
-2. The store's `Object.is` check detects a change
-3. `onChangeAppState` fires, detects the model changed, calls `setMainLoopModelOverride()` (updates bootstrap) and `updateSettingsForSource()` (persists to disk)
-4. All store subscribers fire -- React components re-render to show the new model name
-5. The next API call reads the model from `getMainLoopModelOverride()` in bootstrap state
+1. Обработчик команды вызывает `store.setState(prev => ({ ...prev, mainLoopModel: 'claude-sonnet-4' }))`.
+2. Проверка storeа `Object.is` обнаруживает изменение
+3. `onChangeAppState` срабатывает, обнаруживает изменение модели, вызывает `setMainLoopModelOverride()` (обновляет загрузочную загрузку) и `updateSettingsForSource()` (сохраняется на диске)
+4. Все подписчики storeа отключаются — компоненты React повторно визуализируются, чтобы показать название новой модели.
+5. Следующий вызов API считывает модель из `getMainLoopModelOverride()` в State начальной загрузки.
 
-Steps 1-4 are synchronous. The API client in step 5 may run seconds later. But it reads from bootstrap state (updated in step 3), not from AppState. This is the two-tier handoff: the UI store is the source of truth for what the user chose, but bootstrap state is the source of truth for what the API client uses.
+Шаги 1–4 синхронны. Клиент API на шаге 5 может запуститься через несколько секунд. Но он читает из State начальной загрузки (обновленного на шаге 3), а не из AppState. Это двухуровневая передача: хранилище UI является источником истины о том, что выбрал пользователь, а State начальной загрузки является источником истины о том, что использует клиент API.
 
-The DAG property -- bootstrap depends on nothing, AppState depends on bootstrap for init, React depends on AppState -- is enforced by an ESLint rule that prevents `bootstrap/state.ts` from importing modules outside its allowed set.
-
----
-
-## 3.4 Side Effects: onChangeAppState
-
-The `onChange` callback is where the two tiers synchronize. Every `setState` call triggers `onChangeAppState`, which receives both previous and new state and decides what external effects to fire.
-
-**Permission mode sync** is the primary use case. Prior to this centralized handler, permission mode was synced to the remote session (CCR) by only 2 of 8+ mutation paths. The other six -- Shift+Tab cycling, dialog options, slash commands, rewind, bridge callbacks -- all mutated AppState without telling CCR. The external metadata drifted out of sync.
-
-The fix: stop scattering notifications across mutation sites and instead hook the diff in one place. The comment in the source code lists every mutation path that was broken and notes that "the scattered callsites above need zero changes." This is the architectural benefit of centralized side effects -- coverage is structural, not manual.
-
-**Model changes** keep bootstrap state in sync with what the UI renders. **Settings changes** clear credential caches and re-apply environment variables. **Verbose toggle** and **expanded view** are persisted to global config.
-
-The pattern -- centralized side effects on a diffable state transition -- is essentially the Observer pattern applied at the granularity of a state diff rather than individual events. It scales better than scattered event emissions because the number of side effects grows much more slowly than the number of mutation sites.
+Свойство DAG — загрузка не зависит ни от чего, AppState зависит от начальной загрузки для инициализации, React зависит от AppState — обеспечивается правилом ESLint, которое запрещает `bootstrap/state.ts` импортировать модули за пределами разрешенного набора.
 
 ---
 
-## 3.5 Context Building
+## 3.4 Побочные эффекты: onChangeAppState
 
-Three memoized async functions in `context.ts` build the system prompt context prepended to every conversation. Each is computed once per session, not per turn.
+Обратный вызов `onChange` позволяет синхронизировать два уровня. Каждый вызов `setState` запускает `onChangeAppState`, который получает как предыдущее, так и новое State и решает, какие внешние эффекты активировать.
 
-`getGitStatus` runs five git commands in parallel (`Promise.all`), producing a block with the current branch, default branch, recent commits, and working tree status. The `--no-optional-locks` flag prevents git from taking write locks that could interfere with concurrent git operations in another terminal.
+**Синхронизация permission mode** — основной вариант использования. До появления этого централизованного обработчика permission mode синхронизировался с удаленным сеансом (CCR) только по 2 из 8+ путей мутации. Остальные шесть — циклическое нажатие Shift+Tab, параметры диалога, команды слэша, перемотка назад, callbacks моста — все мутировали AppState без уведомления CCR. Внешние метаданные рассинхронизировались.
 
-`getUserContext` loads CLAUDE.md content and caches it in bootstrap state via `setCachedClaudeMdContent`. This cache breaks a circular dependency: the auto-mode classifier needs CLAUDE.md content, but CLAUDE.md loading goes through the filesystem, which goes through permissions, which calls the classifier. By caching in bootstrap state (a DAG leaf), the cycle is broken.
+Исправление: перестать разбрасывать уведомления по сайтам мутаций и вместо этого собирать различия в одном месте. Комментарий в исходном коде перечисляет все пути мутаций, которые были нарушены, и отмечает, что «разрозненные сайты вызовов, приведенные выше, не требуют никаких изменений». В этом архитектурное преимущество централизованных побочных эффектов: покрытие является структурным, а не ручным.
 
-All three context functions use Lodash's `memoize` (compute once, cache forever) rather than TTL-based caching. The reasoning: if git status were re-computed every 5 minutes, the change would bust the server-side prompt cache. The system prompt even tells the model: "This is the git status at the start of the conversation. Note that this status is a snapshot in time."
+**Изменения модели** позволяют синхронизировать State начальной загрузки с тем, что отображает UI. **Изменения настроек** очищают кэш учетных данных и повторно применяют переменные среды. **Подробный переключатель** и **расширенный вид** сохраняются в глобальной конфигурации.
 
----
-
-## 3.6 Cost Tracking
-
-Every API response flows through `addToTotalSessionCost`, which accumulates per-model usage, updates bootstrap state, reports to OpenTelemetry, and recursively processes advisor tool usage (nested model calls within a response).
-
-Cost state survives process restarts through save-and-restore to a project config file. The session ID is used as a guard -- costs are only restored if the persisted session ID matches the session being resumed.
-
-Histograms use reservoir sampling (Algorithm R) to maintain bounded memory while accurately representing distributions. The 1,024-entry reservoir produces p50, p95, and p99 percentiles. Why not a simple running average? Because averages hide distribution shape. A session where 95% of API calls take 200ms and 5% take 10 seconds has the same average as one where all calls take 690ms, but the user experience is radically different.
+Шаблон — централизованные побочные эффекты при различимом переходе между состояниями — по сути является шаблоном Observer, применяемым для детализации различий между состояниями, а не для отдельных событий. Он масштабируется лучше, чем выбросы рассеянных событий, поскольку количество побочных эффектов растет гораздо медленнее, чем количество мест мутаций.
 
 ---
 
-## 3.7 What We Learned
+## 3.5 Построение контекста
 
-The codebase has grown from a simple CLI to a system with ~450 lines of state type definitions, ~80 fields of process state, a side-effect system, multiple persistence boundaries, and cache optimization latches. None of this was designed upfront. The sticky latches were added when cache busting became a measurable cost problem. The `onChange` handler was centralized when 6 of 8 permission sync paths were discovered to be broken. The CLAUDE.md cache was added when a circular dependency emerged.
+Три запомненные асинхронные функции в `context.ts` создают контекст System Prompt, добавляемый к каждому разговору. Каждый из них вычисляется один раз за сеанс, а не за ход.
 
-This is the natural growth pattern of state in a complex application. The two-tier architecture provides enough structure to contain the growth -- new bootstrap fields do not affect React rendering, new AppState fields do not create import cycles -- while remaining flexible enough to accommodate patterns that were not anticipated in the original design.
+`getGitStatus` параллельно запускает пять команд git (`Promise.all`), создавая блок с текущей веткой, веткой по умолчанию, недавними коммитами и State рабочего дерева. Флаг `--no-optional-locks` не позволяет git блокировать запись, которая может помешать параллельным операциям git в другом терминале.
+
+`getUserContext` загружает содержимое CLAUDE.md и кэширует его в State начальной загрузки через `setCachedClaudeMdContent`. Этот кеш нарушает циклическую зависимость: классификатору автоматического режима требуется содержимое CLAUDE.md, но загрузка CLAUDE.md происходит через файловую систему, которая проходит через разрешения, вызывающие классификатор. При кэшировании в State начальной загрузки (лист DAG) цикл прерывается.
+
+Все три контекстные функции используют `memoize` Lodash (вычисление один раз, кэширование навсегда), а не кэширование на основе TTL. Причина: если статус git будет пересчитываться каждые 5 минут, это изменение приведет к сбою Prompt Cache на стороне сервера. Системная prompt даже сообщает модели: «Это статус git в начале разговора. Обратите внимание, что этот статус представляет собой снимок во времени».
 
 ---
 
-## 3.8 State Architecture Summary
+## 3.6 Отслеживание затрат
 
-| Property | Bootstrap State | AppState |
+Каждый ответ API проходит через `addToTotalSessionCost`, который накапливает данные об использовании каждой модели, обновляет State начальной загрузки, отправляет отчеты в OpenTelemetry и рекурсивно обрабатывает использование tool-консультанта (вызовы вложенных моделей в ответе).
+
+State стоимости сохраняется при перезапуске процесса благодаря сохранению и восстановлению в файле конфигурации проекта. Идентификатор сеанса используется в качестве защиты — затраты восстанавливаются только в том случае, если сохраненный идентификатор сеанса соответствует возобновляемому сеансу.
+
+Гистограммы используют выборку резервуаров (алгоритм R) для сохранения ограниченной memory и точного представления распределений. Резервуар на 1024 записи дает процентили p50, p95 и p99. Почему бы не использовать простое скользящее среднее? Потому что средние значения скрывают форму распределения. Сеанс, в котором 95% вызовов API занимают 200 мс, а 5% — 10 секунд, имеет такое же среднее значение, как и сеанс, в котором все вызовы занимают 690 мс, но пользовательский опыт радикально отличается.
+
+---
+
+## 3.7 Что мы узнали
+
+Кодовая база выросла с простого CLI до системы с ~450 строками определений типов State, ~80 полями State процесса, системой побочных эффектов, несколькими границами персистентности и защелками оптимизации кэша. Ничего из этого не было запланировано заранее. Липкие защелки были добавлены, когда разрушение кэша стало измеримой проблемой затрат. Обработчик `onChange` был централизован, когда было обнаружено, что 6 из 8 путей синхронизации разрешений нарушены. Кэш CLAUDE.md был добавлен, когда возникла циклическая зависимость.
+
+Это естественная модель роста State в сложном приложении. Двухуровневая архитектура обеспечивает достаточную структуру для сдерживания роста: новые поля начальной загрузки не влияют на рендеринг React, новые поля AppState не создают циклы импорта, оставаясь при этом достаточно гибкой для размещения шаблонов, которые не были предусмотрены в исходном проекте.
+
+---
+
+## 3.8 Резюме государственной архитектуры
+
+| Недвижимость | State начальной загрузки | AppState |
 |---|---|---|
-| **Location** | Module-scope singleton | React context |
-| **Mutability** | Mutable through setters | Immutable snapshots via updater |
-| **Subscribers** | Signal (pub/sub) for specific events | `useSyncExternalStore` for React |
-| **Availability** | Import time (before React) | After provider mounts |
-| **Persistence** | Process exit handlers | Via onChange to disk |
-| **Equality** | N/A (imperative reads) | `Object.is` reference check |
-| **Dependencies** | DAG leaf (imports nothing) | Imports types from across codebase |
-| **Test reset** | `resetStateForTests()` | Create new store instance |
-| **Primary consumers** | API client, cost tracker, context builder | React components, side effects |
+| **Местоположение** | Синглтон в области видимости модуля | React контекст |
+| **Изменчивость** | Изменяемый через сеттеры | Неизменяемые снимки через программу обновления |
+| **Подписчики** | Сигнал (pub/sub) для конкретных событий | `useSyncExternalStore` для React |
+| **Наличие** | Время импорта (до React) | После монтирования провайдера |
+| **Настойчивость** | Обработчики выхода процесса | Через onChange на диск |
+| **Равенство** | Н/Д (обязательное чтение) | `Object.is` проверка ссылок |
+| **Зависимости** | Лист DAG (ничего не импортирует) | Импортирует типы из всей кодовой базы |
+| **Тестовый сброс** | `resetStateForTests()` | Создать новый экземпляр storeа |
+| **Основные потребители** | API клиент, отслеживание затрат, построитель контекста | React компоненты, побочные эффекты |
 
 ---
 
-## Apply This
+## Примените это
 
-**Separate state by access pattern, not by domain.** Session ID belongs in the singleton not because it is "infrastructure" in the abstract, but because it must be readable before React mounts and writable without notifying subscribers. Permission mode belongs in the reactive store because changing it must trigger re-renders and side effects. Let the access pattern drive the tier, and the architecture follows naturally.
+**Отдельное State по шаблону доступа, а не по домену.** Идентификатор сеанса принадлежит одноэлементному не потому, что он является «инфраструктурой» абстрактно, а потому, что он должен быть доступен для чтения до монтирования React и доступен для записи без уведомления подписчиков. Режим разрешений принадлежит реактивному хранилищу, поскольку его изменение должно вызвать повторный рендеринг и побочные эффекты. Позвольте шаблону доступа определять уровень, и архитектура будет следовать естественным путем.
 
-**The sticky latch pattern.** Any system that interacts with a cache (prompt cache, CDN, query cache) faces the same problem: feature toggles that change the cache key mid-session cause invalidation. Once a feature is activated, its cache key contribution stays active for the session. The three-state type (`boolean | null`, meaning "not evaluated / on / never off") makes the intent self-documenting. Especially valuable when the cache is not under your control.
+**Шаблон липкой защелки.** Любая система, которая взаимодействует с кешем (кэш запросов, CDN, кеш запросов), сталкивается с одной и той же проблемой: переключатели функций, которые меняют ключ кеша в середине сеанса, приводят к аннулированию. После активации функции вклад ее ключа кэша остается активным в течение сеанса. Тип с тремя состояниями (`boolean | null`, что означает «не оценивается/включено/никогда не выключается») делает намерение самодокументируемым. Особенно ценно, когда кэш не под вашим контролем.
 
-**Centralize side effects on state diffs.** When multiple code paths can change the same state, do not scatter notifications across mutation sites. Hook the store's `onChange` callback and detect which fields changed. Coverage becomes structural (any mutation triggers the effect) rather than manual (each mutation site must remember to notify).
+**Централизуйте побочные эффекты при изменении State.** Если одно и то же State может измениться несколькими путями кода, не разбрасывайте уведомления по сайтам мутаций. Подключите обратный вызов storeа `onChange` и определите, какие поля изменились. Охват становится структурным (любая мутация вызывает эффект), а не ручным (каждый сайт мутации должен не забыть уведомить).
 
-**Prefer 34 lines you own over a library you do not.** When your requirements are exactly get, set, subscribe, and a change callback, a minimal implementation gives you full control over the semantics. In a system where state management bugs can cost real money, that transparency has value. The key insight is recognizing when you do *not* need a library.
+**Предпочитайте 34 строки, которыми вы владеете, а не библиотеку, которой у вас нет.** Когда ваши требования — это получение, установка, подписка и обратный вызов изменения, минимальная реализация дает вам полный контроль над семантикой. В системе, где ошибки управления State могут стоить реальных денег, такая прозрачность имеет ценность. Ключевым моментом является понимание того, когда вам *не* нужна библиотека.
 
-**Use process exit as a persistence boundary with intention.** Multiple subsystems persist state on process exit. The trade-off is explicit: non-graceful termination (SIGKILL, OOM) loses accumulated data. This is acceptable because the data is diagnostic, not transactional, and writing to disk on every state change would be too expensive for counters that increment hundreds of times per session.
+**Сознательно используйте выход процесса в качестве границы постоянства.** Несколько подсистем сохраняют State при выходе из процесса. Компромисс очевиден: некорректное завершение (SIGKILL, OOM) приводит к потере накопленных данных. Это приемлемо, поскольку данные являются диагностическими, а не транзакционными, и запись на диск при каждом изменении State была бы слишком дорогостоящей для счетчиков, которые увеличиваются сотни раз за сеанс.
 
 ---
 
-The two-tier architecture established in this chapter -- bootstrap singleton for infrastructure, reactive store for UI, side effects bridging them -- is the foundation that every subsequent chapter builds on. The conversation loop (Chapter 4) reads context from the memoized builders. The tool system (Chapter 5) checks permissions from AppState. The agent system (Chapter 8) creates task entries in AppState while tracking costs in bootstrap state. Understanding where state lives, and why, is prerequisite to understanding how any of these systems work.
+Двухуровневая архитектура, созданная в этой главе — одноэлементная загрузка для инфраструктуры, реактивное хранилище для UI и побочные эффекты, соединяющие их, — является основой, на которой строится каждая последующая глава. Цикл диалога (глава 4) считывает контекст из запомненных конструкторов. Tool System (глава 5) проверяет разрешения от AppState. Система agents (глава 8) создает записи Task в AppState, отслеживая затраты в State начальной загрузки. Понимание того, где и почему живет state, является предпосылкой понимания того, как работает любая из этих систем.
 
-Some fields straddle the boundary. The main loop model exists in both tiers: `mainLoopModel` in AppState (for UI rendering) and `mainLoopModelOverride` in bootstrap state (for API client consumption). The `onChangeAppState` handler keeps them synchronized. This duplication is the cost of the two-tier split. But the alternative -- having the API client import the React store, or having React components read from the process singleton -- would violate the dependency direction that keeps the architecture sound. A small amount of controlled duplication, bridged by a centralized synchronization point, is preferable to a tangled dependency graph.
+Некоторые месторождения находятся по обе стороны границы. Модель основного цикла существует на обоих уровнях: `mainLoopModel` в AppState (для рендеринга UI) и `mainLoopModelOverride` в State начальной загрузки (для использования клиентом API). Обработчик `onChangeAppState` обеспечивает их синхронизацию. Это дублирование является издержками двухуровневого разделения. Но альтернатива — если клиент API импортирует хранилище React или считывает компоненты React из синглтона процесса — нарушит направление зависимости, которое сохраняет работоспособность архитектуры. Небольшое количество контролируемого дублирования, соединенного централизованной точкой синхронизации, предпочтительнее запутанного графа зависимостей.

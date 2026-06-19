@@ -1,24 +1,24 @@
-# Chapter 17: Performance -- Every Millisecond and Token Counts
+# Глава 17: Производительность. Каждая миллисекунда и токены на счету
 
-## The Senior Engineer's Playbook
+## Пособие старшего инженера
 
-Performance optimization in an agentic system is not one problem. It is five:
+Оптимизация производительности в agentic system — это не одна проблема. Это пять:
 
-1. **Startup latency** -- the time from keystroke to first useful output. Users abandon tools that feel slow to launch.
-2. **Token efficiency** -- the fraction of the context window consumed by useful content versus overhead. The context window is the most constrained resource.
-3. **API cost** -- the dollar amount per turn. Prompt caching can reduce this by 90%, but only if the system preserves cache stability across turns.
-4. **Rendering throughput** -- the frames per second during streaming output. Chapter 13 covered the rendering architecture; this chapter covers the performance measurements and optimizations that keep it fast.
-5. **Search speed** -- the time to find a file in a 270,000-path codebase on every keystroke.
+1. **Задержка при запуске** — время от нажатия клавиши до первого полезного вывода. Пользователи отказываются от tools, которые медленно запускаются.
+2. **Эффективность токена** – доля контекстного окна, занимаемая полезным контентом, по сравнению с накладными расходами. Контекстное окно — наиболее ограниченный ресурс.
+3. **API стоимость** — сумма в долларах за ход. Оперативное кэширование может уменьшить это на 90%, но только если система сохраняет стабильность кэша между ходами.
+4. **Пропускная способность рендеринга** – количество кадров в секунду во время потокового вывода. Глава 13 посвящена архитектуре рендеринга; в этой главе рассматриваются измерения производительности и оптимизации, обеспечивающие ее быстродействие.
+5. **Скорость поиска** — время поиска файла в кодовой базе с 270 000 путей при каждом нажатии клавиши.
 
-Claude Code attacks all five with techniques ranging from the obvious (memoization) to the subtle (26-bit bitmaps for pre-filtering fuzzy search). A note on methodology: these are not theoretical optimizations. Claude Code ships with 50+ startup profiling checkpoints, sampled at 100% of internal users and 0.5% of external users. Every optimization below was motivated by data from this instrumentation, not by intuition.
+Claude Code атакует все пять методов, начиная от очевидных (мемоизация) и заканчивая тонкими (26-битные растровые изображения для предварительной фильтрации нечеткого поиска). Примечание по методологии: это не теоретическая оптимизация. Claude Code поставляется с более чем 50 контрольными точками профилирования запуска, выбранными для 100 % внутренних пользователей и 0,5 % внешних пользователей. Каждая приведенная ниже оптимизация была мотивирована данными этого tool, а не интуицией.
 
 ---
 
-## Saving Milliseconds at Startup
+## Экономия миллисекунд при запуске
 
-### Module-Level I/O Parallelism
+### Параллелизм ввода-вывода на уровне модуля
 
-The entry point `main.tsx` deliberately violates "no side effects at module scope":
+Точка входа `main.tsx` намеренно нарушает «отсутствие побочных эффектов в области модуля»:
 
 ```typescript
 profileCheckpoint('main_tsx_entry');
@@ -26,45 +26,45 @@ startMdmRawRead();       // fires plutil/reg-query subprocesses
 startKeychainPrefetch();  // fires both macOS keychain reads in parallel
 ```
 
-Two macOS keychain entries would otherwise cost ~65ms of sequential synchronous spawns. By launching both as fire-and-forget promises at the module level, they execute in parallel with ~135ms of module loading during which the CPU would otherwise be idle.
+В противном случае две записи связки ключей macOS стоили бы ~65 мс последовательного синхронного появления. Запуская оба типа обещаний «выстрелил и забыл» на уровне модуля, они выполняются параллельно с загрузкой модуля ~ 135 мс, в течение которой в противном случае ЦП простаивал бы.
 
-### API Preconnection
+### API Предварительное соединение
 
-`apiPreconnect.ts` fires a `HEAD` request to the Anthropic API during initialization, overlapping the TCP+TLS handshake (100-200ms) with setup work. In interactive mode, the overlap is unbounded -- the connection warms while the user types. The request fires after `applyExtraCACertsFromConfig()` and `configureGlobalAgents()` so the warmed connection uses the correct transport configuration.
+`apiPreconnect.ts` отправляет запрос `HEAD` на Anthropic API во время инициализации, перекрывая рукопожатие TCP+TLS (100–200 мс) с работой по настройке. В интерактивном режиме перекрытие не ограничено — соединение нагревается, пока пользователь печатает. Запрос срабатывает после `applyExtraCACertsFromConfig()` и `configureGlobalAgents()`, поэтому «горячее» соединение использует правильную транспортную конфигурацию.
 
-### Fast-Path Dispatch and Deferred Imports
+### Быстрая отправка и отложенный импорт
 
-The CLI entry point contains early-return paths for specialized subcommands -- `claude mcp` never loads the React REPL, `claude daemon` never loads the tool system. Heavy modules are loaded via dynamic `import()` only when needed: OpenTelemetry (~400KB + ~700KB gRPC), event logging, error dialogs, upstream proxy. `LazySchema` defers Zod schema construction to first validation, pushing the cost past startup.
+Точка входа CLI содержит пути раннего возврата для специализированных подкоманд: `claude mcp` никогда не загружает React, REPL, `claude daemon` никогда не загружает Tool System. Тяжелые модули загружаются через динамический `import()` только при необходимости: OpenTelemetry (~400 КБ + ~700 КБ gRPC), регистрация событий, диалоговые окна ошибок, восходящий прокси. `LazySchema` откладывает построение схемы Zod до первой проверки, что увеличивает затраты после запуска.
 
 ---
 
-## Saving Tokens in the Context Window
+## Сохранение токенов в контекстном окне
 
-### Slot Reservation: 8K Default, 64K Escalation
+### Резервирование слотов: 8 КБ по умолчанию, эскалация 64 КБ
 
-The most impactful single optimization:
+Самая эффективная одиночная оптимизация:
 
-The default output slot reservation is 8,000 tokens, escalating to 64,000 on truncation. The API reserves `max_output_tokens` of capacity for the model's response. The default SDK value is 32K-64K, but production data shows p99 output length is 4,911 tokens. The default over-reserves by 8-16x, wasting 24,000-59,000 tokens per turn. Claude Code caps at 8K and retries at 64K on the rare truncation (<1% of requests). For a 200K window, this is a 12-28% improvement in usable context -- for free.
+Резервирование выходного слота по умолчанию составляет 8 000 токенов, а при усечении оно увеличивается до 64 000. API резервирует `max_output_tokens` мощности для ответа модели. Значение SDK по умолчанию составляет 32–64 КБ, но производственные данные показывают, что выходная длина p99 составляет 4911 токенов. По умолчанию резервы превышают 8–16 раз, тратя 24 000–59 000 жетонов за ход. Claude Code ограничивается 8 КБ и повторяет попытки 64 КБ при редком усечении (<1% запросов). Для окна в 200 тысяч это улучшение полезного контекста на 12–28 % — причем бесплатно.
 
-### Tool Result Budgeting
+### Tool «Бюджетирование результатов»
 
-| Limit | Value | Purpose |
+| Лимит | Значение | Цель |
 |-------|-------|---------|
-| Per-tool characters | 50,000 | Results persisted to disk when exceeded |
-| Per-tool tokens | 100,000 | ~400KB text upper bound |
-| Per-message aggregate | 200,000 chars | Prevents N parallel tools from blowing the budget in one turn |
+| Символы для каждого tool | 50 000 | Результаты сохраняются на диске при превышении |
+| Токены для каждого tool | 100 000 | ~400 КБ верхняя граница текста |
+| Совокупность сообщений | 200 000 символов | Не позволяет N параллельным tools раздуть бюджет за один ход |
 
-The per-message aggregate is the key insight. Without it, "read all files in src/" could produce 10 parallel reads each returning 40K characters.
+Совокупность сообщений является ключевым моментом. Без него команда «прочитать все файлы в src/» могла бы произвести 10 параллельных операций чтения, каждое из которых вернуло бы 40 000 символов.
 
-### Context Window Sizing
+### Размер контекстного окна
 
-The default 200K-token window is expandable to 1M via the `[1m]` suffix on model names or experiment treatment. When usage approaches the limit, a 4-layer compaction system progressively summarizes older content. Token counting is anchored on the API's actual `usage` field, not client-side estimation -- accounting for prompt caching credits, thinking tokens, and server-side transformations.
+Окно на 200 000 токенов по умолчанию можно расширить до 1 М с помощью суффикса `[1m]` в названиях моделей или при обработке эксперимента. Когда использование приближается к пределу, 4-слойная система сжатия постепенно суммирует старый контент. Подсчет токенов привязан к фактическому полю `usage` API, а не к оценке на стороне клиента — с учетом быстрого кэширования кредитов, токенов мышления и преобразований на стороне сервера.
 
 ---
 
-## Saving Money on API Calls
+## Экономия на звонках API
 
-### The Prompt Cache Architecture
+### Архитектура кэша запросов
 
 ```mermaid
 graph LR
@@ -86,57 +86,57 @@ graph LR
     style E fill:#ffcdd2
 ```
 
-Anthropic's prompt cache operates on exact prefix matching. If a single token changes mid-prefix, everything after is a cache miss. Claude Code structures the entire prompt so stable parts come first and volatile parts come last.
+Кэш prompts Anthropic работает на основе точного сопоставления префиксов. Если один токен меняет средний префикс, все, что происходит после него, является промахом в кэше. Claude Code структурирует все prompt так, что стабильные части идут первыми, а нестабильные — последними.
 
-When `shouldUseGlobalCacheScope()` returns true, system prompt entries before the dynamic boundary get `scope: 'global'` -- two users running the same Claude Code version share the prefix cache. Global scope is disabled when MCP tools are present, since MCP schemas are per-user.
+Когда `shouldUseGlobalCacheScope()` возвращает true, записи системных prompts перед динамической границей получают `scope: 'global'` — два пользователя, использующие одну и ту же версию Claude Code, совместно используют кэш префикса. Глобальная область отключена при наличии tools MCP, поскольку схемы MCP предназначены для каждого пользователя.
 
-### Sticky Latch Fields
+### Липкие поля защелки
 
-Five boolean fields use a "sticky-on" pattern -- once true, they remain true for the session:
+Пять логических полей используют шаблон «прилипания» — если они верны, они остаются верными на протяжении всего сеанса:
 
-| Latch Field | What It Prevents |
+| Защелка Поле | Что это предотвращает |
 |-------------|-----------------|
-| `promptCache1hEligible` | Mid-session overage flip changing cache TTL |
-| `afkModeHeaderLatched` | Shift+Tab toggles busting cache |
-| `fastModeHeaderLatched` | Cooldown enter/exit double-busting cache |
-| `cacheEditingHeaderLatched` | Mid-session config toggles busting cache |
-| `thinkingClearLatched` | Flipping thinking mode after confirmed cache miss |
+| `promptCache1hEligible` | Изменение TTL кэша в середине сеанса |
+| `afkModeHeaderLatched` | Shift+Tab переключает очистку кэша |
+| `fastModeHeaderLatched` | Перезарядка вход/выход из тайника двойного уничтожения |
+| `cacheEditingHeaderLatched` | Конфигурация середины сеанса переключает очистку кеша |
+| `thinkingClearLatched` | Переключение режима мышления после подтвержденного промаха в кэше |
 
-Each corresponds to a header or parameter that, if changed mid-session, would bust ~50,000-70,000 tokens of cached prompt. The latches sacrifice mid-session toggling to preserve the cache.
+Каждый соответствует заголовку или параметру, изменение которого в середине сеанса приведет к уничтожению примерно 50 000–70 000 токенов кэшированного prompt. Защелки жертвуют переключением в середине сеанса ради сохранения кэша.
 
-### Memoized Session Date
+### Запоминание даты сеанса
 
 ```typescript
 const getSessionStartDate = memoize(getLocalISODate)
 ```
 
-Without this, the date would change at midnight, busting the entire cached prefix. A stale date is cosmetic; a cache bust reprocesses the entire conversation.
+Без этого дата изменилась бы в полночь, что привело бы к разрушению всего кэшированного префикса. Просроченная дата носит косметический характер; очистка кэша повторно обрабатывает весь разговор.
 
-### Section Memoization
+### Мемоизация раздела
 
-System prompt sections use a two-tier cache. Most content uses `systemPromptSection(name, compute)`, cached until `/clear` or `/compact`. The nuclear option `DANGEROUS_uncachedSystemPromptSection(name, compute, reason)` recomputes every turn -- the naming convention forces developers to document WHY cache-breaking is necessary.
-
----
-
-## Saving CPU in Rendering
-
-Chapter 13 covered the rendering architecture in depth -- the packed typed arrays, pool-based interning, double buffering, and cell-level diffing. Here we focus on the performance measurements and adaptive behaviors that keep it fast.
-
-The terminal renderer throttles at 60fps via `throttle(deferredRender, FRAME_INTERVAL_MS)`. When the terminal is blurred, the interval doubles to 30fps. Scroll drain frames run at quarter interval for maximum scroll speed. This adaptive throttling ensures rendering never consumes more CPU than necessary.
-
-The React Compiler (`react/compiler-runtime`) auto-memoizes component renders throughout the codebase. Manual `useMemo` and `useCallback` are error-prone; the compiler gets it right by construction. Pre-allocated frozen objects (`Object.freeze()`) eliminate allocations for common render-path values -- one allocation saved per frame in alt-screen mode compounds over thousands of frames.
-
-For the full rendering pipeline details -- the `CharPool`/`StylePool`/`HyperlinkPool` interning system, the blit optimization, the damage rectangle tracking, the OffscreenFreeze component -- see Chapter 13.
+В разделах системных prompts используется двухуровневый кеш. Большая часть контента использует `systemPromptSection(name, compute)`, cached до `/clear` или `/compact`. Ядерный вариант `DANGEROUS_uncachedSystemPromptSection(name, compute, reason)` пересчитывает каждый ход — соглашение об именах заставляет разработчиков документировать, ПОЧЕМУ необходим взлом кэша.
 
 ---
 
-## Saving Memory and Time in Search
+## Экономия процессора при рендеринге
 
-The fuzzy file search runs on every keystroke, searching 270,000+ paths. Three optimization layers keep it under a few milliseconds.
+В главе 13 подробно рассмотрена архитектура рендеринга — упакованные типизированные массивы, интернирование на основе пула, двойная буферизация и сравнение на уровне ячеек. Здесь мы сосредоточимся на измерениях производительности и адаптивном поведении, которые обеспечивают ее быстроту.
 
-### The Bitmap Pre-Filter
+Терминальный рендерер регулирует скорость 60 кадров в секунду через `throttle(deferredRender, FRAME_INTERVAL_MS)`. Когда терминал размыт, интервал увеличивается вдвое до 30 кадров в секунду. Сливные рамы прокрутки работают с интервалом в четверть для достижения максимальной скорости прокрутки. Такое адаптивное регулирование гарантирует, что рендеринг никогда не будет потреблять больше ресурсов ЦП, чем необходимо.
 
-Every indexed path gets a 26-bit bitmap of which lowercase letters it contains:
+Компилятор React (`react/compiler-runtime`) автоматически запоминает рендеринг компонентов по всей базе кода. Руководства `useMemo` и `useCallback` подвержены ошибкам; компилятор делает это правильно по конструкции. Предварительно выделенные замороженные объекты (`Object.freeze()`) устраняют выделение для общих значений пути рендеринга — одно выделение, сохраняемое для каждого кадра в режиме альтернативного экрана, объединяет тысячи кадров.
+
+Полную информацию о конвейере рендеринга — системе интернирования `CharPool`/`StylePool`/`HyperlinkPool`, оптимизации блит-анализа, отслеживании прямоугольников повреждений, компоненте OffscreenFreeze — см. в главе 13.
+
+---
+
+## Экономия memory и времени при поиске
+
+Нечеткий поиск файлов выполняется при каждом нажатии клавиши, просматривая более 270 000 путей. Три уровня оптимизации позволяют сократить время до нескольких миллисекунд.
+
+### Предварительный фильтр растрового изображения
+
+Каждый индексированный путь получает 26-битное растровое изображение, в котором содержатся строчные буквы:
 
 ```typescript
 // Pseudocode — illustrates the 26-bit bitmap concept
@@ -150,56 +150,56 @@ function buildCharBitmap(filepath: string): number {
 }
 ```
 
-At search time: `if ((charBits[i] & needleBitmap) !== needleBitmap) continue`. Any path missing a query letter fails instantly -- one integer comparison, no string operations. Rejection rate: ~10% for broad queries like "test," 90%+ for queries with rare letters. Cost: 4 bytes per path, ~1MB for 270,000 paths.
+Во время поиска: `if ((charBits[i] & needleBitmap) !== needleBitmap) continue`. Любой путь, в котором отсутствует буква запроса, мгновенно завершается неудачей — одно целочисленное сравнение, никаких строковых операций. Процент отказов: ~10% для широких запросов типа «тест», более 90% для запросов с редкими буквами. Стоимость: 4 байта на путь, ~1 МБ на 270 000 путей.
 
-### Score-Bound Rejection and Fused indexOf Scan
+### Отклонение с привязкой к баллам и объединенное сканирование indexOf
 
-Paths surviving the bitmap face a score ceiling check before the expensive boundary/camelCase scoring. If the best-case score cannot beat the current top-K threshold, the path is skipped.
+Пути, пережившие растровое изображение, подвергаются проверке максимального количества баллов перед дорогостоящей оценкой границ/camelCase. Если оценка в лучшем случае не может превзойти текущий порог top-K, путь пропускается.
 
-The actual matching fuses position finding with gap/consecutive bonus computation using `String.indexOf()`, which is SIMD-accelerated in both JSC (Bun) and V8 (Node). The engine's optimized search is significantly faster than manual character loops.
+Фактическое сопоставление объединяет поиск позиции с вычислением разрыва/последовательного бонуса с использованием `String.indexOf()`, который ускоряется с помощью SIMD как в АО (Bun), так и в V8 (Node). Оптимизированный поиск движка выполняется значительно быстрее, чем циклический поиск символов вручную.
 
-### Async Indexing with Partial Queryability
+### Асинхронное индексирование с частичной возможностью запроса
 
-For large codebases, `loadFromFileListAsync()` yields to the event loop every ~4ms of work (time-based, not count-based -- adapting to machine speed). It returns two promises: `queryable` (resolves on first chunk, enabling immediate partial results) and `done` (full index complete). The user can start searching within 5-10ms of the file list becoming available.
+Для больших баз кода `loadFromFileListAsync()` запускает цикл событий каждые ~4 мс работы (на основе времени, а не на основе подсчета - адаптируясь к скорости машины). Он возвращает два промиса: `queryable` (разрешает первый фрагмент, обеспечивая немедленные частичные результаты) и `done` (полный индекс завершен). Пользователь может начать поиск в течение 5-10 мс после того, как список файлов станет доступен.
 
-The yield check uses `(i & 0xff) === 0xff` -- a branchless modulo-256 to amortize the cost of `performance.now()`.
-
----
-
-## The Memory Relevance Side-Query
-
-One optimization sits at the intersection of token efficiency and API cost. As described in Chapter 11, the memory system uses a lightweight Sonnet model call -- not the main Opus model -- to select which memory files to include. The cost (256 max output tokens on a fast model) is negligible compared to the tokens saved by not including irrelevant memory files. A single irrelevant 2,000-token memory costs more in wasted context than the side query costs in API calls.
+Проверка доходности использует `(i & 0xff) === 0xff` — безветвевой модуль 256 для амортизации стоимости `performance.now()`.
 
 ---
 
-## Speculative Tool Execution
+## Дополнительный запрос релевантности memory
 
-The `StreamingToolExecutor` begins executing tools as they stream in, before the full response completes. Read-only tools (Glob, Grep, Read) can execute in parallel; write tools require exclusive access. The `partitionToolCalls()` function groups consecutive safe tools into batches: [Read, Read, Grep, Edit, Read, Read] becomes three batches -- [Read, Read, Grep] concurrent, [Edit] serial, [Read, Read] concurrent.
-
-Results are always yielded in the original tool order for deterministic model reasoning. A sibling abort controller kills parallel subprocesses when a Bash tool errors, preventing resource waste.
+Одна оптимизация находится на пересечении эффективности токена и стоимости API. Как описано в главе 11, система memory использует упрощенный вызов модели Sonnet, а не основную модель Opus, чтобы выбрать, какие файлы memory включать. Стоимость (максимальное количество выходных токенов 256 на быстрой модели) незначительна по сравнению с токенами, сэкономленными за счет исключения ненужных файлов memory. Одна ненужная memory на 2000 токенов стоит больше в ненужном контексте, чем затраты на дополнительный запрос в вызовах API.
 
 ---
 
-## Streaming and the Raw API
+## Спекулятивное исполнение tool
 
-Claude Code uses the raw streaming API instead of the SDK's `BetaMessageStream` helper. The helper calls `partialParse()` on every `input_json_delta` -- O(n^2) in tool input length. Claude Code accumulates raw strings and parses once when the block is complete.
+`StreamingToolExecutor` начинает выполнять tools по мере их поступления, прежде чем завершится полный ответ. Tools только для чтения (Glob, Grep, Read) могут выполняться параллельно; tools записи требуют эксклюзивного доступа. Функция `partitionToolCalls()` группирует последовательные безопасные tools в bundlees: [Чтение, Чтение, Grep, Редактирование, Чтение, Чтение] превращается в три batchа — [Чтение, Чтение, Grep] одновременно, [Редактирование] последовательно, [Чтение, Чтение] одновременно.
 
-A streaming watchdog (`CLAUDE_STREAM_IDLE_TIMEOUT_MS`, default 90 seconds) aborts and retries if no chunks arrive, with fallback to non-streaming `messages.create()` on proxy failure.
-
----
-
-## Apply This: Performance for Agentic Systems
-
-**Audit your context window budget.** The gap between your `max_output_tokens` reservation and your actual p99 output length is wasted context. Set a tight default and escalate on truncation.
-
-**Design for cache stability.** Every field in your prompt is stable or volatile. Put stable first, volatile last. Treat any mid-conversation change to the stable prefix as a bug with a dollar cost.
-
-**Parallelize startup I/O.** Module loading is CPU-bound. Keychain reads and network handshakes are I/O-bound. Launch I/O before imports.
-
-**Use bitmap pre-filters for search.** A cheap pre-filter rejecting 10-90% of candidates before expensive scoring is a significant win at 4 bytes per entry.
-
-**Measure where it matters.** Claude Code has 50+ startup checkpoints, sampled at 100% internally and 0.5% externally. Performance work without measurement is guesswork.
+Результаты всегда выдаются в исходном порядке tools для рассуждений детерминированной модели. Родственный контроллер аварийного завершения завершает параллельные подпроцессы в случае ошибки tool Bash, предотвращая бесполезную трату ресурсов.
 
 ---
 
-A final observation: most of these optimizations are not algorithmically sophisticated. Bitmap pre-filters, circular buffers, memoization, interning -- these are CS fundamentals. The sophistication is in knowing where to apply them. The startup profiler tells you where the milliseconds are. The API usage field tells you where the tokens are. The cache hit rate tells you where the money is. Measurement first, optimization second, always.
+## Стриминг и Raw API
+
+Claude Code использует необработанную потоковую передачу API вместо вспомогательного средства `BetaMessageStream` SDK. Помощник вызывает `partialParse()` для каждого `input_json_delta` -- O(n^2) входной длины tool. Claude Code накапливает необработанные строки и анализирует их один раз, когда блок завершен.
+
+Сторожевой таймер streaming (`CLAUDE_STREAM_IDLE_TIMEOUT_MS`, по умолчанию 90 секунд) прерывает передачу и повторяет попытку, если не поступает фрагментов, с возвратом к непотоковой передаче `messages.create()` в случае сбоя прокси-сервера.
+
+---
+
+## Примените это: производительность agentic systems
+
+**Проверьте бюджет Context Window.** Разрыв между резервированием `max_output_tokens` и фактической длиной выходного сигнала p99 — это напрасная трата контекста. Установите жесткое значение по умолчанию и эскалируйте проблему при усечении.
+
+**Разработано с учетом стабильности кэша.** Каждое поле в prompt может быть стабильным или изменчивым. Ставьте стабильное на первое место, а нестабильное на последнее. Любое изменение префикса «стабильный» в середине разговора рассматривайте как ошибку, за которую придется платить.
+
+**Распараллелить ввод-вывод при запуске.** Загрузка модуля зависит от ЦП. Чтение связки ключей и сетевые подтверждения связаны с вводом-выводом. Запустите ввод-вывод перед импортом.
+
+**Используйте предварительные фильтры растровых изображений для поиска.** Дешевый предварительный фильтр, отклоняющий 10–90 % кандидатов без дорогостоящей оценки, является значительным преимуществом при 4 байтах на запись.
+
+**Измеряйте там, где это важно.** Claude Code имеет более 50 контрольных точек запуска, выборка составляет 100 % для внутренней системы и 0,5 % для внешней. Работа по производительности без измерения – это догадки.
+
+---
+
+И последнее наблюдение: большинство этих оптимизаций не являются алгоритмически сложными. Предварительные фильтры растровых изображений, циклические буферы, мемоизация, интернирование — это основы CS. Сложность заключается в том, чтобы знать, где их применить. Профилировщик запуска сообщает вам, где находятся миллисекунды. Поле использования API сообщает вам, где находятся токены. Коэффициент попадания в кеш подскажет вам, где находятся деньги. Всегда сначала измерение, потом оптимизация.
